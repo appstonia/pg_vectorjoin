@@ -4,6 +4,8 @@ OBJS = pg_vectorjoin.o
 EXTENSION = pg_vectorjoin
 DATA = pg_vectorjoin--1.0.sql
 
+PG_CPPFLAGS = -I$(srcdir)/include
+
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 
