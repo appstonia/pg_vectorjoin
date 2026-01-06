@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "fmgr.h"
+#include "optimizer/paths.h"
 #include "utils/guc.h"
 #include "vjoin_compat.h"
 #include "pg_vectorjoin.h"
@@ -14,6 +15,9 @@ bool    vjoin_enable_hashjoin = true;
 bool    vjoin_enable_bnl = true;
 int     vjoin_batch_size = VJOIN_DEFAULT_BATCH;
 double  vjoin_cost_factor = 0.5;
+
+/* Saved previous hooks */
+set_join_pathlist_hook_type prev_join_pathlist_hook = NULL;
 
 void
 _PG_init(void)
@@ -63,4 +67,8 @@ _PG_init(void)
                              0, NULL, NULL, NULL);
 
     MarkGUCPrefixReserved("pg_vectorjoin");
+
+    /* Install join pathlist hook */
+    prev_join_pathlist_hook = set_join_pathlist_hook;
+    set_join_pathlist_hook = vjoin_pathlist_hook;
 }
