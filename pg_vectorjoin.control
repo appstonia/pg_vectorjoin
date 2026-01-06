@@ -1,0 +1,4 @@
+comment = 'pg_vectorjoin - vectorized join execution for PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/pg_vectorjoin'
+relocatable = true
