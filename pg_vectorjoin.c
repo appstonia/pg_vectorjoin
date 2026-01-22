@@ -42,24 +42,7 @@ CustomPathMethods vjoin_bnl_path_methods = {
     .PlanCustomPath = vjoin_bnl_plan,
 };
 
-/* Stub executor callbacks — to be replaced by real implementations */
-void
-vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
-{
-    /* TODO: build hash table from inner, init probe batch */
-}
-
-TupleTableSlot *
-vjoin_hash_exec(CustomScanState *node)
-{
-    /* TODO: batch probe outer keys against hash table, emit matches */
-    return NULL;
-}
-
-void vjoin_hash_end(CustomScanState *node) { /* TODO: destroy hash table, free batch */ }
-void vjoin_hash_rescan(CustomScanState *node) { /* TODO: reset probe state */ }
-void vjoin_hash_explain(CustomScanState *node, List *ancestors, ExplainState *es) { /* TODO: show hash table stats */ }
-
+/* Stub executor callbacks — BNL to be replaced by real implementations */
 void
 vjoin_bnl_begin(CustomScanState *node, EState *estate, int eflags)
 {

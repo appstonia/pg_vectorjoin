@@ -2,6 +2,7 @@
 #define PG_VECTORJOIN_H
 
 #include "postgres.h"
+#include "executor/tuptable.h"
 #include "nodes/extensible.h"
 #include "optimizer/paths.h"
 
@@ -67,5 +68,58 @@ TupleTableSlot *vjoin_bnl_exec(CustomScanState *node);
 void vjoin_bnl_end(CustomScanState *node);
 void vjoin_bnl_rescan(CustomScanState *node);
 void vjoin_bnl_explain(CustomScanState *node, List *ancestors, ExplainState *es);
+
+/* Hash table functions (vjoin_hashtable.c) */
+struct VJoinHashTable;
+typedef struct VJoinHashTable VJoinHashTable;
+VJoinHashTable *vjoin_ht_create(int estimated_rows, int num_keys,
+                                MemoryContext parent);
+void vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
+                     MinimalTuple tuple, Datum *keyvals, bool *keynulls);
+void vjoin_ht_destroy(VJoinHashTable *ht);
+
+/* Inline murmurhash32 finalizer */
+static inline uint32
+vjoin_murmurhash32(uint32 h)
+{
+    h ^= h >> 16;
+    h *= 0x45d9f3b;
+    h ^= h >> 16;
+    h *= 0x45d9f3b;
+    h ^= h >> 16;
+    return h;
+}
+
+static inline uint32
+vjoin_hash_datum(Datum d, Oid keytype)
+{
+    switch (keytype)
+    {
+        case INT4OID:
+            return vjoin_murmurhash32((uint32) DatumGetInt32(d));
+        case INT8OID:
+        {
+            uint64 v = (uint64) DatumGetInt64(d);
+            return vjoin_murmurhash32((uint32)(v ^ (v >> 32)));
+        }
+        case FLOAT8OID:
+        {
+            union { double d; uint64 u; } conv;
+            conv.d = DatumGetFloat8(d);
+            /* Normalize -0.0 to +0.0 */
+            if (conv.d == 0.0) conv.u = 0;
+            return vjoin_murmurhash32((uint32)(conv.u ^ (conv.u >> 32)));
+        }
+        default:
+            return vjoin_murmurhash32((uint32) d);
+    }
+}
+
+static inline uint32
+vjoin_combine_hashes(uint32 h1, uint32 h2)
+{
+    h1 = ((h1 << 1) | (h1 >> 31));  /* rotate left 1 */
+    return h1 ^ h2;
+}
 
 #endif /* PG_VECTORJOIN_H */
