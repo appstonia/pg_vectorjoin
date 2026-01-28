@@ -1,5 +1,5 @@
 MODULE_big = pg_vectorjoin
-OBJS = pg_vectorjoin.o vjoin_path.o vjoin_plan.o vjoin_hashtable.o vjoin_exec_hash.o
+OBJS = pg_vectorjoin.o vjoin_path.o vjoin_plan.o vjoin_hashtable.o vjoin_exec_hash.o vjoin_exec_bnl.o
 
 EXTENSION = pg_vectorjoin
 DATA = pg_vectorjoin--1.0.sql

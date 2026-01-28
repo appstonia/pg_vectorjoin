@@ -42,24 +42,6 @@ CustomPathMethods vjoin_bnl_path_methods = {
     .PlanCustomPath = vjoin_bnl_plan,
 };
 
-/* Stub executor callbacks — BNL to be replaced by real implementations */
-void
-vjoin_bnl_begin(CustomScanState *node, EState *estate, int eflags)
-{
-    /* TODO: init outer block buffer, open children */
-}
-
-TupleTableSlot *
-vjoin_bnl_exec(CustomScanState *node)
-{
-    /* TODO: load outer block, scan inner with SIMD compare, emit matches */
-    return NULL;
-}
-
-void vjoin_bnl_end(CustomScanState *node) { /* TODO: free block buffer */ }
-void vjoin_bnl_rescan(CustomScanState *node) { /* TODO: reset block + inner scan */ }
-void vjoin_bnl_explain(CustomScanState *node, List *ancestors, ExplainState *es) { /* TODO: show block stats */ }
-
 /* CustomExecMethods */
 CustomExecMethods vjoin_hash_exec_methods = {
     .CustomName = "VectorHashJoin",
