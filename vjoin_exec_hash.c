@@ -7,6 +7,7 @@
 #include "utils/memutils.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
+#include "vjoin_simd.h"
 
 /*
  * Deserialize key info from custom_private.
@@ -337,8 +338,8 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
     state->inner_slot = MakeSingleTupleTableSlot(inner_desc,
                                                  &TTSOpsMinimalTuple);
 
-    /* SIMD not yet wired — will be enabled in later commit */
-    state->use_simd = false;
+    state->use_simd = vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
+                      vjoin_simd_caps.has_neon;
 
     state->phase = VHJ_BUILD;
 }

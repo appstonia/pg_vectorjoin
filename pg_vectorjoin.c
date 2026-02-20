@@ -5,6 +5,7 @@
 #include "utils/guc.h"
 #include "vjoin_compat.h"
 #include "pg_vectorjoin.h"
+#include "vjoin_simd.h"
 
 PG_MODULE_MAGIC;
 
@@ -109,6 +110,9 @@ _PG_init(void)
                              0, NULL, NULL, NULL);
 
     MarkGUCPrefixReserved("pg_vectorjoin");
+
+    /* Detect SIMD capabilities at load time */
+    vjoin_detect_simd();
 
     /* Register CustomScanMethods */
     RegisterCustomScanMethods(&vjoin_hash_scan_methods);

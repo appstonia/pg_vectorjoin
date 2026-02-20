@@ -7,6 +7,7 @@
 #include "utils/memutils.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
+#include "vjoin_simd.h"
 
 /*
  * Deserialize key info from custom_private.
@@ -114,8 +115,8 @@ bnl_load_outer_block(BlockNestLoopState *state)
 }
 
 /*
- * Compare one inner tuple against the entire outer block (scalar).
- * SIMD fast paths will be wired in a later commit.
+ * Compare one inner tuple against the entire outer block using SIMD
+ * for single int4/int8/float8 key, scalar fallback otherwise.
  */
 static void
 bnl_compare_block(BlockNestLoopState *state,
@@ -124,7 +125,142 @@ bnl_compare_block(BlockNestLoopState *state,
 {
     int k, i;
 
-    /* Scalar comparison for all key types */
+    /* Single int4 key with SIMD */
+    if (state->num_keys == 1 && state->key_types[0] == INT4OID &&
+        !inner_nulls[0] && state->use_simd)
+    {
+        int32  inner_val = DatumGetInt32(inner_keys[0]);
+        int   *match_indices;
+        int    nmatches;
+        int32 *key_array;
+
+        key_array = (int32 *) palloc(sizeof(int32) * state->block_count);
+        match_indices = (int *) palloc(sizeof(int) * state->block_count);
+
+        for (i = 0; i < state->block_count; i++)
+        {
+            if (state->block_nulls[i * state->num_keys])
+                key_array[i] = inner_val + 1;  /* ensure no match for null */
+            else
+                key_array[i] = DatumGetInt32(
+                    state->block_keys[i * state->num_keys]);
+        }
+
+        nmatches = vjoin_compare_int4_block(key_array, state->block_count,
+                                            inner_val, match_indices);
+
+        for (i = 0; i < nmatches; i++)
+        {
+            if (state->result_count >= state->result_capacity)
+            {
+                state->result_capacity *= 2;
+                state->results = repalloc(state->results,
+                    sizeof(VJoinMatch) * state->result_capacity);
+                state->result_inner_tuples = repalloc(state->result_inner_tuples,
+                    sizeof(MinimalTuple) * state->result_capacity);
+            }
+            state->results[state->result_count].outer_idx = match_indices[i];
+            state->results[state->result_count].inner_idx = 0;
+            state->result_inner_tuples[state->result_count] = inner_mt;
+            state->result_count++;
+        }
+
+        pfree(key_array);
+        pfree(match_indices);
+        return;
+    }
+
+    /* Single int8 key with SIMD */
+    if (state->num_keys == 1 && state->key_types[0] == INT8OID &&
+        !inner_nulls[0] && state->use_simd)
+    {
+        int64  inner_val = DatumGetInt64(inner_keys[0]);
+        int   *match_indices;
+        int    nmatches;
+        int64 *key_array;
+
+        key_array = (int64 *) palloc(sizeof(int64) * state->block_count);
+        match_indices = (int *) palloc(sizeof(int) * state->block_count);
+
+        for (i = 0; i < state->block_count; i++)
+        {
+            if (state->block_nulls[i * state->num_keys])
+                key_array[i] = inner_val + 1;
+            else
+                key_array[i] = DatumGetInt64(
+                    state->block_keys[i * state->num_keys]);
+        }
+
+        nmatches = vjoin_compare_int8_block(key_array, state->block_count,
+                                            inner_val, match_indices);
+
+        for (i = 0; i < nmatches; i++)
+        {
+            if (state->result_count >= state->result_capacity)
+            {
+                state->result_capacity *= 2;
+                state->results = repalloc(state->results,
+                    sizeof(VJoinMatch) * state->result_capacity);
+                state->result_inner_tuples = repalloc(state->result_inner_tuples,
+                    sizeof(MinimalTuple) * state->result_capacity);
+            }
+            state->results[state->result_count].outer_idx = match_indices[i];
+            state->results[state->result_count].inner_idx = 0;
+            state->result_inner_tuples[state->result_count] = inner_mt;
+            state->result_count++;
+        }
+
+        pfree(key_array);
+        pfree(match_indices);
+        return;
+    }
+
+    /* Single float8 key with SIMD */
+    if (state->num_keys == 1 && state->key_types[0] == FLOAT8OID &&
+        !inner_nulls[0] && state->use_simd)
+    {
+        double  inner_val = DatumGetFloat8(inner_keys[0]);
+        int    *match_indices;
+        int     nmatches;
+        double *key_array;
+
+        key_array = (double *) palloc(sizeof(double) * state->block_count);
+        match_indices = (int *) palloc(sizeof(int) * state->block_count);
+
+        for (i = 0; i < state->block_count; i++)
+        {
+            if (state->block_nulls[i * state->num_keys])
+                key_array[i] = inner_val + 1.0;
+            else
+                key_array[i] = DatumGetFloat8(
+                    state->block_keys[i * state->num_keys]);
+        }
+
+        nmatches = vjoin_compare_float8_block(key_array, state->block_count,
+                                              inner_val, match_indices);
+
+        for (i = 0; i < nmatches; i++)
+        {
+            if (state->result_count >= state->result_capacity)
+            {
+                state->result_capacity *= 2;
+                state->results = repalloc(state->results,
+                    sizeof(VJoinMatch) * state->result_capacity);
+                state->result_inner_tuples = repalloc(state->result_inner_tuples,
+                    sizeof(MinimalTuple) * state->result_capacity);
+            }
+            state->results[state->result_count].outer_idx = match_indices[i];
+            state->results[state->result_count].inner_idx = 0;
+            state->result_inner_tuples[state->result_count] = inner_mt;
+            state->result_count++;
+        }
+
+        pfree(key_array);
+        pfree(match_indices);
+        return;
+    }
+
+    /* Scalar fallback for multiple keys or unsupported types */
     for (i = 0; i < state->block_count; i++)
     {
         bool match = true;
@@ -314,8 +450,8 @@ vjoin_bnl_begin(CustomScanState *node, EState *estate, int eflags)
                                              "BlockNestLoop block",
                                              ALLOCSET_DEFAULT_SIZES);
 
-    /* SIMD not yet wired — will be enabled in later commit */
-    state->use_simd = false;
+    state->use_simd = vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
+                      vjoin_simd_caps.has_neon;
 
     state->inner_exhausted = false;
     state->outer_exhausted = false;
