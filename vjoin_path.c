@@ -151,7 +151,7 @@ vjoin_try_hashjoin(PlannerInfo *root,
 
     /* Cost model: vectorized hash build + batch probe */
     startup_cost = inner_path->total_cost +
-                   inner_rows * cpu_operator_cost * 2.0;
+                   inner_rows * cpu_operator_cost * 2.0;  /* hash + insert */
 
     run_cost = outer_path->total_cost +
                outer_rows * cpu_operator_cost * 2.0 * vjoin_cost_factor;
@@ -203,7 +203,7 @@ vjoin_try_bnl(PlannerInfo *root,
     double      outer_rows,
                 inner_rows,
                 num_blocks;
-    int         simd_width = 4;
+    int         simd_width = 4;  /* conservative: SSE2 int32 width */
 
     if (outer_path == NULL || inner_path == NULL)
         return;
@@ -221,7 +221,7 @@ vjoin_try_bnl(PlannerInfo *root,
 
     /* BNL is typically only competitive for smaller inner relations */
     if (inner_rows > 10000 && nkeys > 0)
-        return;
+        return;  /* Hash join will likely be better */
 
     cpath = makeNode(CustomPath);
     cpath->path.pathtype = T_CustomScan;
@@ -272,7 +272,7 @@ vjoin_pathlist_hook(PlannerInfo *root,
     /* Only inner joins for now */
     if (jointype != JOIN_INNER)
         return;
-
+    
     /* Master kill switch */
     if (!vjoin_enable)
         return;

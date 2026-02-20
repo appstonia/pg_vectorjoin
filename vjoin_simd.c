@@ -239,6 +239,7 @@ compare_int4_neon(const int32 *block, int block_count,
         int32x4_t vblock = vld1q_s32(block + i);
         uint32x4_t vcmp = vceqq_s32(vblock, vval);
 
+        /* Extract mask from NEON result */
         uint32_t lane0 = vgetq_lane_u32(vcmp, 0);
         uint32_t lane1 = vgetq_lane_u32(vcmp, 1);
         uint32_t lane2 = vgetq_lane_u32(vcmp, 2);

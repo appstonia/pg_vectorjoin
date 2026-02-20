@@ -22,7 +22,7 @@ typedef struct VJoinHashTable
 typedef struct VJoinMatch
 {
     int outer_idx;
-    int inner_idx;
+    int inner_idx;     /* index into hash table (for hash join) */
 } VJoinMatch;
 
 /* ---------- Vectorized Hash Join state ---------- */
@@ -57,12 +57,12 @@ typedef struct VectorHashJoinState
 
     /* Probe batch */
     int         batch_size;
-    int         batch_count;
-    int         batch_pos;
-    Datum      *batch_keys;
-    bool       *batch_nulls;
-    uint32     *batch_hashes;
-    MinimalTuple *batch_tuples;
+    int         batch_count;       /* tuples in current batch */
+    int         batch_pos;         /* next unprocessed in batch */
+    Datum      *batch_keys;        /* [batch_size * num_keys] */
+    bool       *batch_nulls;       /* [batch_size * num_keys] */
+    uint32     *batch_hashes;      /* [batch_size] */
+    MinimalTuple *batch_tuples;    /* [batch_size] */
 
     /* Result buffer */
     VJoinMatch *results;
@@ -70,7 +70,7 @@ typedef struct VectorHashJoinState
     int         result_pos;
     int         result_capacity;
 
-    /* Temp slots */
+    /* Temp slots for result construction */
     TupleTableSlot *outer_slot;
     TupleTableSlot *inner_slot;
 
@@ -110,14 +110,14 @@ typedef struct BlockNestLoopState
 
     /* Outer block */
     int         block_size;
-    int         block_count;
-    Datum      *block_keys;
-    bool       *block_nulls;
-    MinimalTuple *block_tuples;
+    int         block_count;        /* tuples in current block */
+    Datum      *block_keys;         /* [block_size * num_keys] */
+    bool       *block_nulls;        /* [block_size * num_keys] */
+    MinimalTuple *block_tuples;     /* [block_size] */
 
     /* Result buffer */
     VJoinMatch *results;
-    MinimalTuple *result_inner_tuples;
+    MinimalTuple *result_inner_tuples;  /* parallel with results */
     int         result_count;
     int         result_pos;
     int         result_capacity;

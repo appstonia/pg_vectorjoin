@@ -2,7 +2,6 @@
 #define PG_VECTORJOIN_H
 
 #include "postgres.h"
-#include "executor/tuptable.h"
 #include "nodes/extensible.h"
 #include "optimizer/paths.h"
 

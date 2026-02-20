@@ -1,6 +1,5 @@
 #include "postgres.h"
 #include "fmgr.h"
-#include "executor/executor.h"
 #include "optimizer/paths.h"
 #include "utils/guc.h"
 #include "vjoin_compat.h"
@@ -20,6 +19,9 @@ double  vjoin_cost_factor = 0.5;
 
 /* Saved previous hooks */
 set_join_pathlist_hook_type prev_join_pathlist_hook = NULL;
+#if VJOIN_HAS_SETUP_HOOK
+static join_path_setup_hook_type prev_join_setup_hook = NULL;
+#endif
 
 /* CustomScanMethods */
 CustomScanMethods vjoin_hash_scan_methods = {
@@ -65,6 +67,7 @@ CustomExecMethods vjoin_bnl_exec_methods = {
 void
 _PG_init(void)
 {
+    /* Define GUC parameters */
     DefineCustomBoolVariable("pg_vectorjoin.enable",
                              "Enable vectorized join optimization.",
                              NULL,
@@ -117,8 +120,13 @@ _PG_init(void)
     /* Register CustomScanMethods */
     RegisterCustomScanMethods(&vjoin_hash_scan_methods);
     RegisterCustomScanMethods(&vjoin_bnl_scan_methods);
-
+    
     /* Install join pathlist hook */
     prev_join_pathlist_hook = set_join_pathlist_hook;
     set_join_pathlist_hook = vjoin_pathlist_hook;
+
+#if VJOIN_HAS_SETUP_HOOK
+    prev_join_setup_hook = join_path_setup_hook;
+    join_path_setup_hook = NULL;  /* future: vjoin_setup_hook */
+#endif
 }

@@ -51,8 +51,8 @@ vjoin_hash_plan(PlannerInfo *root, RelOptInfo *rel,
     cscan->scan.plan.targetlist = tlist;
     cscan->custom_scan_tlist = vjoin_build_scan_tlist(
         outer_plan->targetlist, inner_plan->targetlist);
-    cscan->scan.plan.qual = NIL;
-    cscan->scan.scanrelid = 0;
+    cscan->scan.plan.qual = NIL;       /* quals applied in ExecCustomScan */
+    cscan->scan.scanrelid = 0;         /* not a real relation scan */
     cscan->flags = best_path->flags;
     cscan->custom_plans = custom_plans;
     cscan->custom_exprs = NIL;

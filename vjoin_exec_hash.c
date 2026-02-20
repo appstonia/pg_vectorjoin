@@ -338,6 +338,7 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
     state->inner_slot = MakeSingleTupleTableSlot(inner_desc,
                                                  &TTSOpsMinimalTuple);
 
+    /* SIMD detection */
     state->use_simd = vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
                       vjoin_simd_caps.has_neon;
 
