@@ -11,7 +11,7 @@ ANALYZE vjoin_inner;
 
 -- Test 1: Basic inner join with vectorized hash join
 SET pg_vectorjoin.enable = on;
-SET pg_vectorjoin.enable_bnl = off;
+SET pg_vectorjoin.enable_nestloop = off;
 
 EXPLAIN (COSTS OFF)
 SELECT o.id, o.val, i.data
@@ -22,7 +22,7 @@ SELECT count(*) FROM vjoin_outer o JOIN vjoin_inner i ON o.id = i.ref_id;
 
 -- Test 2: Block nested loop
 SET pg_vectorjoin.enable_hashjoin = off;
-SET pg_vectorjoin.enable_bnl = on;
+SET pg_vectorjoin.enable_nestloop = on;
 
 SELECT count(*) FROM vjoin_outer o JOIN vjoin_inner i ON o.id = i.ref_id;
 
