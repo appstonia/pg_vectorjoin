@@ -5,6 +5,8 @@
 #include "nodes/extensible.h"
 #include "nodes/value.h"
 #include "utils/memutils.h"
+#include "utils/tuplestore.h"
+#include "miscadmin.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
@@ -13,7 +15,7 @@
  * Deserialize key info from custom_private.
  */
 static void
-bnl_deserialize_keys(List *private_data,
+nl_deserialize_keys(List *private_data,
                      int *num_keys,
                      AttrNumber *outer_keynos,
                      AttrNumber *inner_keynos,
@@ -35,7 +37,7 @@ bnl_deserialize_keys(List *private_data,
  * Fill the scan slot from matched outer + inner tuple.
  */
 static TupleTableSlot *
-bnl_form_result(BlockNestLoopState *state, MinimalTuple outer_mt,
+nl_form_result(VJoinNestLoopState *state, MinimalTuple outer_mt,
                 MinimalTuple inner_mt)
 {
     TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
@@ -71,7 +73,7 @@ bnl_form_result(BlockNestLoopState *state, MinimalTuple outer_mt,
  * Returns the number of tuples loaded.
  */
 static int
-bnl_load_outer_block(BlockNestLoopState *state)
+nl_load_outer_block(VJoinNestLoopState *state)
 {
     TupleTableSlot *slot;
     MemoryContext old;
@@ -119,7 +121,7 @@ bnl_load_outer_block(BlockNestLoopState *state)
  * for single int4/int8/float8 key, scalar fallback otherwise.
  */
 static void
-bnl_compare_block(BlockNestLoopState *state,
+nl_compare_block(VJoinNestLoopState *state,
                   Datum *inner_keys, bool *inner_nulls,
                   MinimalTuple inner_mt)
 {
@@ -326,7 +328,7 @@ bnl_compare_block(BlockNestLoopState *state,
  * Accumulates all matches in result buffer, then returns.
  */
 static void
-bnl_scan_inner(BlockNestLoopState *state)
+nl_scan_inner(VJoinNestLoopState *state)
 {
     TupleTableSlot *slot;
     MemoryContext oldctx = MemoryContextSwitchTo(state->block_ctx);
@@ -341,16 +343,37 @@ bnl_scan_inner(BlockNestLoopState *state)
         int    k;
         MinimalTuple inner_mt;
 
-        /* Pull inner tuple in parent context */
         MemoryContextSwitchTo(oldctx);
-        slot = ExecProcNode(state->inner_ps);
-        MemoryContextSwitchTo(state->block_ctx);
-        if (TupIsNull(slot))
+
+        if (state->inner_stored)
         {
-            state->inner_exhausted = true;
-            MemoryContextSwitchTo(oldctx);
-            return;
+            /* Read from tuplestore */
+            if (!tuplestore_gettupleslot(state->inner_store, true, false,
+                                         state->store_slot))
+            {
+                state->inner_exhausted = true;
+                MemoryContextSwitchTo(state->block_ctx);
+                MemoryContextSwitchTo(oldctx);
+                return;
+            }
+            slot = state->store_slot;
         }
+        else
+        {
+            /* First pass: pull from child and materialize */
+            slot = ExecProcNode(state->inner_ps);
+            if (TupIsNull(slot))
+            {
+                state->inner_exhausted = true;
+                state->inner_stored = true;
+                MemoryContextSwitchTo(state->block_ctx);
+                MemoryContextSwitchTo(oldctx);
+                return;
+            }
+            tuplestore_puttupleslot(state->inner_store, slot);
+        }
+
+        MemoryContextSwitchTo(state->block_ctx);
 
         /* Extract inner keys */
         for (k = 0; k < state->num_keys; k++)
@@ -378,7 +401,7 @@ bnl_scan_inner(BlockNestLoopState *state)
         inner_mt = ExecCopySlotMinimalTuple(slot);
 
         /* Compare against outer block */
-        bnl_compare_block(state, inner_keys, inner_nulls, inner_mt);
+        nl_compare_block(state, inner_keys, inner_nulls, inner_mt);
 
         /*
          * If we have accumulated enough results, stop scanning inner
@@ -395,9 +418,9 @@ bnl_scan_inner(BlockNestLoopState *state)
 /* ---- Public callbacks ---- */
 
 void
-vjoin_bnl_begin(CustomScanState *node, EState *estate, int eflags)
+vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
 {
-    BlockNestLoopState *state = (BlockNestLoopState *) node;
+    VJoinNestLoopState *state = (VJoinNestLoopState *) node;
     CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
     PlanState  *outer_ps,
                *inner_ps;
@@ -417,7 +440,7 @@ vjoin_bnl_begin(CustomScanState *node, EState *estate, int eflags)
     state->num_inner_attrs = inner_desc->natts;
 
     /* Deserialize key info */
-    bnl_deserialize_keys(cscan->custom_private,
+    nl_deserialize_keys(cscan->custom_private,
                          &state->num_keys,
                          state->outer_keynos,
                          state->inner_keynos,
@@ -447,21 +470,27 @@ vjoin_bnl_begin(CustomScanState *node, EState *estate, int eflags)
 
     /* Memory context for block-scoped allocations */
     state->block_ctx = AllocSetContextCreate(CurrentMemoryContext,
-                                             "BlockNestLoop block",
+                                             "NestLoop block",
                                              ALLOCSET_DEFAULT_SIZES);
 
     state->use_simd = vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
                       vjoin_simd_caps.has_neon;
 
+    /* Inner materialization */
+    state->inner_store = tuplestore_begin_heap(false, false, work_mem);
+    state->inner_stored = false;
+    state->store_slot = MakeSingleTupleTableSlot(inner_desc,
+                                                 &TTSOpsMinimalTuple);
+
     state->inner_exhausted = false;
     state->outer_exhausted = false;
-    state->phase = BNL_LOAD_BLOCK;
+    state->phase = NL_LOAD_BLOCK;
 }
 
 TupleTableSlot *
-vjoin_bnl_exec(CustomScanState *node)
+vjoin_nestloop_exec(CustomScanState *node)
 {
-    BlockNestLoopState *state = (BlockNestLoopState *) node;
+    VJoinNestLoopState *state = (VJoinNestLoopState *) node;
     ExprContext *econtext = node->ss.ps.ps_ExprContext;
     ExprState  *qual = node->ss.ps.qual;
     ProjectionInfo *projInfo = node->ss.ps.ps_ProjInfo;
@@ -472,44 +501,47 @@ vjoin_bnl_exec(CustomScanState *node)
 
         switch (state->phase)
         {
-            case BNL_LOAD_BLOCK:
+            case NL_LOAD_BLOCK:
                 if (state->outer_exhausted)
                 {
-                    state->phase = BNL_DONE;
+                    state->phase = NL_DONE;
                     continue;
                 }
 
-                if (bnl_load_outer_block(state) == 0)
+                if (nl_load_outer_block(state) == 0)
                 {
-                    state->phase = BNL_DONE;
+                    state->phase = NL_DONE;
                     continue;
                 }
 
-                /* Rescan inner for new block */
+                /* Rescan inner: use tuplestore if already materialized */
                 state->inner_exhausted = false;
-                ExecReScan(state->inner_ps);
-                state->phase = BNL_SCAN_INNER;
+                if (state->inner_stored)
+                    tuplestore_rescan(state->inner_store);
+                else
+                    ExecReScan(state->inner_ps);
+                state->phase = NL_SCAN_INNER;
                 continue;
 
-            case BNL_SCAN_INNER:
-                bnl_scan_inner(state);
+            case NL_SCAN_INNER:
+                nl_scan_inner(state);
                 if (state->result_count > 0)
                 {
-                    state->phase = BNL_EMIT;
+                    state->phase = NL_EMIT;
                     continue;
                 }
 
                 if (state->inner_exhausted)
                 {
                     /* This block done, load next */
-                    state->phase = BNL_LOAD_BLOCK;
+                    state->phase = NL_LOAD_BLOCK;
                     continue;
                 }
 
                 /* No matches yet but inner not exhausted — keep scanning */
                 continue;
 
-            case BNL_EMIT:
+            case NL_EMIT:
                 if (state->result_pos >= state->result_count)
                 {
                     /* Buffer exhausted */
@@ -517,9 +549,9 @@ vjoin_bnl_exec(CustomScanState *node)
                     state->result_pos = 0;
 
                     if (state->inner_exhausted)
-                        state->phase = BNL_LOAD_BLOCK;
+                        state->phase = NL_LOAD_BLOCK;
                     else
-                        state->phase = BNL_SCAN_INNER;
+                        state->phase = NL_SCAN_INNER;
                     continue;
                 }
 
@@ -529,7 +561,7 @@ vjoin_bnl_exec(CustomScanState *node)
                         state->result_inner_tuples[state->result_pos];
                     state->result_pos++;
 
-                    result = bnl_form_result(state,
+                    result = nl_form_result(state,
                                             state->block_tuples[oi],
                                             inner_mt);
 
@@ -544,36 +576,44 @@ vjoin_bnl_exec(CustomScanState *node)
                     return result;
                 }
 
-            case BNL_DONE:
+            case NL_DONE:
                 return NULL;
         }
     }
 }
 
 void
-vjoin_bnl_end(CustomScanState *node)
+vjoin_nestloop_end(CustomScanState *node)
 {
-    BlockNestLoopState *state = (BlockNestLoopState *) node;
+    VJoinNestLoopState *state = (VJoinNestLoopState *) node;
 
     ExecEndNode(state->outer_ps);
     ExecEndNode(state->inner_ps);
 
     ExecDropSingleTupleTableSlot(state->outer_slot);
     ExecDropSingleTupleTableSlot(state->inner_slot);
+    ExecDropSingleTupleTableSlot(state->store_slot);
+
+    if (state->inner_store)
+        tuplestore_end(state->inner_store);
 
     if (state->block_ctx)
         MemoryContextDelete(state->block_ctx);
 }
 
 void
-vjoin_bnl_rescan(CustomScanState *node)
+vjoin_nestloop_rescan(CustomScanState *node)
 {
-    BlockNestLoopState *state = (BlockNestLoopState *) node;
+    VJoinNestLoopState *state = (VJoinNestLoopState *) node;
 
     ExecReScan(state->outer_ps);
+
+    /* Reset inner materialization */
+    tuplestore_clear(state->inner_store);
+    state->inner_stored = false;
     ExecReScan(state->inner_ps);
 
-    state->phase = BNL_LOAD_BLOCK;
+    state->phase = NL_LOAD_BLOCK;
     state->block_count = 0;
     state->result_count = 0;
     state->result_pos = 0;
@@ -582,9 +622,9 @@ vjoin_bnl_rescan(CustomScanState *node)
 }
 
 void
-vjoin_bnl_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+vjoin_nestloop_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-    BlockNestLoopState *state = (BlockNestLoopState *) node;
+    VJoinNestLoopState *state = (VJoinNestLoopState *) node;
 
     ExplainPropertyInteger("Block Size", NULL, state->block_size, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);

@@ -1,10 +1,20 @@
 MODULE_big = pg_vectorjoin
-OBJS = pg_vectorjoin.o vjoin_path.o vjoin_plan.o vjoin_hashtable.o vjoin_exec_hash.o vjoin_exec_bnl.o vjoin_simd.o
+OBJS = src/pg_vectorjoin.o \
+       src/vjoin_path.o \
+       src/vjoin_plan.o \
+       src/vjoin_exec_hash.o \
+       src/vjoin_exec_nestloop.o \
+       src/vjoin_hashtable.o \
+       src/vjoin_simd.o \
+       src/vjoin_exec_merge.o
 
 EXTENSION = pg_vectorjoin
 DATA = pg_vectorjoin--1.0.sql
 
 PG_CPPFLAGS = -I$(srcdir)/include
+PG_CFLAGS = -O2
+
+REGRESS = basic
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

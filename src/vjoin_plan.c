@@ -63,9 +63,9 @@ vjoin_hash_plan(PlannerInfo *root, RelOptInfo *rel,
     return &cscan->scan.plan;
 }
 
-/* PlanCustomPath for BlockNestLoop */
+/* PlanCustomPath for NestLoop */
 Plan *
-vjoin_bnl_plan(PlannerInfo *root, RelOptInfo *rel,
+vjoin_nestloop_plan(PlannerInfo *root, RelOptInfo *rel,
                CustomPath *best_path, List *tlist,
                List *clauses, List *custom_plans)
 {
@@ -83,7 +83,7 @@ vjoin_bnl_plan(PlannerInfo *root, RelOptInfo *rel,
     cscan->custom_exprs = NIL;
     cscan->custom_private = best_path->custom_private;
     cscan->custom_relids = rel->relids;
-    cscan->methods = &vjoin_bnl_scan_methods;
+    cscan->methods = &vjoin_nestloop_scan_methods;
 
     return &cscan->scan.plan;
 }
@@ -98,12 +98,47 @@ vjoin_hash_create_state(CustomScan *cscan)
     return (Node *) state;
 }
 
-/* CreateCustomScanState for BlockNestLoop */
+/* CreateCustomScanState for NestLoop */
 Node *
-vjoin_bnl_create_state(CustomScan *cscan)
+vjoin_nestloop_create_state(CustomScan *cscan)
 {
-    BlockNestLoopState *state = (BlockNestLoopState *)
-        newNode(sizeof(BlockNestLoopState), T_CustomScanState);
-    state->css.methods = &vjoin_bnl_exec_methods;
+    VJoinNestLoopState *state = (VJoinNestLoopState *)
+        newNode(sizeof(VJoinNestLoopState), T_CustomScanState);
+    state->css.methods = &vjoin_nestloop_exec_methods;
+    return (Node *) state;
+}
+
+/* PlanCustomPath for VectorMergeJoin */
+Plan *
+vjoin_merge_plan(PlannerInfo *root, RelOptInfo *rel,
+                 CustomPath *best_path, List *tlist,
+                 List *clauses, List *custom_plans)
+{
+    CustomScan *cscan = makeNode(CustomScan);
+    Plan       *outer_plan = (Plan *) linitial(custom_plans);
+    Plan       *inner_plan = (Plan *) lsecond(custom_plans);
+
+    cscan->scan.plan.targetlist = tlist;
+    cscan->custom_scan_tlist = vjoin_build_scan_tlist(
+        outer_plan->targetlist, inner_plan->targetlist);
+    cscan->scan.plan.qual = NIL;
+    cscan->scan.scanrelid = 0;
+    cscan->flags = best_path->flags;
+    cscan->custom_plans = custom_plans;
+    cscan->custom_exprs = NIL;
+    cscan->custom_private = best_path->custom_private;
+    cscan->custom_relids = rel->relids;
+    cscan->methods = &vjoin_merge_scan_methods;
+
+    return &cscan->scan.plan;
+}
+
+/* CreateCustomScanState for VectorMergeJoin */
+Node *
+vjoin_merge_create_state(CustomScan *cscan)
+{
+    VectorMergeJoinState *state = (VectorMergeJoinState *)
+        newNode(sizeof(VectorMergeJoinState), T_CustomScanState);
+    state->css.methods = &vjoin_merge_exec_methods;
     return (Node *) state;
 }

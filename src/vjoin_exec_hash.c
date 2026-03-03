@@ -1,9 +1,12 @@
 #include "postgres.h"
 #include "access/htup_details.h"
+#include "access/tupdesc.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "nodes/extensible.h"
 #include "nodes/value.h"
+#include "utils/datum.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
@@ -32,36 +35,32 @@ vjoin_deserialize_keys(List *private_data,
 }
 
 /*
- * Fill the scan slot from matched outer + inner tuples.
+ * Fill the scan slot from pre-deformed outer + inner Datum arrays.
+ * No intermediate TupleTableSlot operations — just 4 memcpy.
  */
 static TupleTableSlot *
-vjoin_form_result(VectorHashJoinState *state, MinimalTuple outer_mt,
-                  MinimalTuple inner_mt)
+vjoin_form_result(VectorHashJoinState *state,
+                  int outer_batch_idx, int inner_ht_pos)
 {
     TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-    TupleTableSlot *outer_slot = state->outer_slot;
-    TupleTableSlot *inner_slot = state->inner_slot;
-
-    ExecStoreMinimalTuple(outer_mt, outer_slot, false);
-    slot_getallattrs(outer_slot);
-
-    ExecStoreMinimalTuple(inner_mt, inner_slot, false);
-    slot_getallattrs(inner_slot);
+    VJoinHashTable *ht = state->hashtable;
+    int outer_off = outer_batch_idx * state->num_outer_attrs;
+    int inner_off = inner_ht_pos * ht->num_all_attrs;
 
     ExecClearTuple(scan_slot);
 
     memcpy(scan_slot->tts_values,
-           outer_slot->tts_values,
+           &state->batch_values[outer_off],
            state->num_outer_attrs * sizeof(Datum));
     memcpy(scan_slot->tts_isnull,
-           outer_slot->tts_isnull,
+           &state->batch_isnull[outer_off],
            state->num_outer_attrs * sizeof(bool));
 
     memcpy(scan_slot->tts_values + state->num_outer_attrs,
-           inner_slot->tts_values,
+           &ht->all_values[inner_off],
            state->num_inner_attrs * sizeof(Datum));
     memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
-           inner_slot->tts_isnull,
+           &ht->all_isnull[inner_off],
            state->num_inner_attrs * sizeof(bool));
 
     ExecStoreVirtualTuple(scan_slot);
@@ -70,6 +69,7 @@ vjoin_form_result(VectorHashJoinState *state, MinimalTuple outer_mt,
 
 /*
  * Build phase: read all inner tuples into hash table.
+ * Pre-deforms all inner attributes for fast result emission.
  */
 static void
 vjoin_hash_build(VectorHashJoinState *state)
@@ -116,14 +116,55 @@ vjoin_hash_build(VectorHashJoinState *state)
             hashval = (i == 0) ? h : vjoin_combine_hashes(hashval, h);
         }
 
-        /* Insert into hash table */
+        /* Deform all inner attributes for fast emit */
+        slot_getallattrs(slot);
+
+        /* Insert into hash table with full deformed values */
         vjoin_ht_insert(state->hashtable, hashval,
                         ExecCopySlotMinimalTuple(slot),
-                        keyvals, keynulls);
+                        keyvals, keynulls,
+                        slot->tts_values, slot->tts_isnull);
     }
 
     MemoryContextSwitchTo(oldctx);
     state->phase = VHJ_PROBE;
+}
+
+/*
+ * Copy outer tuple attributes from slot into batch Datum arrays.
+ * For pass-by-value types: direct Datum copy.
+ * For pass-by-ref types: datumCopy into batch_ctx.
+ */
+static inline void
+vjoin_extract_outer_attrs(VectorHashJoinState *state,
+                          TupleTableSlot *slot, int batch_idx)
+{
+    int off = batch_idx * state->num_outer_attrs;
+
+    slot_getallattrs(slot);
+
+    if (state->batch_all_byval)
+    {
+        /* Fast path: all pass-by-value, just memcpy */
+        memcpy(&state->batch_values[off], slot->tts_values,
+               state->num_outer_attrs * sizeof(Datum));
+        memcpy(&state->batch_isnull[off], slot->tts_isnull,
+               state->num_outer_attrs * sizeof(bool));
+    }
+    else
+    {
+        int i;
+        for (i = 0; i < state->num_outer_attrs; i++)
+        {
+            state->batch_isnull[off + i] = slot->tts_isnull[i];
+            if (slot->tts_isnull[i] || state->outer_byval[i])
+                state->batch_values[off + i] = slot->tts_values[i];
+            else
+                state->batch_values[off + i] =
+                    datumCopy(slot->tts_values[i], false,
+                              state->outer_typlen[i]);
+        }
+    }
 }
 
 /*
@@ -149,7 +190,7 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
     {
         bool has_null = false;
         uint32 hashval = 0;
-        int i;
+        int i, off;
 
         /* Switch to parent context for ExecProcNode */
         MemoryContextSwitchTo(oldctx);
@@ -158,13 +199,17 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
         if (TupIsNull(slot))
             break;
 
-        state->batch_tuples[batch_idx] = ExecCopySlotMinimalTuple(slot);
+        /* Extract all outer attributes into batch Datum arrays */
+        vjoin_extract_outer_attrs(state, slot, batch_idx);
 
-        /* Extract keys and compute hash */
+        /* Compute hash from pre-extracted key values */
+        off = batch_idx * state->num_outer_attrs;
         for (i = 0; i < state->num_keys; i++)
         {
-            bool isnull;
-            Datum d = slot_getattr(slot, state->outer_keynos[i], &isnull);
+            int keyoff = state->outer_keynos[i] - 1;  /* 1-based → 0-based */
+            bool isnull = state->batch_isnull[off + keyoff];
+            Datum d = state->batch_values[off + keyoff];
+
             state->batch_keys[batch_idx * state->num_keys + i] = d;
             state->batch_nulls[batch_idx * state->num_keys + i] = isnull;
             if (isnull)
@@ -279,6 +324,7 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
                *inner_ps;
     TupleDesc   outer_desc,
                 inner_desc;
+    int         i;
 
     /* Initialize child plans */
     outer_ps = ExecInitNode(linitial(cscan->custom_plans), estate, eflags);
@@ -291,6 +337,8 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
     inner_desc = ExecGetResultType(inner_ps);
     state->num_outer_attrs = outer_desc->natts;
     state->num_inner_attrs = inner_desc->natts;
+    state->outer_desc = CreateTupleDescCopy(outer_desc);
+    state->inner_desc = CreateTupleDescCopy(inner_desc);
 
     /* Deserialize key info */
     vjoin_deserialize_keys(cscan->custom_private,
@@ -298,6 +346,19 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
                            state->outer_keynos,
                            state->inner_keynos,
                            state->key_types);
+
+    /* Detect pass-by-value for outer attrs (fast batch extraction) */
+    state->outer_byval = palloc(sizeof(bool) * state->num_outer_attrs);
+    state->outer_typlen = palloc(sizeof(int16) * state->num_outer_attrs);
+    state->batch_all_byval = true;
+    for (i = 0; i < state->num_outer_attrs; i++)
+    {
+        get_typlenbyval(TupleDescAttr(outer_desc, i)->atttypid,
+                        &state->outer_typlen[i],
+                        &state->outer_byval[i]);
+        if (!state->outer_byval[i])
+            state->batch_all_byval = false;
+    }
 
     /* Memory contexts */
     state->hash_ctx = AllocSetContextCreate(CurrentMemoryContext,
@@ -314,6 +375,7 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
             inner_rows = 64;
         state->hashtable = vjoin_ht_create((int) inner_rows,
                                            state->num_keys,
+                                           state->num_inner_attrs,
                                            state->hash_ctx);
     }
 
@@ -324,19 +386,16 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
     state->batch_nulls = palloc(sizeof(bool) * state->batch_size *
                                 state->num_keys);
     state->batch_hashes = palloc(sizeof(uint32) * state->batch_size);
-    state->batch_tuples = palloc(sizeof(MinimalTuple) * state->batch_size);
+    state->batch_values = palloc(sizeof(Datum) * state->batch_size *
+                                 state->num_outer_attrs);
+    state->batch_isnull = palloc(sizeof(bool) * state->batch_size *
+                                 state->num_outer_attrs);
 
     /* Result buffer */
     state->result_capacity = state->batch_size * 4;
     state->results = palloc(sizeof(VJoinMatch) * state->result_capacity);
     state->result_count = 0;
     state->result_pos = 0;
-
-    /* Temp slots for result construction */
-    state->outer_slot = MakeSingleTupleTableSlot(outer_desc,
-                                                 &TTSOpsMinimalTuple);
-    state->inner_slot = MakeSingleTupleTableSlot(inner_desc,
-                                                 &TTSOpsMinimalTuple);
 
     /* SIMD detection */
     state->use_simd = vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
@@ -383,9 +442,7 @@ vjoin_hash_exec(CustomScanState *node)
                     int ii = state->results[state->result_pos].inner_idx;
                     state->result_pos++;
 
-                    result = vjoin_form_result(state,
-                                              state->batch_tuples[oi],
-                                              state->hashtable->tuples[ii]);
+                    result = vjoin_form_result(state, oi, ii);
 
                     ResetExprContext(econtext);
                     econtext->ecxt_scantuple = result;
@@ -414,8 +471,10 @@ vjoin_hash_end(CustomScanState *node)
     ExecEndNode(state->outer_ps);
     ExecEndNode(state->inner_ps);
 
-    ExecDropSingleTupleTableSlot(state->outer_slot);
-    ExecDropSingleTupleTableSlot(state->inner_slot);
+    if (state->outer_desc)
+        FreeTupleDesc(state->outer_desc);
+    if (state->inner_desc)
+        FreeTupleDesc(state->inner_desc);
 
     if (state->hashtable)
         vjoin_ht_destroy(state->hashtable);

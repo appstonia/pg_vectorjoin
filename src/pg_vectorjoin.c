@@ -10,10 +10,19 @@ PG_MODULE_MAGIC;
 
 void _PG_init(void);
 
+/* Dummy function to force library loading from CREATE EXTENSION */
+PG_FUNCTION_INFO_V1(vjoin_loaded);
+Datum
+vjoin_loaded(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_BOOL(true);
+}
+
 /* GUC variables */
 bool    vjoin_enable = true;
 bool    vjoin_enable_hashjoin = true;
-bool    vjoin_enable_bnl = true;
+bool    vjoin_enable_nestloop = true;
+bool    vjoin_enable_mergejoin = true;
 int     vjoin_batch_size = VJOIN_DEFAULT_BATCH;
 double  vjoin_cost_factor = 0.5;
 
@@ -29,9 +38,14 @@ CustomScanMethods vjoin_hash_scan_methods = {
     .CreateCustomScanState = vjoin_hash_create_state,
 };
 
-CustomScanMethods vjoin_bnl_scan_methods = {
-    .CustomName = "BlockNestLoop",
-    .CreateCustomScanState = vjoin_bnl_create_state,
+CustomScanMethods vjoin_nestloop_scan_methods = {
+    .CustomName = "VectorNestedLoop",
+    .CreateCustomScanState = vjoin_nestloop_create_state,
+};
+
+CustomScanMethods vjoin_merge_scan_methods = {
+    .CustomName = "VectorMergeJoin",
+    .CreateCustomScanState = vjoin_merge_create_state,
 };
 
 /* CustomPathMethods */
@@ -40,9 +54,14 @@ CustomPathMethods vjoin_hash_path_methods = {
     .PlanCustomPath = vjoin_hash_plan,
 };
 
-CustomPathMethods vjoin_bnl_path_methods = {
-    .CustomName = "BlockNestLoop",
-    .PlanCustomPath = vjoin_bnl_plan,
+CustomPathMethods vjoin_nestloop_path_methods = {
+    .CustomName = "VectorNestedLoop",
+    .PlanCustomPath = vjoin_nestloop_plan,
+};
+
+CustomPathMethods vjoin_merge_path_methods = {
+    .CustomName = "VectorMergeJoin",
+    .PlanCustomPath = vjoin_merge_plan,
 };
 
 /* CustomExecMethods */
@@ -55,13 +74,22 @@ CustomExecMethods vjoin_hash_exec_methods = {
     .ExplainCustomScan = vjoin_hash_explain,
 };
 
-CustomExecMethods vjoin_bnl_exec_methods = {
-    .CustomName = "BlockNestLoop",
-    .BeginCustomScan = vjoin_bnl_begin,
-    .ExecCustomScan = vjoin_bnl_exec,
-    .EndCustomScan = vjoin_bnl_end,
-    .ReScanCustomScan = vjoin_bnl_rescan,
-    .ExplainCustomScan = vjoin_bnl_explain,
+CustomExecMethods vjoin_nestloop_exec_methods = {
+    .CustomName = "VectorNestedLoop",
+    .BeginCustomScan = vjoin_nestloop_begin,
+    .ExecCustomScan = vjoin_nestloop_exec,
+    .EndCustomScan = vjoin_nestloop_end,
+    .ReScanCustomScan = vjoin_nestloop_rescan,
+    .ExplainCustomScan = vjoin_nestloop_explain,
+};
+
+CustomExecMethods vjoin_merge_exec_methods = {
+    .CustomName = "VectorMergeJoin",
+    .BeginCustomScan = vjoin_merge_begin,
+    .ExecCustomScan = vjoin_merge_exec,
+    .EndCustomScan = vjoin_merge_end,
+    .ReScanCustomScan = vjoin_merge_rescan,
+    .ExplainCustomScan = vjoin_merge_explain,
 };
 
 void
@@ -84,10 +112,18 @@ _PG_init(void)
                              PGC_USERSET,
                              0, NULL, NULL, NULL);
 
-    DefineCustomBoolVariable("pg_vectorjoin.enable_bnl",
+    DefineCustomBoolVariable("pg_vectorjoin.enable_nestloop",
                              "Enable block nested loop join.",
                              NULL,
-                             &vjoin_enable_bnl,
+                             &vjoin_enable_nestloop,
+                             true,
+                             PGC_USERSET,
+                             0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_vectorjoin.enable_mergejoin",
+                             "Enable vectorized merge join.",
+                             NULL,
+                             &vjoin_enable_mergejoin,
                              true,
                              PGC_USERSET,
                              0, NULL, NULL, NULL);
@@ -119,7 +155,8 @@ _PG_init(void)
 
     /* Register CustomScanMethods */
     RegisterCustomScanMethods(&vjoin_hash_scan_methods);
-    RegisterCustomScanMethods(&vjoin_bnl_scan_methods);
+    RegisterCustomScanMethods(&vjoin_nestloop_scan_methods);
+    RegisterCustomScanMethods(&vjoin_merge_scan_methods);
     
     /* Install join pathlist hook */
     prev_join_pathlist_hook = set_join_pathlist_hook;

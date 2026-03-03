@@ -14,7 +14,8 @@ next_power_of_2(int n)
 }
 
 VJoinHashTable *
-vjoin_ht_create(int estimated_rows, int num_keys, MemoryContext parent)
+vjoin_ht_create(int estimated_rows, int num_keys, int num_all_attrs,
+                MemoryContext parent)
 {
     MemoryContext htctx;
     VJoinHashTable *ht;
@@ -28,6 +29,7 @@ vjoin_ht_create(int estimated_rows, int num_keys, MemoryContext parent)
                                                     sizeof(VJoinHashTable));
     ht->htctx = htctx;
     ht->num_keys = num_keys;
+    ht->num_all_attrs = num_all_attrs;
 
     /* Capacity = next power of 2 >= estimated_rows * load_factor */
     capacity = next_power_of_2(Max(estimated_rows * VJOIN_HT_LOAD_FACTOR, 128));
@@ -43,13 +45,18 @@ vjoin_ht_create(int estimated_rows, int num_keys, MemoryContext parent)
         MemoryContextAllocZero(htctx, sizeof(Datum) * capacity * num_keys);
     ht->key_nulls = (bool *)
         MemoryContextAllocZero(htctx, sizeof(bool) * capacity * num_keys);
+    ht->all_values = (Datum *)
+        MemoryContextAllocZero(htctx, sizeof(Datum) * capacity * num_all_attrs);
+    ht->all_isnull = (bool *)
+        MemoryContextAllocZero(htctx, sizeof(bool) * capacity * num_all_attrs);
 
     return ht;
 }
 
 void
 vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
-                MinimalTuple tuple, Datum *keyvals, bool *keynulls)
+                MinimalTuple tuple, Datum *keyvals, bool *keynulls,
+                Datum *all_values, bool *all_isnull)
 {
     int pos;
     MemoryContext old;
@@ -67,7 +74,10 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
         MinimalTuple  *old_tuples = ht->tuples;
         Datum         *old_keys = ht->keys;
         bool          *old_nulls = ht->key_nulls;
+        Datum         *old_vals = ht->all_values;
+        bool          *old_inull = ht->all_isnull;
         int            new_cap = old_cap * 2;
+        int            na = ht->num_all_attrs;
         int            i;
 
         old = MemoryContextSwitchTo(ht->htctx);
@@ -78,6 +88,8 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
         ht->tuples = (MinimalTuple *) palloc0(sizeof(MinimalTuple) * new_cap);
         ht->keys = (Datum *) palloc0(sizeof(Datum) * new_cap * ht->num_keys);
         ht->key_nulls = (bool *) palloc0(sizeof(bool) * new_cap * ht->num_keys);
+        ht->all_values = (Datum *) palloc0(sizeof(Datum) * new_cap * na);
+        ht->all_isnull = (bool *) palloc0(sizeof(bool) * new_cap * na);
 
         /* Reinsert existing entries */
         for (i = 0; i < old_cap; i++)
@@ -96,6 +108,12 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
                 memcpy(&ht->key_nulls[pos * ht->num_keys],
                        &old_nulls[i * ht->num_keys],
                        sizeof(bool) * ht->num_keys);
+                memcpy(&ht->all_values[pos * na],
+                       &old_vals[i * na],
+                       sizeof(Datum) * na);
+                memcpy(&ht->all_isnull[pos * na],
+                       &old_inull[i * na],
+                       sizeof(bool) * na);
             }
         }
 
@@ -103,6 +121,8 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
         pfree(old_tuples);
         pfree(old_keys);
         pfree(old_nulls);
+        pfree(old_vals);
+        pfree(old_inull);
 
         MemoryContextSwitchTo(old);
     }
@@ -120,6 +140,10 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
            sizeof(Datum) * ht->num_keys);
     memcpy(&ht->key_nulls[pos * ht->num_keys], keynulls,
            sizeof(bool) * ht->num_keys);
+    memcpy(&ht->all_values[pos * ht->num_all_attrs], all_values,
+           sizeof(Datum) * ht->num_all_attrs);
+    memcpy(&ht->all_isnull[pos * ht->num_all_attrs], all_isnull,
+           sizeof(bool) * ht->num_all_attrs);
     ht->num_entries++;
 
     MemoryContextSwitchTo(old);

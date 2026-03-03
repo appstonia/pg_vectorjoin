@@ -3,6 +3,7 @@
 
 #include "pg_vectorjoin.h"
 #include "executor/tuptable.h"
+#include "utils/tuplestore.h"
 
 /* ---------- Open-addressing hash table ---------- */
 typedef struct VJoinHashTable
@@ -11,6 +12,9 @@ typedef struct VJoinHashTable
     MinimalTuple *tuples;       /* [capacity] */
     Datum      *keys;           /* [capacity * num_keys] */
     bool       *key_nulls;      /* [capacity * num_keys] */
+    Datum      *all_values;     /* [capacity * num_all_attrs] pre-deformed */
+    bool       *all_isnull;     /* [capacity * num_all_attrs] */
+    int         num_all_attrs;  /* total inner attrs */
     int         capacity;       /* power of 2 */
     int         mask;           /* capacity - 1 */
     int         num_entries;
@@ -62,7 +66,8 @@ typedef struct VectorHashJoinState
     Datum      *batch_keys;        /* [batch_size * num_keys] */
     bool       *batch_nulls;       /* [batch_size * num_keys] */
     uint32     *batch_hashes;      /* [batch_size] */
-    MinimalTuple *batch_tuples;    /* [batch_size] */
+    Datum      *batch_values;      /* [batch_size * num_outer_attrs] deformed */
+    bool       *batch_isnull;      /* [batch_size * num_outer_attrs] */
 
     /* Result buffer */
     VJoinMatch *results;
@@ -70,9 +75,12 @@ typedef struct VectorHashJoinState
     int         result_pos;
     int         result_capacity;
 
-    /* Temp slots for result construction */
-    TupleTableSlot *outer_slot;
-    TupleTableSlot *inner_slot;
+    /* Type metadata for outer attrs (pass-by-ref handling) */
+    TupleDesc   outer_desc;
+    TupleDesc   inner_desc;
+    bool       *outer_byval;       /* [num_outer_attrs] */
+    int16      *outer_typlen;      /* [num_outer_attrs] */
+    bool        batch_all_byval;   /* true if all outer attrs pass-by-value */
 
     /* Memory */
     MemoryContext hash_ctx;
@@ -82,19 +90,19 @@ typedef struct VectorHashJoinState
 } VectorHashJoinState;
 
 /* ---------- Block Nested Loop state ---------- */
-typedef enum BNLPhase
+typedef enum NLPhase
 {
-    BNL_LOAD_BLOCK,
-    BNL_SCAN_INNER,
-    BNL_EMIT,
-    BNL_DONE
-} BNLPhase;
+    NL_LOAD_BLOCK,
+    NL_SCAN_INNER,
+    NL_EMIT,
+    NL_DONE
+} NLPhase;
 
-typedef struct BlockNestLoopState
+typedef struct VJoinNestLoopState
 {
     CustomScanState css;                /* must be first */
 
-    BNLPhase    phase;
+    NLPhase    phase;
 
     /* Key info */
     int         num_keys;
@@ -129,8 +137,123 @@ typedef struct BlockNestLoopState
     bool        inner_exhausted;
     bool        outer_exhausted;
 
+    /* Inner materialization (tuplestore) */
+    Tuplestorestate *inner_store;
+    bool        inner_stored;       /* true after first full scan */
+    TupleTableSlot *store_slot;     /* slot for reading from tuplestore */
+
     MemoryContext block_ctx;
     bool        use_simd;
-} BlockNestLoopState;
+} VJoinNestLoopState;
+
+/* ---------- Vectorized Merge Join state ---------- */
+typedef enum VMJPhase
+{
+    VMJ_INIT,
+    VMJ_ADVANCE,
+    VMJ_MATCH_OUTER,
+    VMJ_MATCH_INNER,
+    VMJ_EMIT,
+    VMJ_BATCH_FILL,
+    VMJ_BATCH_MERGE,
+    VMJ_BATCH_EMIT,
+    VMJ_DONE
+} VMJPhase;
+
+typedef struct VectorMergeJoinState
+{
+    CustomScanState css;                /* must be first */
+
+    VMJPhase    phase;
+
+    /* Key info (single-key for v1) */
+    int         num_keys;
+    AttrNumber  outer_keynos[VJOIN_MAX_KEYS];
+    AttrNumber  inner_keynos[VJOIN_MAX_KEYS];
+    Oid         key_types[VJOIN_MAX_KEYS];
+
+    /* Children */
+    PlanState  *outer_ps;
+    PlanState  *inner_ps;
+    int         num_outer_attrs;
+    int         num_inner_attrs;
+
+    /* Current position in each sorted stream */
+    MinimalTuple outer_tuple;           /* current outer tuple */
+    MinimalTuple inner_tuple;           /* current inner tuple */
+    TupleTableSlot *outer_cur_slot;     /* last slot from outer ExecProcNode */
+    TupleTableSlot *inner_cur_slot;     /* last slot from inner ExecProcNode */
+    Datum       outer_key[VJOIN_MAX_KEYS];
+    Datum       inner_key[VJOIN_MAX_KEYS];
+    bool        outer_null[VJOIN_MAX_KEYS];
+    bool        inner_null[VJOIN_MAX_KEYS];
+    bool        outer_done;
+    bool        inner_done;
+
+    /* Saved tuples for singleton detection */
+    MinimalTuple saved_outer;
+    MinimalTuple saved_inner;
+    Datum       match_key[VJOIN_MAX_KEYS];
+    bool        match_null[VJOIN_MAX_KEYS];
+    bool        outer_multi;
+    bool        inner_multi;
+
+    /* Outer group: all tuples with same key */
+    MinimalTuple *outer_group;
+    int         outer_group_count;
+    int         outer_group_capacity;
+
+    /* Inner group: all tuples with same key */
+    MinimalTuple *inner_group;
+    int         inner_group_count;
+    int         inner_group_capacity;
+
+    /* Emit position in cross product */
+    int         emit_outer_pos;
+    int         emit_inner_pos;
+
+    /* Temp slots for result construction */
+    TupleTableSlot *outer_slot;
+    TupleTableSlot *inner_slot;
+    TupleDesc   outer_desc;             /* saved for MT reconstruction */
+    TupleDesc   inner_desc;
+
+    /* Memory */
+    MemoryContext match_ctx;
+    bool        use_simd;
+    bool        all_byval;              /* all output columns pass-by-value */
+
+    /* Block merge buffers (used when all_byval is true) */
+    int         batch_size;
+
+    /* Outer block — pre-deformed into columnar arrays */
+    Datum      *ob_keys;                /* [batch_size] primary key values */
+    Datum      *ob_values;              /* [batch_size * num_outer_attrs] */
+    bool       *ob_isnull;              /* [batch_size * num_outer_attrs] */
+    int         ob_count;               /* tuples in current block */
+    int         ob_pos;                 /* current merge position */
+    bool        ob_exhausted;           /* child returned NULL */
+
+    /* Inner block */
+    Datum      *ib_keys;                /* [batch_size] primary key values */
+    Datum      *ib_values;              /* [batch_size * num_inner_attrs] */
+    bool       *ib_isnull;              /* [batch_size * num_inner_attrs] */
+    int         ib_count;
+    int         ib_pos;
+    bool        ib_exhausted;
+
+    /* Batch result buffer */
+    VJoinMatch *batch_results;
+    int         batch_result_count;
+    int         batch_result_pos;
+    int         batch_result_capacity;
+
+    /* Cross-product tracking for multi-match groups within a batch */
+    int         batch_cp_oi;            /* -1 if not in cross product */
+    int         batch_cp_ii;
+    int         batch_cp_oe;            /* outer group end */
+    int         batch_cp_ie;            /* inner group end */
+    int         batch_cp_ii_start;      /* inner group start for reset */
+} VectorMergeJoinState;
 
 #endif /* VJOIN_STATE_H */
