@@ -274,33 +274,29 @@ vjoin_try_nestloop(PlannerInfo *root,
                    outer_rows * inner_rows * cpu_operator_cost *
                    vjoin_cost_factor / simd_width;
 
-        /* NL is typically only competitive for smaller inner relations */
-        if (!(inner_rows > 10000 && nkeys > 0))
-        {
-            cpath = makeNode(CustomPath);
-            cpath->path.pathtype = T_CustomScan;
-            cpath->path.parent = joinrel;
-            cpath->path.pathtarget = joinrel->reltarget;
-            cpath->path.param_info = NULL;
-            cpath->path.parallel_aware = false;
-            cpath->path.parallel_safe = outer_path->parallel_safe &&
-                                        inner_path->parallel_safe;
-            cpath->path.parallel_workers = 0;
-            cpath->path.rows = joinrel->rows;
-            cpath->path.startup_cost = startup_cost;
-            cpath->path.total_cost = startup_cost + run_cost;
-            cpath->path.pathkeys = NIL;
-            cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-            cpath->custom_paths = list_make2(outer_path, inner_path);
+        cpath = makeNode(CustomPath);
+        cpath->path.pathtype = T_CustomScan;
+        cpath->path.parent = joinrel;
+        cpath->path.pathtarget = joinrel->reltarget;
+        cpath->path.param_info = NULL;
+        cpath->path.parallel_aware = false;
+        cpath->path.parallel_safe = outer_path->parallel_safe &&
+                                    inner_path->parallel_safe;
+        cpath->path.parallel_workers = 0;
+        cpath->path.rows = joinrel->rows;
+        cpath->path.startup_cost = startup_cost;
+        cpath->path.total_cost = startup_cost + run_cost;
+        cpath->path.pathkeys = NIL;
+        cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+        cpath->custom_paths = list_make2(outer_path, inner_path);
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
-            cpath->custom_restrictinfo = extra->restrictlist;
+        cpath->custom_restrictinfo = extra->restrictlist;
 #endif
-            cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                        inner_keynos, key_types);
-            cpath->methods = &vjoin_nestloop_path_methods;
+        cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
+                                                    inner_keynos, key_types);
+        cpath->methods = &vjoin_nestloop_path_methods;
 
-            add_path(joinrel, &cpath->path);
-        }
+        add_path(joinrel, &cpath->path);
     }
 
     /* --- Parallel path --- */
@@ -314,42 +310,39 @@ vjoin_try_nestloop(PlannerInfo *root,
             outer_rows = par_outer->rows;
             inner_rows = inner_path->rows;
 
-            if (!(inner_rows > 10000 && nkeys > 0))
-            {
-                num_blocks = ceil(outer_rows / vjoin_batch_size);
-                parallel_workers = par_outer->parallel_workers;
-                if (parallel_workers <= 0)
-                    parallel_workers = 1;
+            num_blocks = ceil(outer_rows / vjoin_batch_size);
+            parallel_workers = par_outer->parallel_workers;
+            if (parallel_workers <= 0)
+                parallel_workers = 1;
 
-                startup_cost = par_outer->startup_cost;
-                run_cost = par_outer->total_cost - par_outer->startup_cost +
-                           num_blocks * inner_path->total_cost +
-                           outer_rows * inner_rows * cpu_operator_cost *
-                           vjoin_cost_factor / simd_width;
+            startup_cost = par_outer->startup_cost;
+            run_cost = par_outer->total_cost - par_outer->startup_cost +
+                       num_blocks * inner_path->total_cost +
+                       outer_rows * inner_rows * cpu_operator_cost *
+                       vjoin_cost_factor / simd_width;
 
-                cpath = makeNode(CustomPath);
-                cpath->path.pathtype = T_CustomScan;
-                cpath->path.parent = joinrel;
-                cpath->path.pathtarget = joinrel->reltarget;
-                cpath->path.param_info = NULL;
-                cpath->path.parallel_aware = true;
-                cpath->path.parallel_safe = true;
-                cpath->path.parallel_workers = parallel_workers;
-                cpath->path.rows = clamp_row_est(joinrel->rows / parallel_workers);
-                cpath->path.startup_cost = startup_cost;
-                cpath->path.total_cost = startup_cost + run_cost;
-                cpath->path.pathkeys = NIL;
-                cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-                cpath->custom_paths = list_make2(par_outer, inner_path);
+            cpath = makeNode(CustomPath);
+            cpath->path.pathtype = T_CustomScan;
+            cpath->path.parent = joinrel;
+            cpath->path.pathtarget = joinrel->reltarget;
+            cpath->path.param_info = NULL;
+            cpath->path.parallel_aware = true;
+            cpath->path.parallel_safe = true;
+            cpath->path.parallel_workers = parallel_workers;
+            cpath->path.rows = clamp_row_est(joinrel->rows / parallel_workers);
+            cpath->path.startup_cost = startup_cost;
+            cpath->path.total_cost = startup_cost + run_cost;
+            cpath->path.pathkeys = NIL;
+            cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+            cpath->custom_paths = list_make2(par_outer, inner_path);
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
-                cpath->custom_restrictinfo = extra->restrictlist;
+            cpath->custom_restrictinfo = extra->restrictlist;
 #endif
-                cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                            inner_keynos, key_types);
-                cpath->methods = &vjoin_nestloop_path_methods;
+            cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
+                                                        inner_keynos, key_types);
+            cpath->methods = &vjoin_nestloop_path_methods;
 
-                add_partial_path(joinrel, &cpath->path);
-            }
+            add_partial_path(joinrel, &cpath->path);
         }
     }
 }
