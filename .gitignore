@@ -53,3 +53,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# IDE and editor files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+.DS_Store
