@@ -7,9 +7,9 @@
 
 /* Constants */
 #define VJOIN_MAX_KEYS          8
-#define VJOIN_DEFAULT_BATCH     1024
-#define VJOIN_MIN_BATCH         64
-#define VJOIN_MAX_BATCH         8192
+#define VJOIN_DEFAULT_BATCH     2000
+#define VJOIN_MIN_BATCH         100
+#define VJOIN_MAX_BATCH         10000
 #define VJOIN_HT_LOAD_FACTOR   2       /* capacity = inner_rows * factor */
 
 /* GUC variables */
