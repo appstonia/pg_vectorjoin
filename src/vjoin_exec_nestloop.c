@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "access/htup_details.h"
+#include "vjoin_compat.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "nodes/extensible.h"

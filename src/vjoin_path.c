@@ -14,6 +14,8 @@
 #include "vjoin_compat.h"
 #include "pg_vectorjoin.h"
 
+#include <math.h>
+
 /* Supported key types for SIMD fast path */
 static bool
 vjoin_is_supported_type(Oid typid)

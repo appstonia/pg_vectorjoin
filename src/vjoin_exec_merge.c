@@ -1,10 +1,12 @@
 #include "postgres.h"
 #include "access/htup_details.h"
+#include "vjoin_compat.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "nodes/extensible.h"
 #include "nodes/value.h"
 #include "utils/memutils.h"
+#include "vjoin_compat.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
@@ -204,7 +206,7 @@ vmj_collect_outer_group(VectorMergeJoinState *state, MinimalTuple first_mt)
         state->outer_group = repalloc(state->outer_group,
             sizeof(MinimalTuple) * state->outer_group_capacity);
     }
-    state->outer_group[state->outer_group_count++] = heap_copy_minimal_tuple(first_mt);
+    state->outer_group[state->outer_group_count++] = vjoin_heap_copy_minimal_tuple(first_mt);
 
     MemoryContextSwitchTo(oldctx);
 
@@ -263,7 +265,7 @@ vmj_collect_inner_group(VectorMergeJoinState *state, MinimalTuple first_mt)
         state->inner_group = repalloc(state->inner_group,
             sizeof(MinimalTuple) * state->inner_group_capacity);
     }
-    state->inner_group[state->inner_group_count++] = heap_copy_minimal_tuple(first_mt);
+    state->inner_group[state->inner_group_count++] = vjoin_heap_copy_minimal_tuple(first_mt);
 
     MemoryContextSwitchTo(oldctx);
 
@@ -945,11 +947,11 @@ vjoin_merge_exec(CustomScanState *node)
                         }
 
                         /* Multi group — reconstruct MinimalTuples from scan_slot */
-                        state->saved_outer = heap_form_minimal_tuple(
+                        state->saved_outer = vjoin_heap_form_minimal_tuple(
                             state->outer_desc,
                             scan_slot->tts_values,
                             scan_slot->tts_isnull);
-                        state->saved_inner = heap_form_minimal_tuple(
+                        state->saved_inner = vjoin_heap_form_minimal_tuple(
                             state->inner_desc,
                             scan_slot->tts_values + state->num_outer_attrs,
                             scan_slot->tts_isnull + state->num_outer_attrs);

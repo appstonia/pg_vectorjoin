@@ -28,11 +28,31 @@
 #define CUSTOMPATH_SUPPORT_PROJECTION 0x0004
 #endif
 
-/* custom_restrictinfo field in CustomPath was added in PG16 */
-#if PG_VERSION_NUM >= 160000
+/* custom_restrictinfo field in CustomPath was added in PG17 */
+#if PG_VERSION_NUM >= 170000
 #define VJOIN_HAS_CUSTOM_RESTRICTINFO 1
 #else
 #define VJOIN_HAS_CUSTOM_RESTRICTINFO 0
+#endif
+
+/* PG18 moved ExplainProperty* functions from commands/explain.h
+ * to commands/explain_format.h */
+#if PG_VERSION_NUM >= 180000
+#include "commands/explain_format.h"
+#else
+#include "commands/explain.h"
+#endif
+
+/* PG18 added an extra "Size extra" parameter to heap_copy_minimal_tuple
+ * and heap_form_minimal_tuple */
+#if PG_VERSION_NUM >= 180000
+#define vjoin_heap_copy_minimal_tuple(mt)  heap_copy_minimal_tuple((mt), 0)
+#define vjoin_heap_form_minimal_tuple(desc, vals, nulls) \
+    heap_form_minimal_tuple((desc), (vals), (nulls), 0)
+#else
+#define vjoin_heap_copy_minimal_tuple(mt)  heap_copy_minimal_tuple((mt))
+#define vjoin_heap_form_minimal_tuple(desc, vals, nulls) \
+    heap_form_minimal_tuple((desc), (vals), (nulls))
 #endif
 
 /* Value vs Integer API change: PG16+ uses makeInteger returning Integer*,
