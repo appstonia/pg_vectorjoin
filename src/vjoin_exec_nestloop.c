@@ -7,7 +7,11 @@
 #include "nodes/value.h"
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
+#include "utils/datum.h"
+#include "utils/typcache.h"
+#include "utils/lsyscache.h"
 #include "miscadmin.h"
+#include "fmgr.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
@@ -20,7 +24,9 @@ nl_deserialize_keys(List *private_data,
                      int *num_keys,
                      AttrNumber *outer_keynos,
                      AttrNumber *inner_keynos,
-                     Oid *key_types)
+                     Oid *key_types,
+                     Oid *eq_funcs,
+                     Oid *key_collations)
 {
     int idx = 0;
     int i;
@@ -31,6 +37,9 @@ nl_deserialize_keys(List *private_data,
         outer_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
         inner_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
         key_types[i] = (Oid) intVal(list_nth(private_data, idx++));
+        idx++;  /* skip hash_proc */
+        eq_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
+        key_collations[i] = (Oid) intVal(list_nth(private_data, idx++));
     }
 }
 
@@ -105,6 +114,8 @@ nl_load_outer_block(VJoinNestLoopState *state)
         {
             bool isnull;
             Datum d = slot_getattr(slot, state->outer_keynos[k], &isnull);
+            if (!isnull && !state->key_byval[k])
+                d = datumCopy(d, false, state->key_typlen[k]);
             state->block_keys[loaded * state->num_keys + k] = d;
             state->block_nulls[loaded * state->num_keys + k] = isnull;
         }
@@ -298,7 +309,10 @@ nl_compare_block(VJoinNestLoopState *state,
                         match = false;
                     break;
                 default:
-                    if (outer_d != inner_d)
+                    if (!DatumGetBool(FunctionCall2Coll(
+                            &state->eq_finfo[k],
+                            state->key_collations[k],
+                            outer_d, inner_d)))
                         match = false;
                     break;
             }
@@ -445,7 +459,22 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
                          &state->num_keys,
                          state->outer_keynos,
                          state->inner_keynos,
-                         state->key_types);
+                         state->key_types,
+                         state->eq_funcs,
+                         state->key_collations);
+
+    /* Set up generic equality functions and type metadata */
+    {
+        int i;
+        for (i = 0; i < state->num_keys; i++)
+        {
+            get_typlenbyval(state->key_types[i],
+                            &state->key_typlen[i],
+                            &state->key_byval[i]);
+            if (OidIsValid(state->eq_funcs[i]))
+                fmgr_info(get_opcode(state->eq_funcs[i]), &state->eq_finfo[i]);
+        }
+    }
 
     /* Block buffer */
     state->block_size = vjoin_batch_size;

@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include "utils/datum.h"
 #include "utils/memutils.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
@@ -15,7 +16,8 @@ next_power_of_2(int n)
 
 VJoinHashTable *
 vjoin_ht_create(int estimated_rows, int num_keys, int num_all_attrs,
-                MemoryContext parent)
+                MemoryContext parent, bool *key_byval, int16 *key_typlen,
+                bool *attr_byval, int16 *attr_typlen)
 {
     MemoryContext htctx;
     VJoinHashTable *ht;
@@ -30,6 +32,22 @@ vjoin_ht_create(int estimated_rows, int num_keys, int num_all_attrs,
     ht->htctx = htctx;
     ht->num_keys = num_keys;
     ht->num_all_attrs = num_all_attrs;
+
+    /* Store key type metadata for datumCopy of pass-by-ref keys */
+    ht->key_byval = (bool *)
+        MemoryContextAlloc(htctx, sizeof(bool) * num_keys);
+    ht->key_typlen = (int16 *)
+        MemoryContextAlloc(htctx, sizeof(int16) * num_keys);
+    memcpy(ht->key_byval, key_byval, sizeof(bool) * num_keys);
+    memcpy(ht->key_typlen, key_typlen, sizeof(int16) * num_keys);
+
+    /* Store inner attr type metadata for datumCopy of pass-by-ref values */
+    ht->attr_byval = (bool *)
+        MemoryContextAlloc(htctx, sizeof(bool) * num_all_attrs);
+    ht->attr_typlen = (int16 *)
+        MemoryContextAlloc(htctx, sizeof(int16) * num_all_attrs);
+    memcpy(ht->attr_byval, attr_byval, sizeof(bool) * num_all_attrs);
+    memcpy(ht->attr_typlen, attr_typlen, sizeof(int16) * num_all_attrs);
 
     /* Capacity = next power of 2 >= estimated_rows * load_factor */
     capacity = next_power_of_2(Max(estimated_rows * VJOIN_HT_LOAD_FACTOR, 128));
@@ -136,14 +154,41 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
 
     ht->hashvals[pos] = hashval;
     ht->tuples[pos] = tuple;
-    memcpy(&ht->keys[pos * ht->num_keys], keyvals,
-           sizeof(Datum) * ht->num_keys);
-    memcpy(&ht->key_nulls[pos * ht->num_keys], keynulls,
-           sizeof(bool) * ht->num_keys);
+
+    /* Copy keys — use datumCopy for pass-by-ref types */
+    {
+        int k;
+        for (k = 0; k < ht->num_keys; k++)
+        {
+            int dst = pos * ht->num_keys + k;
+            ht->key_nulls[dst] = keynulls[k];
+            if (keynulls[k] || ht->key_byval[k])
+                ht->keys[dst] = keyvals[k];
+            else
+                ht->keys[dst] = datumCopy(keyvals[k],
+                                           false,
+                                           ht->key_typlen[k]);
+        }
+    }
+
     memcpy(&ht->all_values[pos * ht->num_all_attrs], all_values,
            sizeof(Datum) * ht->num_all_attrs);
     memcpy(&ht->all_isnull[pos * ht->num_all_attrs], all_isnull,
            sizeof(bool) * ht->num_all_attrs);
+
+    /* datumCopy pass-by-ref inner attribute values */
+    {
+        int a;
+        int base = pos * ht->num_all_attrs;
+        for (a = 0; a < ht->num_all_attrs; a++)
+        {
+            if (!ht->all_isnull[base + a] && !ht->attr_byval[a])
+                ht->all_values[base + a] =
+                    datumCopy(ht->all_values[base + a],
+                              false, ht->attr_typlen[a]);
+        }
+    }
+
     ht->num_entries++;
 
     MemoryContextSwitchTo(old);

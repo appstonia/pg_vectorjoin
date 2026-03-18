@@ -11,16 +11,42 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "utils/lsyscache.h"
+#include "utils/typcache.h"
 #include "vjoin_compat.h"
 #include "pg_vectorjoin.h"
 
 #include <math.h>
 
-/* Supported key types for SIMD fast path */
+/*
+ * Check if a type is usable for vectorized hash join.
+ * Fast-path for INT4/INT8/FLOAT8, generic check via type cache for others.
+ */
 static bool
-vjoin_is_supported_type(Oid typid)
+vjoin_type_has_hash_support(Oid typid, Oid *hash_proc, Oid *eq_opr)
 {
-    return typid == INT4OID || typid == INT8OID || typid == FLOAT8OID;
+    TypeCacheEntry *typentry;
+
+    /* Fast numeric types — always supported, no cache lookup needed */
+    switch (typid)
+    {
+        case INT4OID:
+        case INT8OID:
+        case FLOAT8OID:
+            *hash_proc = InvalidOid;   /* will use inline fast path */
+            *eq_opr = InvalidOid;
+            return true;
+        default:
+            break;
+    }
+
+    /* Generic: look up hash function and equality operator */
+    typentry = lookup_type_cache(typid, TYPECACHE_HASH_PROC | TYPECACHE_EQ_OPR);
+    if (!OidIsValid(typentry->hash_proc) || !OidIsValid(typentry->eq_opr))
+        return false;
+
+    *hash_proc = typentry->hash_proc;
+    *eq_opr = typentry->eq_opr;
+    return true;
 }
 
 /*
@@ -34,6 +60,9 @@ vjoin_analyze_clauses(List *restrictlist,
                       AttrNumber *outer_keynos,
                       AttrNumber *inner_keynos,
                       Oid *key_types,
+                      Oid *hash_procs,
+                      Oid *eq_oprs,
+                      Oid *collations,
                       List *outer_tlist,
                       List *inner_tlist)
 {
@@ -47,6 +76,7 @@ vjoin_analyze_clauses(List *restrictlist,
         Node       *left,
                    *right;
         Oid         keytype;
+        Oid         hp, eo;
         TargetEntry *outer_tle,
                     *inner_tle;
 
@@ -72,7 +102,7 @@ vjoin_analyze_clauses(List *restrictlist,
             continue;
 
         keytype = exprType(left);
-        if (!vjoin_is_supported_type(keytype))
+        if (!vjoin_type_has_hash_support(keytype, &hp, &eo))
             continue;
 
         /* Match Var to outer/inner relation */
@@ -97,6 +127,9 @@ vjoin_analyze_clauses(List *restrictlist,
         outer_keynos[nkeys] = outer_tle->resno;
         inner_keynos[nkeys] = inner_tle->resno;
         key_types[nkeys] = keytype;
+        hash_procs[nkeys] = hp;
+        eq_oprs[nkeys] = eo;
+        collations[nkeys] = opexpr->inputcollid;
         nkeys++;
     }
 
@@ -105,11 +138,13 @@ vjoin_analyze_clauses(List *restrictlist,
 
 /*
  * Build custom_private list for serialization into the plan.
- * Format: [num_keys, outer_keyno1, inner_keyno1, keytype1, ...]
+ * Format: [num_keys, outer_keyno1, inner_keyno1, keytype1,
+ *          hash_proc1, eq_opr1, collation1, ...]
  */
 static List *
 vjoin_build_private(int num_keys, AttrNumber *outer_keynos,
-                    AttrNumber *inner_keynos, Oid *key_types)
+                    AttrNumber *inner_keynos, Oid *key_types,
+                    Oid *hash_procs, Oid *eq_oprs, Oid *collations)
 {
     List *result = NIL;
     int   i;
@@ -120,6 +155,9 @@ vjoin_build_private(int num_keys, AttrNumber *outer_keynos,
         result = lappend(result, makeInteger((int) outer_keynos[i]));
         result = lappend(result, makeInteger((int) inner_keynos[i]));
         result = lappend(result, makeInteger((int) key_types[i]));
+        result = lappend(result, makeInteger((int) hash_procs[i]));
+        result = lappend(result, makeInteger((int) eq_oprs[i]));
+        result = lappend(result, makeInteger((int) collations[i]));
     }
     return result;
 }
@@ -136,7 +174,10 @@ vjoin_try_hashjoin(PlannerInfo *root,
                    int nkeys,
                    AttrNumber *outer_keynos,
                    AttrNumber *inner_keynos,
-                   Oid *key_types)
+                   Oid *key_types,
+                   Oid *hash_procs,
+                   Oid *eq_oprs,
+                   Oid *collations)
 {
     Path       *outer_path = outerrel->cheapest_total_path;
     Path       *inner_path = innerrel->cheapest_total_path;
@@ -176,7 +217,9 @@ vjoin_try_hashjoin(PlannerInfo *root,
         cpath->custom_restrictinfo = extra->restrictlist;
 #endif
         cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                    inner_keynos, key_types);
+                                                    inner_keynos, key_types,
+                                                    hash_procs, eq_oprs,
+                                                    collations);
         cpath->methods = &vjoin_hash_path_methods;
 
         add_path(joinrel, &cpath->path);
@@ -231,7 +274,9 @@ vjoin_try_hashjoin(PlannerInfo *root,
             cpath->custom_restrictinfo = extra->restrictlist;
 #endif
             cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                        inner_keynos, key_types);
+                                                        inner_keynos, key_types,
+                                                        hash_procs, eq_oprs,
+                                                        collations);
             cpath->methods = &vjoin_hash_path_methods;
 
             add_partial_path(joinrel, &cpath->path);
@@ -251,7 +296,10 @@ vjoin_try_nestloop(PlannerInfo *root,
               int nkeys,
               AttrNumber *outer_keynos,
               AttrNumber *inner_keynos,
-              Oid *key_types)
+              Oid *key_types,
+              Oid *hash_procs,
+              Oid *eq_oprs,
+              Oid *collations)
 {
     Path       *outer_path = outerrel->cheapest_total_path;
     Path       *inner_path = innerrel->cheapest_total_path;
@@ -295,7 +343,9 @@ vjoin_try_nestloop(PlannerInfo *root,
         cpath->custom_restrictinfo = extra->restrictlist;
 #endif
         cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                    inner_keynos, key_types);
+                                                    inner_keynos, key_types,
+                                                    hash_procs, eq_oprs,
+                                                    collations);
         cpath->methods = &vjoin_nestloop_path_methods;
 
         add_path(joinrel, &cpath->path);
@@ -341,7 +391,9 @@ vjoin_try_nestloop(PlannerInfo *root,
             cpath->custom_restrictinfo = extra->restrictlist;
 #endif
             cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                        inner_keynos, key_types);
+                                                        inner_keynos, key_types,
+                                                        hash_procs, eq_oprs,
+                                                        collations);
             cpath->methods = &vjoin_nestloop_path_methods;
 
             add_partial_path(joinrel, &cpath->path);
@@ -363,7 +415,10 @@ vjoin_try_mergejoin(PlannerInfo *root,
                     int nkeys,
                     AttrNumber *outer_keynos,
                     AttrNumber *inner_keynos,
-                    Oid *key_types)
+                    Oid *key_types,
+                    Oid *hash_procs,
+                    Oid *eq_oprs,
+                    Oid *collations)
 {
     ListCell   *lc;
     RestrictInfo *merge_rinfo = NULL;
@@ -506,7 +561,9 @@ vjoin_try_mergejoin(PlannerInfo *root,
     cpath->custom_restrictinfo = extra->restrictlist;
 #endif
     cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                inner_keynos, key_types);
+                                                inner_keynos, key_types,
+                                                hash_procs, eq_oprs,
+                                                collations);
     cpath->methods = &vjoin_merge_path_methods;
 
     add_path(joinrel, &cpath->path);
@@ -605,7 +662,9 @@ vjoin_try_mergejoin(PlannerInfo *root,
             pcpath->custom_restrictinfo = extra->restrictlist;
 #endif
             pcpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                         inner_keynos, key_types);
+                                                         inner_keynos, key_types,
+                                                         hash_procs, eq_oprs,
+                                                         collations);
             pcpath->methods = &vjoin_merge_path_methods;
 
             if (par_is_parallel)
@@ -630,6 +689,9 @@ vjoin_pathlist_hook(PlannerInfo *root,
     AttrNumber  outer_keynos[VJOIN_MAX_KEYS];
     AttrNumber  inner_keynos[VJOIN_MAX_KEYS];
     Oid         key_types[VJOIN_MAX_KEYS];
+    Oid         hash_procs[VJOIN_MAX_KEYS];
+    Oid         eq_oprs[VJOIN_MAX_KEYS];
+    Oid         collations[VJOIN_MAX_KEYS];
     int         nkeys;
 
     /* Chain to any previous hook first */
@@ -676,7 +738,8 @@ vjoin_pathlist_hook(PlannerInfo *root,
         nkeys = vjoin_analyze_clauses(extra->restrictlist,
                                       outerrel, innerrel,
                                       outer_keynos, inner_keynos,
-                                      key_types,
+                                      key_types, hash_procs, eq_oprs,
+                                      collations,
                                       outer_tl, inner_tl);
 
         list_free(outer_tl);
@@ -688,13 +751,16 @@ vjoin_pathlist_hook(PlannerInfo *root,
 
     if (vjoin_enable_hashjoin)
         vjoin_try_hashjoin(root, joinrel, outerrel, innerrel, extra,
-                           nkeys, outer_keynos, inner_keynos, key_types);
+                           nkeys, outer_keynos, inner_keynos, key_types,
+                           hash_procs, eq_oprs, collations);
 
     if (vjoin_enable_nestloop)
         vjoin_try_nestloop(root, joinrel, outerrel, innerrel, extra,
-                      nkeys, outer_keynos, inner_keynos, key_types);
+                      nkeys, outer_keynos, inner_keynos, key_types,
+                      hash_procs, eq_oprs, collations);
 
     if (vjoin_enable_mergejoin)
         vjoin_try_mergejoin(root, joinrel, outerrel, innerrel, extra,
-                            nkeys, outer_keynos, inner_keynos, key_types);
+                            nkeys, outer_keynos, inner_keynos, key_types,
+                            hash_procs, eq_oprs, collations);
 }

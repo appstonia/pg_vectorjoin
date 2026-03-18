@@ -3,6 +3,7 @@
 
 #include "pg_vectorjoin.h"
 #include "executor/tuptable.h"
+#include "fmgr.h"
 #include "utils/tuplestore.h"
 
 /* ---------- Open-addressing hash table ---------- */
@@ -19,6 +20,10 @@ typedef struct VJoinHashTable
     int         mask;           /* capacity - 1 */
     int         num_entries;
     int         num_keys;
+    bool       *key_byval;      /* [num_keys] — pass-by-value per key */
+    int16      *key_typlen;     /* [num_keys] — type length per key */
+    bool       *attr_byval;     /* [num_all_attrs] — pass-by-value per attr */
+    int16      *attr_typlen;    /* [num_all_attrs] — type length per attr */
     MemoryContext htctx;
 } VJoinHashTable;
 
@@ -49,6 +54,16 @@ typedef struct VectorHashJoinState
     AttrNumber  outer_keynos[VJOIN_MAX_KEYS];
     AttrNumber  inner_keynos[VJOIN_MAX_KEYS];
     Oid         key_types[VJOIN_MAX_KEYS];
+
+    /* Generic hash/eq support (InvalidOid for INT4/INT8/FLOAT8 fast path) */
+    Oid         hash_funcs[VJOIN_MAX_KEYS];
+    Oid         eq_funcs[VJOIN_MAX_KEYS];
+    Oid         key_collations[VJOIN_MAX_KEYS];
+    FmgrInfo    hash_finfo[VJOIN_MAX_KEYS];
+    FmgrInfo    eq_finfo[VJOIN_MAX_KEYS];
+    bool        key_byval[VJOIN_MAX_KEYS];
+    int16       key_typlen[VJOIN_MAX_KEYS];
+    bool        keys_all_byval;     /* true if all key types pass-by-value */
 
     /* Children */
     PlanState  *outer_ps;
@@ -109,6 +124,13 @@ typedef struct VJoinNestLoopState
     AttrNumber  outer_keynos[VJOIN_MAX_KEYS];
     AttrNumber  inner_keynos[VJOIN_MAX_KEYS];
     Oid         key_types[VJOIN_MAX_KEYS];
+
+    /* Generic equality support */
+    Oid         eq_funcs[VJOIN_MAX_KEYS];
+    Oid         key_collations[VJOIN_MAX_KEYS];
+    FmgrInfo    eq_finfo[VJOIN_MAX_KEYS];
+    bool        key_byval[VJOIN_MAX_KEYS];
+    int16       key_typlen[VJOIN_MAX_KEYS];
 
     /* Children */
     PlanState  *outer_ps;
@@ -171,6 +193,14 @@ typedef struct VectorMergeJoinState
     AttrNumber  outer_keynos[VJOIN_MAX_KEYS];
     AttrNumber  inner_keynos[VJOIN_MAX_KEYS];
     Oid         key_types[VJOIN_MAX_KEYS];
+
+    /* Generic comparison/equality support */
+    Oid         eq_funcs[VJOIN_MAX_KEYS];
+    Oid         key_collations[VJOIN_MAX_KEYS];
+    FmgrInfo    cmp_finfo[VJOIN_MAX_KEYS];
+    FmgrInfo    eq_finfo[VJOIN_MAX_KEYS];
+    bool        key_byval[VJOIN_MAX_KEYS];
+    int16       key_typlen[VJOIN_MAX_KEYS];
 
     /* Children */
     PlanState  *outer_ps;
