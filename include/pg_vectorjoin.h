@@ -7,9 +7,9 @@
 
 /* Constants */
 #define VJOIN_MAX_KEYS          8
-#define VJOIN_DEFAULT_BATCH     1024
-#define VJOIN_MIN_BATCH         64
-#define VJOIN_MAX_BATCH         8192
+#define VJOIN_DEFAULT_BATCH     2000
+#define VJOIN_MIN_BATCH         100
+#define VJOIN_MAX_BATCH         10000
 #define VJOIN_HT_LOAD_FACTOR   2       /* capacity = inner_rows * factor */
 
 /* GUC variables */
@@ -87,11 +87,15 @@ void vjoin_merge_explain(CustomScanState *node, List *ancestors, ExplainState *e
 struct VJoinHashTable;
 typedef struct VJoinHashTable VJoinHashTable;
 VJoinHashTable *vjoin_ht_create(int estimated_rows, int num_keys,
-                                int num_all_attrs, MemoryContext parent);
+                                int num_all_attrs, MemoryContext parent,
+                                bool *key_byval, int16 *key_typlen,
+                                bool *attr_byval, int16 *attr_typlen);
 void vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
                      MinimalTuple tuple, Datum *keyvals, bool *keynulls,
                      Datum *all_values, bool *all_isnull);
 void vjoin_ht_destroy(VJoinHashTable *ht);
+
+#include "fmgr.h"
 
 /* Inline murmurhash32 finalizer */
 static inline uint32
@@ -105,6 +109,7 @@ vjoin_murmurhash32(uint32 h)
     return h;
 }
 
+/* Fast-path hash for INT4/INT8/FLOAT8 */
 static inline uint32
 vjoin_hash_datum(Datum d, Oid keytype)
 {
@@ -128,6 +133,20 @@ vjoin_hash_datum(Datum d, Oid keytype)
         default:
             return vjoin_murmurhash32((uint32) d);
     }
+}
+
+/* Generic hash via PG's type-specific hash function (collation-aware) */
+static inline uint32
+vjoin_hash_datum_generic(Datum d, FmgrInfo *hashfn, Oid collation)
+{
+    return DatumGetUInt32(FunctionCall1Coll(hashfn, collation, d));
+}
+
+/* Returns true if type uses inline fast path, false if generic FmgrInfo needed */
+static inline bool
+vjoin_is_fast_type(Oid typid)
+{
+    return typid == INT4OID || typid == INT8OID || typid == FLOAT8OID;
 }
 
 static inline uint32

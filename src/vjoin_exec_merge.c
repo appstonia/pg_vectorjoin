@@ -6,7 +6,11 @@
 #include "nodes/extensible.h"
 #include "nodes/value.h"
 #include "utils/memutils.h"
+#include "utils/datum.h"
+#include "utils/typcache.h"
+#include "utils/lsyscache.h"
 #include "vjoin_compat.h"
+#include "fmgr.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
@@ -21,7 +25,9 @@ vmj_deserialize_keys(List *private_data,
                      int *num_keys,
                      AttrNumber *outer_keynos,
                      AttrNumber *inner_keynos,
-                     Oid *key_types)
+                     Oid *key_types,
+                     Oid *eq_funcs,
+                     Oid *key_collations)
 {
     int idx = 0;
     int i;
@@ -32,6 +38,9 @@ vmj_deserialize_keys(List *private_data,
         outer_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
         inner_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
         key_types[i] = (Oid) intVal(list_nth(private_data, idx++));
+        idx++;  /* skip hash_proc */
+        eq_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
+        key_collations[i] = (Oid) intVal(list_nth(private_data, idx++));
     }
 }
 
@@ -84,10 +93,12 @@ vmj_compare_keys(VectorMergeJoinState *state)
             }
             default:
             {
-                Datum od = state->outer_key[i];
-                Datum id = state->inner_key[i];
-                if (od < id) return -1;
-                if (od > id) return 1;
+                int32 r = DatumGetInt32(FunctionCall2Coll(
+                              &state->cmp_finfo[i],
+                              state->key_collations[i],
+                              state->outer_key[i],
+                              state->inner_key[i]));
+                if (r != 0) return r;
                 break;
             }
         }
@@ -124,7 +135,10 @@ vmj_keys_equal(VectorMergeJoinState *state,
                     return false;
                 break;
             default:
-                if (key_a[i] != key_b[i])
+                if (!DatumGetBool(FunctionCall2Coll(
+                        &state->eq_finfo[i],
+                        state->key_collations[i],
+                        key_a[i], key_b[i])))
                     return false;
                 break;
         }
@@ -697,7 +711,34 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
                          &state->num_keys,
                          state->outer_keynos,
                          state->inner_keynos,
-                         state->key_types);
+                         state->key_types,
+                         state->eq_funcs,
+                         state->key_collations);
+
+    /* Set up generic comparison/equality functions and type metadata */
+    {
+        int i;
+        for (i = 0; i < state->num_keys; i++)
+        {
+            get_typlenbyval(state->key_types[i],
+                            &state->key_typlen[i],
+                            &state->key_byval[i]);
+
+            if (!vjoin_is_fast_type(state->key_types[i]))
+            {
+                TypeCacheEntry *typentry;
+
+                /* btree comparison function for ordering */
+                typentry = lookup_type_cache(state->key_types[i], TYPECACHE_CMP_PROC);
+                if (OidIsValid(typentry->cmp_proc))
+                    fmgr_info(typentry->cmp_proc, &state->cmp_finfo[i]);
+
+                /* equality function */
+                if (OidIsValid(state->eq_funcs[i]))
+                    fmgr_info(get_opcode(state->eq_funcs[i]), &state->eq_finfo[i]);
+            }
+        }
+    }
 
     /* Memory context for group buffers — reset between match groups */
     state->match_ctx = AllocSetContextCreate(CurrentMemoryContext,
@@ -888,10 +929,19 @@ vjoin_merge_exec(CustomScanState *node)
                      * form result from child slots before advancing,
                      * only reconstruct MinimalTuples in the rare multi case.
                      */
-                    memcpy(state->match_key, state->outer_key,
-                           sizeof(Datum) * state->num_keys);
-                    memcpy(state->match_null, state->outer_null,
-                           sizeof(bool) * state->num_keys);
+                    {
+                        int mk;
+                        for (mk = 0; mk < state->num_keys; mk++)
+                        {
+                            if (!state->outer_null[mk] && !state->key_byval[mk])
+                                state->match_key[mk] = datumCopy(
+                                    state->outer_key[mk], false,
+                                    state->key_typlen[mk]);
+                            else
+                                state->match_key[mk] = state->outer_key[mk];
+                            state->match_null[mk] = state->outer_null[mk];
+                        }
+                    }
 
                     if (state->all_byval)
                     {

@@ -11,16 +11,42 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "utils/lsyscache.h"
+#include "utils/typcache.h"
 #include "vjoin_compat.h"
 #include "pg_vectorjoin.h"
 
 #include <math.h>
 
-/* Supported key types for SIMD fast path */
+/*
+ * Check if a type is usable for vectorized hash join.
+ * Fast-path for INT4/INT8/FLOAT8, generic check via type cache for others.
+ */
 static bool
-vjoin_is_supported_type(Oid typid)
+vjoin_type_has_hash_support(Oid typid, Oid *hash_proc, Oid *eq_opr)
 {
-    return typid == INT4OID || typid == INT8OID || typid == FLOAT8OID;
+    TypeCacheEntry *typentry;
+
+    /* Fast numeric types — always supported, no cache lookup needed */
+    switch (typid)
+    {
+        case INT4OID:
+        case INT8OID:
+        case FLOAT8OID:
+            *hash_proc = InvalidOid;   /* will use inline fast path */
+            *eq_opr = InvalidOid;
+            return true;
+        default:
+            break;
+    }
+
+    /* Generic: look up hash function and equality operator */
+    typentry = lookup_type_cache(typid, TYPECACHE_HASH_PROC | TYPECACHE_EQ_OPR);
+    if (!OidIsValid(typentry->hash_proc) || !OidIsValid(typentry->eq_opr))
+        return false;
+
+    *hash_proc = typentry->hash_proc;
+    *eq_opr = typentry->eq_opr;
+    return true;
 }
 
 /*
@@ -34,6 +60,9 @@ vjoin_analyze_clauses(List *restrictlist,
                       AttrNumber *outer_keynos,
                       AttrNumber *inner_keynos,
                       Oid *key_types,
+                      Oid *hash_procs,
+                      Oid *eq_oprs,
+                      Oid *collations,
                       List *outer_tlist,
                       List *inner_tlist)
 {
@@ -47,6 +76,7 @@ vjoin_analyze_clauses(List *restrictlist,
         Node       *left,
                    *right;
         Oid         keytype;
+        Oid         hp, eo;
         TargetEntry *outer_tle,
                     *inner_tle;
 
@@ -72,7 +102,7 @@ vjoin_analyze_clauses(List *restrictlist,
             continue;
 
         keytype = exprType(left);
-        if (!vjoin_is_supported_type(keytype))
+        if (!vjoin_type_has_hash_support(keytype, &hp, &eo))
             continue;
 
         /* Match Var to outer/inner relation */
@@ -97,6 +127,9 @@ vjoin_analyze_clauses(List *restrictlist,
         outer_keynos[nkeys] = outer_tle->resno;
         inner_keynos[nkeys] = inner_tle->resno;
         key_types[nkeys] = keytype;
+        hash_procs[nkeys] = hp;
+        eq_oprs[nkeys] = eo;
+        collations[nkeys] = opexpr->inputcollid;
         nkeys++;
     }
 
@@ -105,11 +138,13 @@ vjoin_analyze_clauses(List *restrictlist,
 
 /*
  * Build custom_private list for serialization into the plan.
- * Format: [num_keys, outer_keyno1, inner_keyno1, keytype1, ...]
+ * Format: [num_keys, outer_keyno1, inner_keyno1, keytype1,
+ *          hash_proc1, eq_opr1, collation1, ...]
  */
 static List *
 vjoin_build_private(int num_keys, AttrNumber *outer_keynos,
-                    AttrNumber *inner_keynos, Oid *key_types)
+                    AttrNumber *inner_keynos, Oid *key_types,
+                    Oid *hash_procs, Oid *eq_oprs, Oid *collations)
 {
     List *result = NIL;
     int   i;
@@ -120,8 +155,130 @@ vjoin_build_private(int num_keys, AttrNumber *outer_keynos,
         result = lappend(result, makeInteger((int) outer_keynos[i]));
         result = lappend(result, makeInteger((int) inner_keynos[i]));
         result = lappend(result, makeInteger((int) key_types[i]));
+        result = lappend(result, makeInteger((int) hash_procs[i]));
+        result = lappend(result, makeInteger((int) eq_oprs[i]));
+        result = lappend(result, makeInteger((int) collations[i]));
     }
     return result;
+}
+
+/*
+ * Analyze join restriction list for a single theta-join clause on a
+ * fast type (INT4/INT8/FLOAT8) that can be handled via SIMD comparison.
+ * Returns the btree strategy number (1-5) or 6 for NE, 0 if not found.
+ */
+static int
+vjoin_analyze_theta_clause(List *restrictlist,
+                           RelOptInfo *outerrel,
+                           RelOptInfo *innerrel,
+                           List *outer_tlist,
+                           List *inner_tlist,
+                           AttrNumber *theta_outer_keyno,
+                           AttrNumber *theta_inner_keyno,
+                           Oid *theta_keytype)
+{
+    ListCell      *lc;
+    int            ntheta = 0;
+    int            found_strategy = 0;
+
+    foreach(lc, restrictlist)
+    {
+        RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+        OpExpr       *opexpr;
+        Node         *left, *right;
+        Oid           keytype;
+        TargetEntry  *outer_tle, *inner_tle;
+        TypeCacheEntry *typentry;
+        int           strategy;
+        bool          swapped;
+
+        if (!IsA(rinfo->clause, OpExpr))
+            return 0;   /* complex clause, bail out */
+
+        opexpr = (OpExpr *) rinfo->clause;
+        if (list_length(opexpr->args) != 2)
+            return 0;
+
+        left = (Node *) linitial(opexpr->args);
+        right = (Node *) lsecond(opexpr->args);
+        if (!IsA(left, Var) || !IsA(right, Var))
+            return 0;
+
+        ntheta++;
+        if (ntheta > 1)
+            return 0;   /* multiple clauses — can't SIMD optimize */
+
+        keytype = exprType(left);
+        if (keytype != INT4OID && keytype != INT8OID && keytype != FLOAT8OID)
+            return 0;
+
+        /* Look up btree operator family for this type */
+        typentry = lookup_type_cache(keytype, TYPECACHE_BTREE_OPFAMILY);
+        if (!OidIsValid(typentry->btree_opf))
+            return 0;
+
+        strategy = get_op_opfamily_strategy(opexpr->opno, typentry->btree_opf);
+
+        if (strategy == 0)
+        {
+            /* Check for NE via negator of equality */
+            Oid negator = get_negator(opexpr->opno);
+            if (OidIsValid(negator) &&
+                get_op_opfamily_strategy(negator, typentry->btree_opf) == BTEqualStrategyNumber)
+                strategy = 6;  /* NE */
+            else
+                return 0;
+        }
+
+        /* Only theta (non-equality) strategies */
+        if (strategy == BTEqualStrategyNumber)
+            return 0;   /* equi-join, handled by regular key analysis */
+
+        /* Determine which side is outer vs inner */
+        if (bms_is_subset(rinfo->left_relids, outerrel->relids) &&
+            bms_is_subset(rinfo->right_relids, innerrel->relids))
+        {
+            outer_tle = tlist_member((Expr *) left, outer_tlist);
+            inner_tle = tlist_member((Expr *) right, inner_tlist);
+            swapped = false;
+        }
+        else if (bms_is_subset(rinfo->right_relids, outerrel->relids) &&
+                 bms_is_subset(rinfo->left_relids, innerrel->relids))
+        {
+            outer_tle = tlist_member((Expr *) right, outer_tlist);
+            inner_tle = tlist_member((Expr *) left, inner_tlist);
+            swapped = true;
+        }
+        else
+            return 0;
+
+        if (outer_tle == NULL || inner_tle == NULL)
+            return 0;
+
+        /*
+         * If sides were swapped, mirror the strategy:
+         * "left OP right" with swapped sides means "outer OP_mirror inner".
+         * LT(1) <-> GT(5), LE(2) <-> GE(4), EQ(3) stable, NE(6) stable.
+         */
+        if (swapped)
+        {
+            switch (strategy)
+            {
+                case 1: strategy = 5; break;
+                case 2: strategy = 4; break;
+                case 4: strategy = 2; break;
+                case 5: strategy = 1; break;
+                default: break;
+            }
+        }
+
+        *theta_outer_keyno = outer_tle->resno;
+        *theta_inner_keyno = inner_tle->resno;
+        *theta_keytype = keytype;
+        found_strategy = strategy;
+    }
+
+    return found_strategy;
 }
 
 /*
@@ -136,7 +293,10 @@ vjoin_try_hashjoin(PlannerInfo *root,
                    int nkeys,
                    AttrNumber *outer_keynos,
                    AttrNumber *inner_keynos,
-                   Oid *key_types)
+                   Oid *key_types,
+                   Oid *hash_procs,
+                   Oid *eq_oprs,
+                   Oid *collations)
 {
     Path       *outer_path = outerrel->cheapest_total_path;
     Path       *inner_path = innerrel->cheapest_total_path;
@@ -176,7 +336,9 @@ vjoin_try_hashjoin(PlannerInfo *root,
         cpath->custom_restrictinfo = extra->restrictlist;
 #endif
         cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                    inner_keynos, key_types);
+                                                    inner_keynos, key_types,
+                                                    hash_procs, eq_oprs,
+                                                    collations);
         cpath->methods = &vjoin_hash_path_methods;
 
         add_path(joinrel, &cpath->path);
@@ -231,7 +393,9 @@ vjoin_try_hashjoin(PlannerInfo *root,
             cpath->custom_restrictinfo = extra->restrictlist;
 #endif
             cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                        inner_keynos, key_types);
+                                                        inner_keynos, key_types,
+                                                        hash_procs, eq_oprs,
+                                                        collations);
             cpath->methods = &vjoin_hash_path_methods;
 
             add_partial_path(joinrel, &cpath->path);
@@ -251,7 +415,14 @@ vjoin_try_nestloop(PlannerInfo *root,
               int nkeys,
               AttrNumber *outer_keynos,
               AttrNumber *inner_keynos,
-              Oid *key_types)
+              Oid *key_types,
+              Oid *hash_procs,
+              Oid *eq_oprs,
+              Oid *collations,
+              int theta_strategy,
+              AttrNumber theta_outer_keyno,
+              AttrNumber theta_inner_keyno,
+              Oid theta_keytype)
 {
     Path       *outer_path = outerrel->cheapest_total_path;
     Path       *inner_path = innerrel->cheapest_total_path;
@@ -261,7 +432,7 @@ vjoin_try_nestloop(PlannerInfo *root,
     double      outer_rows,
                 inner_rows,
                 num_blocks;
-    int         simd_width = 4;
+    int         simd_width = (nkeys > 0 || theta_strategy != 0) ? 4 : 1;
 
     /* --- Non-parallel path --- */
     if (outer_path != NULL && inner_path != NULL)
@@ -295,7 +466,32 @@ vjoin_try_nestloop(PlannerInfo *root,
         cpath->custom_restrictinfo = extra->restrictlist;
 #endif
         cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                    inner_keynos, key_types);
+                                                    inner_keynos, key_types,
+                                                    hash_procs, eq_oprs,
+                                                    collations);
+        /* Append theta SIMD info */
+        cpath->custom_private = lappend(cpath->custom_private,
+                                        makeInteger(theta_strategy));
+        if (theta_strategy != 0)
+        {
+            cpath->custom_private = lappend(cpath->custom_private,
+                                            makeInteger((int) theta_outer_keyno));
+            cpath->custom_private = lappend(cpath->custom_private,
+                                            makeInteger((int) theta_inner_keyno));
+            cpath->custom_private = lappend(cpath->custom_private,
+                                            makeInteger((int) theta_keytype));
+        }
+        /* Append join qual expressions for executor evaluation */
+        {
+            List *join_clauses = NIL;
+            ListCell *rlc;
+            foreach(rlc, extra->restrictlist)
+            {
+                RestrictInfo *ri = lfirst_node(RestrictInfo, rlc);
+                join_clauses = lappend(join_clauses, copyObject(ri->clause));
+            }
+            cpath->custom_private = lappend(cpath->custom_private, join_clauses);
+        }
         cpath->methods = &vjoin_nestloop_path_methods;
 
         add_path(joinrel, &cpath->path);
@@ -341,7 +537,32 @@ vjoin_try_nestloop(PlannerInfo *root,
             cpath->custom_restrictinfo = extra->restrictlist;
 #endif
             cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                        inner_keynos, key_types);
+                                                        inner_keynos, key_types,
+                                                        hash_procs, eq_oprs,
+                                                        collations);
+            /* Append theta SIMD info */
+            cpath->custom_private = lappend(cpath->custom_private,
+                                            makeInteger(theta_strategy));
+            if (theta_strategy != 0)
+            {
+                cpath->custom_private = lappend(cpath->custom_private,
+                                                makeInteger((int) theta_outer_keyno));
+                cpath->custom_private = lappend(cpath->custom_private,
+                                                makeInteger((int) theta_inner_keyno));
+                cpath->custom_private = lappend(cpath->custom_private,
+                                                makeInteger((int) theta_keytype));
+            }
+            /* Append join qual expressions for executor evaluation */
+            {
+                List *join_clauses = NIL;
+                ListCell *rlc;
+                foreach(rlc, extra->restrictlist)
+                {
+                    RestrictInfo *ri = lfirst_node(RestrictInfo, rlc);
+                    join_clauses = lappend(join_clauses, copyObject(ri->clause));
+                }
+                cpath->custom_private = lappend(cpath->custom_private, join_clauses);
+            }
             cpath->methods = &vjoin_nestloop_path_methods;
 
             add_partial_path(joinrel, &cpath->path);
@@ -363,7 +584,10 @@ vjoin_try_mergejoin(PlannerInfo *root,
                     int nkeys,
                     AttrNumber *outer_keynos,
                     AttrNumber *inner_keynos,
-                    Oid *key_types)
+                    Oid *key_types,
+                    Oid *hash_procs,
+                    Oid *eq_oprs,
+                    Oid *collations)
 {
     ListCell   *lc;
     RestrictInfo *merge_rinfo = NULL;
@@ -506,7 +730,9 @@ vjoin_try_mergejoin(PlannerInfo *root,
     cpath->custom_restrictinfo = extra->restrictlist;
 #endif
     cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                inner_keynos, key_types);
+                                                inner_keynos, key_types,
+                                                hash_procs, eq_oprs,
+                                                collations);
     cpath->methods = &vjoin_merge_path_methods;
 
     add_path(joinrel, &cpath->path);
@@ -605,7 +831,9 @@ vjoin_try_mergejoin(PlannerInfo *root,
             pcpath->custom_restrictinfo = extra->restrictlist;
 #endif
             pcpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
-                                                         inner_keynos, key_types);
+                                                         inner_keynos, key_types,
+                                                         hash_procs, eq_oprs,
+                                                         collations);
             pcpath->methods = &vjoin_merge_path_methods;
 
             if (par_is_parallel)
@@ -630,6 +858,9 @@ vjoin_pathlist_hook(PlannerInfo *root,
     AttrNumber  outer_keynos[VJOIN_MAX_KEYS];
     AttrNumber  inner_keynos[VJOIN_MAX_KEYS];
     Oid         key_types[VJOIN_MAX_KEYS];
+    Oid         hash_procs[VJOIN_MAX_KEYS];
+    Oid         eq_oprs[VJOIN_MAX_KEYS];
+    Oid         collations[VJOIN_MAX_KEYS];
     int         nkeys;
 
     /* Chain to any previous hook first */
@@ -676,25 +907,69 @@ vjoin_pathlist_hook(PlannerInfo *root,
         nkeys = vjoin_analyze_clauses(extra->restrictlist,
                                       outerrel, innerrel,
                                       outer_keynos, inner_keynos,
-                                      key_types,
+                                      key_types, hash_procs, eq_oprs,
+                                      collations,
                                       outer_tl, inner_tl);
 
         list_free(outer_tl);
         list_free(inner_tl);
     }
 
-    if (nkeys == 0)
-        return;
+    /* Hash join and merge join require at least one equality key */
+    if (nkeys > 0)
+    {
+        if (vjoin_enable_hashjoin)
+            vjoin_try_hashjoin(root, joinrel, outerrel, innerrel, extra,
+                               nkeys, outer_keynos, inner_keynos, key_types,
+                               hash_procs, eq_oprs, collations);
 
-    if (vjoin_enable_hashjoin)
-        vjoin_try_hashjoin(root, joinrel, outerrel, innerrel, extra,
-                           nkeys, outer_keynos, inner_keynos, key_types);
+        if (vjoin_enable_mergejoin)
+            vjoin_try_mergejoin(root, joinrel, outerrel, innerrel, extra,
+                                nkeys, outer_keynos, inner_keynos, key_types,
+                                hash_procs, eq_oprs, collations);
+    }
 
+    /* Nested loop works for both equi-join (nkeys>0) and theta-join (nkeys==0) */
     if (vjoin_enable_nestloop)
-        vjoin_try_nestloop(root, joinrel, outerrel, innerrel, extra,
-                      nkeys, outer_keynos, inner_keynos, key_types);
+    {
+        int        theta_strategy = 0;
+        AttrNumber theta_outer_keyno = 0;
+        AttrNumber theta_inner_keyno = 0;
+        Oid        theta_keytype = InvalidOid;
 
-    if (vjoin_enable_mergejoin)
-        vjoin_try_mergejoin(root, joinrel, outerrel, innerrel, extra,
-                            nkeys, outer_keynos, inner_keynos, key_types);
+        /* For theta joins (no equi-join keys), try to detect a single SIMD-able theta clause */
+        if (nkeys == 0)
+        {
+            List       *outer_tl2 = NIL;
+            List       *inner_tl2 = NIL;
+            ListCell   *lc2;
+            int         resno2;
+
+            resno2 = 1;
+            foreach(lc2, outerrel->reltarget->exprs)
+                outer_tl2 = lappend(outer_tl2,
+                                    makeTargetEntry((Expr *) lfirst(lc2),
+                                                    resno2++, NULL, false));
+            resno2 = 1;
+            foreach(lc2, innerrel->reltarget->exprs)
+                inner_tl2 = lappend(inner_tl2,
+                                    makeTargetEntry((Expr *) lfirst(lc2),
+                                                    resno2++, NULL, false));
+
+            theta_strategy = vjoin_analyze_theta_clause(extra->restrictlist,
+                                                        outerrel, innerrel,
+                                                        outer_tl2, inner_tl2,
+                                                        &theta_outer_keyno,
+                                                        &theta_inner_keyno,
+                                                        &theta_keytype);
+            list_free(outer_tl2);
+            list_free(inner_tl2);
+        }
+
+        vjoin_try_nestloop(root, joinrel, outerrel, innerrel, extra,
+                      nkeys, outer_keynos, inner_keynos, key_types,
+                      hash_procs, eq_oprs, collations,
+                      theta_strategy, theta_outer_keyno,
+                      theta_inner_keyno, theta_keytype);
+    }
 }

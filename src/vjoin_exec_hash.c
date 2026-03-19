@@ -9,6 +9,7 @@
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "fmgr.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
@@ -21,7 +22,10 @@ vjoin_deserialize_keys(List *private_data,
                        int *num_keys,
                        AttrNumber *outer_keynos,
                        AttrNumber *inner_keynos,
-                       Oid *key_types)
+                       Oid *key_types,
+                       Oid *hash_funcs,
+                       Oid *eq_funcs,
+                       Oid *key_collations)
 {
     int idx = 0;
     int i;
@@ -32,6 +36,9 @@ vjoin_deserialize_keys(List *private_data,
         outer_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
         inner_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
         key_types[i] = (Oid) intVal(list_nth(private_data, idx++));
+        hash_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
+        eq_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
+        key_collations[i] = (Oid) intVal(list_nth(private_data, idx++));
     }
 }
 
@@ -113,7 +120,13 @@ vjoin_hash_build(VectorHashJoinState *state)
         hashval = 0;
         for (i = 0; i < state->num_keys; i++)
         {
-            uint32 h = vjoin_hash_datum(keyvals[i], state->key_types[i]);
+            uint32 h;
+            if (vjoin_is_fast_type(state->key_types[i]))
+                h = vjoin_hash_datum(keyvals[i], state->key_types[i]);
+            else
+                h = vjoin_hash_datum_generic(keyvals[i],
+                                             &state->hash_finfo[i],
+                                             state->key_collations[i]);
             hashval = (i == 0) ? h : vjoin_combine_hashes(hashval, h);
         }
 
@@ -217,7 +230,13 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
                 has_null = true;
             else
             {
-                uint32 h = vjoin_hash_datum(d, state->key_types[i]);
+                uint32 h;
+                if (vjoin_is_fast_type(state->key_types[i]))
+                    h = vjoin_hash_datum(d, state->key_types[i]);
+                else
+                    h = vjoin_hash_datum_generic(d,
+                                                 &state->hash_finfo[i],
+                                                 state->key_collations[i]);
                 hashval = (i == 0) ? h : vjoin_combine_hashes(hashval, h);
             }
         }
@@ -279,7 +298,11 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
                                 match = false;
                             break;
                         default:
-                            if (outer_key != inner_key)
+                            if (!DatumGetBool(
+                                    FunctionCall2Coll(
+                                        &state->eq_finfo[k],
+                                        state->key_collations[k],
+                                        outer_key, inner_key)))
                                 match = false;
                             break;
                     }
@@ -346,7 +369,27 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
                            &state->num_keys,
                            state->outer_keynos,
                            state->inner_keynos,
-                           state->key_types);
+                           state->key_types,
+                           state->hash_funcs,
+                           state->eq_funcs,
+                           state->key_collations);
+
+    /* Set up FmgrInfo caches and key type metadata */
+    state->keys_all_byval = true;
+    for (i = 0; i < state->num_keys; i++)
+    {
+        get_typlenbyval(state->key_types[i],
+                        &state->key_typlen[i],
+                        &state->key_byval[i]);
+        if (!state->key_byval[i])
+            state->keys_all_byval = false;
+
+        /* Set up generic hash/eq functions for non-numeric types */
+        if (OidIsValid(state->hash_funcs[i]))
+            fmgr_info(state->hash_funcs[i], &state->hash_finfo[i]);
+        if (OidIsValid(state->eq_funcs[i]))
+            fmgr_info(get_opcode(state->eq_funcs[i]), &state->eq_finfo[i]);
+    }
 
     /* Detect pass-by-value for outer attrs (fast batch extraction) */
     state->outer_byval = palloc(sizeof(bool) * state->num_outer_attrs);
@@ -372,12 +415,33 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
     /* Create hash table (estimate based on inner plan rows) */
     {
         double inner_rows = inner_ps->plan->plan_rows;
+        bool   *inner_byval;
+        int16  *inner_typlen;
+
         if (inner_rows < 64)
             inner_rows = 64;
+
+        /* Gather inner attr type metadata for pass-by-ref handling */
+        inner_byval = palloc(sizeof(bool) * state->num_inner_attrs);
+        inner_typlen = palloc(sizeof(int16) * state->num_inner_attrs);
+        for (i = 0; i < state->num_inner_attrs; i++)
+        {
+            get_typlenbyval(TupleDescAttr(inner_desc, i)->atttypid,
+                            &inner_typlen[i],
+                            &inner_byval[i]);
+        }
+
         state->hashtable = vjoin_ht_create((int) inner_rows,
                                            state->num_keys,
                                            state->num_inner_attrs,
-                                           state->hash_ctx);
+                                           state->hash_ctx,
+                                           state->key_byval,
+                                           state->key_typlen,
+                                           inner_byval,
+                                           inner_typlen);
+
+        pfree(inner_byval);
+        pfree(inner_typlen);
     }
 
     /* Allocate batch buffers */

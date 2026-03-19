@@ -7,7 +7,11 @@
 #include "nodes/value.h"
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
+#include "utils/datum.h"
+#include "utils/typcache.h"
+#include "utils/lsyscache.h"
 #include "miscadmin.h"
+#include "fmgr.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
@@ -20,7 +24,13 @@ nl_deserialize_keys(List *private_data,
                      int *num_keys,
                      AttrNumber *outer_keynos,
                      AttrNumber *inner_keynos,
-                     Oid *key_types)
+                     Oid *key_types,
+                     Oid *eq_funcs,
+                     Oid *key_collations,
+                     int *theta_strategy,
+                     AttrNumber *theta_outer_keyno,
+                     AttrNumber *theta_inner_keyno,
+                     Oid *theta_keytype)
 {
     int idx = 0;
     int i;
@@ -31,6 +41,24 @@ nl_deserialize_keys(List *private_data,
         outer_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
         inner_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
         key_types[i] = (Oid) intVal(list_nth(private_data, idx++));
+        idx++;  /* skip hash_proc */
+        eq_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
+        key_collations[i] = (Oid) intVal(list_nth(private_data, idx++));
+    }
+
+    /* Theta SIMD info */
+    *theta_strategy = intVal(list_nth(private_data, idx++));
+    if (*theta_strategy != 0)
+    {
+        *theta_outer_keyno = (AttrNumber) intVal(list_nth(private_data, idx++));
+        *theta_inner_keyno = (AttrNumber) intVal(list_nth(private_data, idx++));
+        *theta_keytype = (Oid) intVal(list_nth(private_data, idx++));
+    }
+    else
+    {
+        *theta_outer_keyno = 0;
+        *theta_inner_keyno = 0;
+        *theta_keytype = InvalidOid;
     }
 }
 
@@ -100,13 +128,71 @@ nl_load_outer_block(VJoinNestLoopState *state)
 
         state->block_tuples[loaded] = ExecCopySlotMinimalTuple(slot);
 
+        /* Pre-deform outer into columnar arrays for theta scan */
+        if (state->block_values != NULL)
+        {
+            ExecStoreMinimalTuple(state->block_tuples[loaded],
+                                  state->outer_slot, false);
+            slot_getallattrs(state->outer_slot);
+            memcpy(&state->block_values[loaded * state->num_outer_attrs],
+                   state->outer_slot->tts_values,
+                   state->num_outer_attrs * sizeof(Datum));
+            memcpy(&state->block_isnull[loaded * state->num_outer_attrs],
+                   state->outer_slot->tts_isnull,
+                   state->num_outer_attrs * sizeof(bool));
+        }
+
         /* Extract keys into columnar arrays */
         for (k = 0; k < state->num_keys; k++)
         {
             bool isnull;
             Datum d = slot_getattr(slot, state->outer_keynos[k], &isnull);
+            if (!isnull && !state->key_byval[k])
+                d = datumCopy(d, false, state->key_typlen[k]);
             state->block_keys[loaded * state->num_keys + k] = d;
             state->block_nulls[loaded * state->num_keys + k] = isnull;
+        }
+
+        /* Extract theta key into typed array for SIMD comparison */
+        if (state->theta_strategy != 0)
+        {
+            bool isnull;
+            Datum d = slot_getattr(slot, state->theta_outer_keyno, &isnull);
+            state->theta_block_nulls[loaded] = isnull;
+            if (!isnull)
+            {
+                switch (state->theta_keytype)
+                {
+                    case INT4OID:
+                        ((int32 *)state->theta_typed_keys)[loaded] =
+                            DatumGetInt32(d);
+                        break;
+                    case INT8OID:
+                        ((int64 *)state->theta_typed_keys)[loaded] =
+                            DatumGetInt64(d);
+                        break;
+                    case FLOAT8OID:
+                        ((double *)state->theta_typed_keys)[loaded] =
+                            DatumGetFloat8(d);
+                        break;
+                }
+            }
+            else
+            {
+                /* Zero-fill for NULL — will be post-filtered */
+                switch (state->theta_keytype)
+                {
+                    case INT4OID:
+                        ((int32 *)state->theta_typed_keys)[loaded] = 0;
+                        break;
+                    case INT8OID:
+                        ((int64 *)state->theta_typed_keys)[loaded] = 0;
+                        break;
+                    case FLOAT8OID:
+                        ((double *)state->theta_typed_keys)[loaded] = 0.0;
+                        break;
+                }
+            }
         }
 
         loaded++;
@@ -298,7 +384,10 @@ nl_compare_block(VJoinNestLoopState *state,
                         match = false;
                     break;
                 default:
-                    if (outer_d != inner_d)
+                    if (!DatumGetBool(FunctionCall2Coll(
+                            &state->eq_finfo[k],
+                            state->key_collations[k],
+                            outer_d, inner_d)))
                         match = false;
                     break;
             }
@@ -445,21 +534,71 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
                          &state->num_keys,
                          state->outer_keynos,
                          state->inner_keynos,
-                         state->key_types);
+                         state->key_types,
+                         state->eq_funcs,
+                         state->key_collations,
+                         &state->theta_strategy,
+                         &state->theta_outer_keyno,
+                         &state->theta_inner_keyno,
+                         &state->theta_keytype);
+
+    /* Set up generic equality functions and type metadata */
+    {
+        int i;
+        for (i = 0; i < state->num_keys; i++)
+        {
+            get_typlenbyval(state->key_types[i],
+                            &state->key_typlen[i],
+                            &state->key_byval[i]);
+            if (OidIsValid(state->eq_funcs[i]))
+                fmgr_info(get_opcode(state->eq_funcs[i]), &state->eq_finfo[i]);
+        }
+    }
 
     /* Block buffer */
     state->block_size = vjoin_batch_size;
-    state->block_keys = palloc(sizeof(Datum) * state->block_size *
-                               state->num_keys);
-    state->block_nulls = palloc(sizeof(bool) * state->block_size *
-                                state->num_keys);
+    if (state->num_keys > 0)
+    {
+        state->block_keys = palloc(sizeof(Datum) * state->block_size *
+                                   state->num_keys);
+        state->block_nulls = palloc(sizeof(bool) * state->block_size *
+                                    state->num_keys);
+    }
+    else
+    {
+        state->block_keys = NULL;
+        state->block_nulls = NULL;
+    }
     state->block_tuples = palloc(sizeof(MinimalTuple) * state->block_size);
 
-    /* Result buffer */
-    state->result_capacity = state->block_size * 4;
-    state->results = palloc(sizeof(VJoinMatch) * state->result_capacity);
-    state->result_inner_tuples = palloc(sizeof(MinimalTuple) *
-                                        state->result_capacity);
+    /* Pre-deformed outer values for theta scan */
+    if (state->num_keys == 0)
+    {
+        state->block_values = palloc(sizeof(Datum) * state->block_size *
+                                     state->num_outer_attrs);
+        state->block_isnull = palloc(sizeof(bool) * state->block_size *
+                                     state->num_outer_attrs);
+    }
+    else
+    {
+        state->block_values = NULL;
+        state->block_isnull = NULL;
+    }
+
+    /* Result buffer (only needed for equi-join key matching) */
+    if (state->num_keys > 0)
+    {
+        state->result_capacity = state->block_size * 4;
+        state->results = palloc(sizeof(VJoinMatch) * state->result_capacity);
+        state->result_inner_tuples = palloc(sizeof(MinimalTuple) *
+                                            state->result_capacity);
+    }
+    else
+    {
+        state->result_capacity = 0;
+        state->results = NULL;
+        state->result_inner_tuples = NULL;
+    }
     state->result_count = 0;
     state->result_pos = 0;
 
@@ -474,8 +613,44 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
                                              "NestLoop block",
                                              ALLOCSET_DEFAULT_SIZES);
 
-    state->use_simd = vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
-                      vjoin_simd_caps.has_neon;
+    state->use_simd = ((state->num_keys > 0) || (state->theta_strategy != 0)) &&
+                       (vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
+                        vjoin_simd_caps.has_neon);
+
+    /* Theta SIMD arrays */
+    if (state->theta_strategy != 0)
+    {
+        size_t elem_size;
+
+        switch (state->theta_keytype)
+        {
+            case INT4OID:  elem_size = sizeof(int32); break;
+            case INT8OID:  elem_size = sizeof(int64); break;
+            case FLOAT8OID: elem_size = sizeof(double); break;
+            default:       elem_size = 0; break;
+        }
+        if (elem_size > 0)
+        {
+            state->theta_typed_keys = palloc(elem_size * state->block_size);
+            state->theta_block_nulls = palloc(sizeof(bool) * state->block_size);
+            state->theta_match_buf = palloc(sizeof(int) * state->block_size);
+        }
+        else
+        {
+            state->theta_strategy = 0;  /* unsupported type, disable */
+            state->theta_typed_keys = NULL;
+            state->theta_block_nulls = NULL;
+            state->theta_match_buf = NULL;
+        }
+    }
+    else
+    {
+        state->theta_typed_keys = NULL;
+        state->theta_block_nulls = NULL;
+        state->theta_match_buf = NULL;
+    }
+    state->theta_match_count = 0;
+    state->theta_match_pos = 0;
 
     /* Inner materialization */
     state->inner_store = tuplestore_begin_heap(false, false, work_mem);
@@ -485,7 +660,15 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
 
     state->inner_exhausted = false;
     state->outer_exhausted = false;
+    state->theta_has_inner = false;
+    state->theta_outer_pos = 0;
     state->phase = NL_LOAD_BLOCK;
+
+    /* Initialize join quals from custom_exprs (handles theta-join conditions).
+     * Skip when theta SIMD is active — the single theta clause is handled
+     * by SIMD comparison directly. */
+    if (cscan->custom_exprs != NIL && state->theta_strategy == 0)
+        node->ss.ps.qual = ExecInitQual(cscan->custom_exprs, (PlanState *) node);
 }
 
 TupleTableSlot *
@@ -515,13 +698,19 @@ vjoin_nestloop_exec(CustomScanState *node)
                     continue;
                 }
 
-                /* Rescan inner: use tuplestore if already materialized */
                 state->inner_exhausted = false;
                 if (state->inner_stored)
                     tuplestore_rescan(state->inner_store);
                 else
                     ExecReScan(state->inner_ps);
-                state->phase = NL_SCAN_INNER;
+
+                if (state->num_keys == 0)
+                {
+                    state->theta_has_inner = false;
+                    state->phase = NL_THETA_SCAN;
+                }
+                else
+                    state->phase = NL_SCAN_INNER;
                 continue;
 
             case NL_SCAN_INNER:
@@ -579,6 +768,181 @@ vjoin_nestloop_exec(CustomScanState *node)
 
             case NL_DONE:
                 return NULL;
+
+            case NL_THETA_SCAN:
+            {
+                TupleTableSlot *scan_slot = node->ss.ss_ScanTupleSlot;
+                int n_outer = state->num_outer_attrs;
+                int n_inner = state->num_inner_attrs;
+
+                for (;;)
+                {
+                    CHECK_FOR_INTERRUPTS();
+
+                    /* SIMD theta: emit buffered matches */
+                    if (state->theta_strategy != 0 && state->theta_has_inner)
+                    {
+                        while (state->theta_match_pos < state->theta_match_count)
+                        {
+                            int oi = state->theta_match_buf[state->theta_match_pos++];
+
+                            memcpy(scan_slot->tts_values,
+                                   &state->block_values[oi * n_outer],
+                                   n_outer * sizeof(Datum));
+                            memcpy(scan_slot->tts_isnull,
+                                   &state->block_isnull[oi * n_outer],
+                                   n_outer * sizeof(bool));
+                            ExecStoreVirtualTuple(scan_slot);
+
+                            ResetExprContext(econtext);
+                            econtext->ecxt_scantuple = scan_slot;
+
+                            if (projInfo)
+                                return ExecProject(projInfo);
+                            return scan_slot;
+                        }
+                        /* All matches emitted, move to next inner */
+                        state->theta_has_inner = false;
+                    }
+
+                    /* Fetch next inner tuple if needed */
+                    if (!state->theta_has_inner)
+                    {
+                        TupleTableSlot *isl;
+
+                        if (state->inner_stored)
+                        {
+                            if (!tuplestore_gettupleslot(state->inner_store,
+                                                        true, false,
+                                                        state->store_slot))
+                            {
+                                state->inner_exhausted = true;
+                                state->phase = NL_LOAD_BLOCK;
+                                break;
+                            }
+                            isl = state->store_slot;
+                        }
+                        else
+                        {
+                            isl = ExecProcNode(state->inner_ps);
+                            if (TupIsNull(isl))
+                            {
+                                state->inner_exhausted = true;
+                                state->inner_stored = true;
+                                state->phase = NL_LOAD_BLOCK;
+                                break;
+                            }
+                            tuplestore_puttupleslot(state->inner_store, isl);
+                        }
+
+                        /* Deform inner once, set inner portion of scan_slot */
+                        ExecStoreMinimalTuple(
+                            ExecCopySlotMinimalTuple(isl),
+                            state->inner_slot, true);
+                        slot_getallattrs(state->inner_slot);
+
+                        memcpy(scan_slot->tts_values + n_outer,
+                               state->inner_slot->tts_values,
+                               n_inner * sizeof(Datum));
+                        memcpy(scan_slot->tts_isnull + n_outer,
+                               state->inner_slot->tts_isnull,
+                               n_inner * sizeof(bool));
+
+                        state->theta_has_inner = true;
+
+                        if (state->theta_strategy != 0)
+                        {
+                            /* SIMD theta: extract inner key and run vectorized comparison */
+                            bool  inner_null;
+                            Datum inner_d = slot_getattr(state->inner_slot,
+                                                        state->theta_inner_keyno,
+                                                        &inner_null);
+                            if (inner_null)
+                            {
+                                state->theta_match_count = 0;
+                            }
+                            else
+                            {
+                                int raw_matches = 0;
+                                int j;
+
+                                switch (state->theta_keytype)
+                                {
+                                    case INT4OID:
+                                        raw_matches = vjoin_compare_int4_block_theta(
+                                            (int32 *) state->theta_typed_keys,
+                                            state->block_count,
+                                            DatumGetInt32(inner_d),
+                                            state->theta_strategy,
+                                            state->theta_match_buf);
+                                        break;
+                                    case INT8OID:
+                                        raw_matches = vjoin_compare_int8_block_theta(
+                                            (int64 *) state->theta_typed_keys,
+                                            state->block_count,
+                                            DatumGetInt64(inner_d),
+                                            state->theta_strategy,
+                                            state->theta_match_buf);
+                                        break;
+                                    case FLOAT8OID:
+                                        raw_matches = vjoin_compare_float8_block_theta(
+                                            (double *) state->theta_typed_keys,
+                                            state->block_count,
+                                            DatumGetFloat8(inner_d),
+                                            state->theta_strategy,
+                                            state->theta_match_buf);
+                                        break;
+                                }
+
+                                /* Post-filter NULLs in-place */
+                                state->theta_match_count = 0;
+                                for (j = 0; j < raw_matches; j++)
+                                {
+                                    int idx = state->theta_match_buf[j];
+                                    if (!state->theta_block_nulls[idx])
+                                        state->theta_match_buf[state->theta_match_count++] = idx;
+                                }
+                            }
+                            state->theta_match_pos = 0;
+                            /* Loop back to emit matches */
+                            continue;
+                        }
+                        else
+                        {
+                            state->theta_outer_pos = 0;
+                        }
+                    }
+
+                    /* Scalar path: iterate all outer tuples */
+                    while (state->theta_outer_pos < state->block_count)
+                    {
+                        int oi = state->theta_outer_pos++;
+
+                        memcpy(scan_slot->tts_values,
+                               &state->block_values[oi * n_outer],
+                               n_outer * sizeof(Datum));
+                        memcpy(scan_slot->tts_isnull,
+                               &state->block_isnull[oi * n_outer],
+                               n_outer * sizeof(bool));
+                        ExecStoreVirtualTuple(scan_slot);
+
+                        ResetExprContext(econtext);
+                        econtext->ecxt_scantuple = scan_slot;
+
+                        if (!qual || ExecQual(qual, econtext))
+                        {
+                            if (projInfo)
+                                return ExecProject(projInfo);
+                            return scan_slot;
+                        }
+                    }
+
+                    /* Done with this inner tuple, fetch next */
+                    state->theta_has_inner = false;
+                }
+
+                continue;
+            }
         }
     }
 }
@@ -620,6 +984,8 @@ vjoin_nestloop_rescan(CustomScanState *node)
     state->result_pos = 0;
     state->inner_exhausted = false;
     state->outer_exhausted = false;
+    state->theta_has_inner = false;
+    state->theta_outer_pos = 0;
 }
 
 void
@@ -629,4 +995,10 @@ vjoin_nestloop_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
     ExplainPropertyInteger("Block Size", NULL, state->block_size, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);
+    if (state->num_keys == 0)
+    {
+        ExplainPropertyBool("Theta Join", true, es);
+        if (state->theta_strategy != 0)
+            ExplainPropertyBool("Theta SIMD", true, es);
+    }
 }

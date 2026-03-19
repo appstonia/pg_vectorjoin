@@ -28,6 +28,22 @@ int vjoin_compare_float8_block(const double *block, int block_count,
                                double value, int *match_indices);
 
 /*
+ * Theta (inequality) block comparison: compare block_count values against
+ * a single value using the given btree strategy number.
+ * Strategy: 1=LT, 2=LE, 3=EQ, 4=GE, 5=GT, 6=NE
+ * Returns number of matches, fills match_indices[] with positions.
+ */
+int vjoin_compare_int4_block_theta(const int32 *block, int block_count,
+                                   int32 value, int strategy,
+                                   int *match_indices);
+int vjoin_compare_int8_block_theta(const int64 *block, int block_count,
+                                   int64 value, int strategy,
+                                   int *match_indices);
+int vjoin_compare_float8_block_theta(const double *block, int block_count,
+                                     double value, int strategy,
+                                     int *match_indices);
+
+/*
  * Batch hash: compute hashes for an array of keys.
  */
 void vjoin_hash_int4_batch(const int32 *values, int count, uint32 *hashes);

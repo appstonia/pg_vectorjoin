@@ -3,6 +3,7 @@
 
 #include "pg_vectorjoin.h"
 #include "executor/tuptable.h"
+#include "fmgr.h"
 #include "utils/tuplestore.h"
 
 /* ---------- Open-addressing hash table ---------- */
@@ -19,6 +20,10 @@ typedef struct VJoinHashTable
     int         mask;           /* capacity - 1 */
     int         num_entries;
     int         num_keys;
+    bool       *key_byval;      /* [num_keys] — pass-by-value per key */
+    int16      *key_typlen;     /* [num_keys] — type length per key */
+    bool       *attr_byval;     /* [num_all_attrs] — pass-by-value per attr */
+    int16      *attr_typlen;    /* [num_all_attrs] — type length per attr */
     MemoryContext htctx;
 } VJoinHashTable;
 
@@ -49,6 +54,16 @@ typedef struct VectorHashJoinState
     AttrNumber  outer_keynos[VJOIN_MAX_KEYS];
     AttrNumber  inner_keynos[VJOIN_MAX_KEYS];
     Oid         key_types[VJOIN_MAX_KEYS];
+
+    /* Generic hash/eq support (InvalidOid for INT4/INT8/FLOAT8 fast path) */
+    Oid         hash_funcs[VJOIN_MAX_KEYS];
+    Oid         eq_funcs[VJOIN_MAX_KEYS];
+    Oid         key_collations[VJOIN_MAX_KEYS];
+    FmgrInfo    hash_finfo[VJOIN_MAX_KEYS];
+    FmgrInfo    eq_finfo[VJOIN_MAX_KEYS];
+    bool        key_byval[VJOIN_MAX_KEYS];
+    int16       key_typlen[VJOIN_MAX_KEYS];
+    bool        keys_all_byval;     /* true if all key types pass-by-value */
 
     /* Children */
     PlanState  *outer_ps;
@@ -95,6 +110,7 @@ typedef enum NLPhase
     NL_LOAD_BLOCK,
     NL_SCAN_INNER,
     NL_EMIT,
+    NL_THETA_SCAN,
     NL_DONE
 } NLPhase;
 
@@ -110,6 +126,13 @@ typedef struct VJoinNestLoopState
     AttrNumber  inner_keynos[VJOIN_MAX_KEYS];
     Oid         key_types[VJOIN_MAX_KEYS];
 
+    /* Generic equality support */
+    Oid         eq_funcs[VJOIN_MAX_KEYS];
+    Oid         key_collations[VJOIN_MAX_KEYS];
+    FmgrInfo    eq_finfo[VJOIN_MAX_KEYS];
+    bool        key_byval[VJOIN_MAX_KEYS];
+    int16       key_typlen[VJOIN_MAX_KEYS];
+
     /* Children */
     PlanState  *outer_ps;
     PlanState  *inner_ps;
@@ -122,6 +145,10 @@ typedef struct VJoinNestLoopState
     Datum      *block_keys;         /* [block_size * num_keys] */
     bool       *block_nulls;        /* [block_size * num_keys] */
     MinimalTuple *block_tuples;     /* [block_size] */
+
+    /* Pre-deformed outer values for theta scan (num_keys == 0) */
+    Datum      *block_values;       /* [block_size * num_outer_attrs] */
+    bool       *block_isnull;       /* [block_size * num_outer_attrs] */
 
     /* Result buffer */
     VJoinMatch *results;
@@ -144,6 +171,21 @@ typedef struct VJoinNestLoopState
 
     MemoryContext block_ctx;
     bool        use_simd;
+
+    /* Theta-join direct iteration state (used when num_keys == 0) */
+    int         theta_outer_pos;
+    bool        theta_has_inner;
+
+    /* Theta SIMD support (single-key INT4/INT8/FLOAT8 theta-join) */
+    int         theta_strategy;      /* 0=none, 1=LT,2=LE,4=GE,5=GT,6=NE */
+    AttrNumber  theta_outer_keyno;
+    AttrNumber  theta_inner_keyno;
+    Oid         theta_keytype;
+    void       *theta_typed_keys;    /* [block_size] typed key array */
+    bool       *theta_block_nulls;   /* [block_size] */
+    int        *theta_match_buf;     /* [block_size] match indices from SIMD */
+    int         theta_match_count;
+    int         theta_match_pos;
 } VJoinNestLoopState;
 
 /* ---------- Vectorized Merge Join state ---------- */
@@ -171,6 +213,14 @@ typedef struct VectorMergeJoinState
     AttrNumber  outer_keynos[VJOIN_MAX_KEYS];
     AttrNumber  inner_keynos[VJOIN_MAX_KEYS];
     Oid         key_types[VJOIN_MAX_KEYS];
+
+    /* Generic comparison/equality support */
+    Oid         eq_funcs[VJOIN_MAX_KEYS];
+    Oid         key_collations[VJOIN_MAX_KEYS];
+    FmgrInfo    cmp_finfo[VJOIN_MAX_KEYS];
+    FmgrInfo    eq_finfo[VJOIN_MAX_KEYS];
+    bool        key_byval[VJOIN_MAX_KEYS];
+    int16       key_typlen[VJOIN_MAX_KEYS];
 
     /* Children */
     PlanState  *outer_ps;
