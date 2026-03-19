@@ -138,17 +138,19 @@ vjoin_analyze_clauses(List *restrictlist,
 
 /*
  * Build custom_private list for serialization into the plan.
- * Format: [num_keys, outer_keyno1, inner_keyno1, keytype1,
+ * Format: [jointype, num_keys, outer_keyno1, inner_keyno1, keytype1,
  *          hash_proc1, eq_opr1, collation1, ...]
  */
 static List *
-vjoin_build_private(int num_keys, AttrNumber *outer_keynos,
+vjoin_build_private(JoinType jointype,
+                    int num_keys, AttrNumber *outer_keynos,
                     AttrNumber *inner_keynos, Oid *key_types,
                     Oid *hash_procs, Oid *eq_oprs, Oid *collations)
 {
     List *result = NIL;
     int   i;
 
+    result = lappend(result, makeInteger((int) jointype));
     result = lappend(result, makeInteger(num_keys));
     for (i = 0; i < num_keys; i++)
     {
@@ -290,6 +292,7 @@ vjoin_try_hashjoin(PlannerInfo *root,
                    RelOptInfo *outerrel,
                    RelOptInfo *innerrel,
                    JoinPathExtraData *extra,
+                   JoinType jointype,
                    int nkeys,
                    AttrNumber *outer_keynos,
                    AttrNumber *inner_keynos,
@@ -335,7 +338,8 @@ vjoin_try_hashjoin(PlannerInfo *root,
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
         cpath->custom_restrictinfo = extra->restrictlist;
 #endif
-        cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
+        cpath->custom_private = vjoin_build_private(jointype, nkeys,
+                                                    outer_keynos,
                                                     inner_keynos, key_types,
                                                     hash_procs, eq_oprs,
                                                     collations);
@@ -392,7 +396,8 @@ vjoin_try_hashjoin(PlannerInfo *root,
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
             cpath->custom_restrictinfo = extra->restrictlist;
 #endif
-            cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
+            cpath->custom_private = vjoin_build_private(jointype, nkeys,
+                                                        outer_keynos,
                                                         inner_keynos, key_types,
                                                         hash_procs, eq_oprs,
                                                         collations);
@@ -412,6 +417,7 @@ vjoin_try_nestloop(PlannerInfo *root,
               RelOptInfo *outerrel,
               RelOptInfo *innerrel,
               JoinPathExtraData *extra,
+              JoinType jointype,
               int nkeys,
               AttrNumber *outer_keynos,
               AttrNumber *inner_keynos,
@@ -465,7 +471,8 @@ vjoin_try_nestloop(PlannerInfo *root,
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
         cpath->custom_restrictinfo = extra->restrictlist;
 #endif
-        cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
+        cpath->custom_private = vjoin_build_private(jointype, nkeys,
+                                                    outer_keynos,
                                                     inner_keynos, key_types,
                                                     hash_procs, eq_oprs,
                                                     collations);
@@ -536,7 +543,8 @@ vjoin_try_nestloop(PlannerInfo *root,
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
             cpath->custom_restrictinfo = extra->restrictlist;
 #endif
-            cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
+            cpath->custom_private = vjoin_build_private(jointype, nkeys,
+                                                        outer_keynos,
                                                         inner_keynos, key_types,
                                                         hash_procs, eq_oprs,
                                                         collations);
@@ -581,6 +589,7 @@ vjoin_try_mergejoin(PlannerInfo *root,
                     RelOptInfo *outerrel,
                     RelOptInfo *innerrel,
                     JoinPathExtraData *extra,
+                    JoinType jointype,
                     int nkeys,
                     AttrNumber *outer_keynos,
                     AttrNumber *inner_keynos,
@@ -729,7 +738,8 @@ vjoin_try_mergejoin(PlannerInfo *root,
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
     cpath->custom_restrictinfo = extra->restrictlist;
 #endif
-    cpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
+    cpath->custom_private = vjoin_build_private(jointype, nkeys,
+                                                outer_keynos,
                                                 inner_keynos, key_types,
                                                 hash_procs, eq_oprs,
                                                 collations);
@@ -830,7 +840,8 @@ vjoin_try_mergejoin(PlannerInfo *root,
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
             pcpath->custom_restrictinfo = extra->restrictlist;
 #endif
-            pcpath->custom_private = vjoin_build_private(nkeys, outer_keynos,
+            pcpath->custom_private = vjoin_build_private(jointype, nkeys,
+                                                         outer_keynos,
                                                          inner_keynos, key_types,
                                                          hash_procs, eq_oprs,
                                                          collations);
@@ -868,8 +879,11 @@ vjoin_pathlist_hook(PlannerInfo *root,
         prev_join_pathlist_hook(root, joinrel, outerrel, innerrel,
                                 jointype, extra);
 
-    /* Only inner joins for now */
-    if (jointype != JOIN_INNER)
+    /* Supported join types */
+    if (jointype != JOIN_INNER &&
+        jointype != JOIN_LEFT &&
+        jointype != JOIN_FULL &&
+        jointype != JOIN_RIGHT)
         return;
     
     /* Master kill switch */
@@ -920,11 +934,13 @@ vjoin_pathlist_hook(PlannerInfo *root,
     {
         if (vjoin_enable_hashjoin)
             vjoin_try_hashjoin(root, joinrel, outerrel, innerrel, extra,
+                               jointype,
                                nkeys, outer_keynos, inner_keynos, key_types,
                                hash_procs, eq_oprs, collations);
 
         if (vjoin_enable_mergejoin)
             vjoin_try_mergejoin(root, joinrel, outerrel, innerrel, extra,
+                                jointype,
                                 nkeys, outer_keynos, inner_keynos, key_types,
                                 hash_procs, eq_oprs, collations);
     }
@@ -967,6 +983,7 @@ vjoin_pathlist_hook(PlannerInfo *root,
         }
 
         vjoin_try_nestloop(root, joinrel, outerrel, innerrel, extra,
+                      jointype,
                       nkeys, outer_keynos, inner_keynos, key_types,
                       hash_procs, eq_oprs, collations,
                       theta_strategy, theta_outer_keyno,

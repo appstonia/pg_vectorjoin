@@ -19,6 +19,7 @@
  */
 static void
 vjoin_deserialize_keys(List *private_data,
+                       JoinType *jointype,
                        int *num_keys,
                        AttrNumber *outer_keynos,
                        AttrNumber *inner_keynos,
@@ -30,6 +31,7 @@ vjoin_deserialize_keys(List *private_data,
     int idx = 0;
     int i;
 
+    *jointype = (JoinType) intVal(list_nth(private_data, idx++));
     *num_keys = intVal(list_nth(private_data, idx++));
     for (i = 0; i < *num_keys; i++)
     {
@@ -40,6 +42,61 @@ vjoin_deserialize_keys(List *private_data,
         eq_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
         key_collations[i] = (Oid) intVal(list_nth(private_data, idx++));
     }
+}
+
+/*
+ * Form result with outer values and NULL-filled inner (for LEFT/FULL).
+ */
+static TupleTableSlot *
+vjoin_form_result_left(VectorHashJoinState *state, int outer_batch_idx)
+{
+    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
+    int outer_off = outer_batch_idx * state->num_outer_attrs;
+
+    ExecClearTuple(scan_slot);
+
+    memcpy(scan_slot->tts_values,
+           &state->batch_values[outer_off],
+           state->num_outer_attrs * sizeof(Datum));
+    memcpy(scan_slot->tts_isnull,
+           &state->batch_isnull[outer_off],
+           state->num_outer_attrs * sizeof(bool));
+
+    memset(scan_slot->tts_values + state->num_outer_attrs,
+           0, state->num_inner_attrs * sizeof(Datum));
+    memset(scan_slot->tts_isnull + state->num_outer_attrs,
+           1, state->num_inner_attrs * sizeof(bool));
+
+    ExecStoreVirtualTuple(scan_slot);
+    return scan_slot;
+}
+
+/*
+ * Form result with NULL-filled outer and inner values (for RIGHT/FULL).
+ */
+static TupleTableSlot *
+vjoin_form_result_right(VectorHashJoinState *state, int inner_ht_pos)
+{
+    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
+    VJoinHashTable *ht = state->hashtable;
+    int inner_off = inner_ht_pos * ht->num_all_attrs;
+
+    ExecClearTuple(scan_slot);
+
+    memset(scan_slot->tts_values, 0,
+           state->num_outer_attrs * sizeof(Datum));
+    memset(scan_slot->tts_isnull, 1,
+           state->num_outer_attrs * sizeof(bool));
+
+    memcpy(scan_slot->tts_values + state->num_outer_attrs,
+           &ht->all_values[inner_off],
+           state->num_inner_attrs * sizeof(Datum));
+    memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
+           &ht->all_isnull[inner_off],
+           state->num_inner_attrs * sizeof(bool));
+
+    ExecStoreVirtualTuple(scan_slot);
+    return scan_slot;
 }
 
 /*
@@ -89,7 +146,7 @@ vjoin_hash_build(VectorHashJoinState *state)
 
     for (;;)
     {
-        bool    has_null;
+        bool    has_null = false;
         uint32  hashval;
         Datum   keyvals[VJOIN_MAX_KEYS];
         bool    keynulls[VJOIN_MAX_KEYS];
@@ -112,9 +169,20 @@ vjoin_hash_build(VectorHashJoinState *state)
                 has_null = true;
         }
 
-        /* Skip NULL keys — NULLs never match in equijoin */
+        /* Skip NULL keys — NULLs never match in equijoin.
+         * For RIGHT/FULL, insert anyway so they appear as unmatched. */
         if (has_null)
+        {
+            if (state->jointype == JOIN_RIGHT || state->jointype == JOIN_FULL)
+            {
+                slot_getallattrs(slot);
+                vjoin_ht_insert(state->hashtable, 1 /* dummy nonzero hash */,
+                                ExecCopySlotMinimalTuple(slot),
+                                keyvals, keynulls,
+                                slot->tts_values, slot->tts_isnull);
+            }
             continue;
+        }
 
         /* Compute hash */
         hashval = 0;
@@ -141,6 +209,14 @@ vjoin_hash_build(VectorHashJoinState *state)
     }
 
     MemoryContextSwitchTo(oldctx);
+
+    /* Allocate inner_matched after build so we know capacity */
+    if (state->jointype == JOIN_RIGHT || state->jointype == JOIN_FULL)
+    {
+        VJoinHashTable *ht = state->hashtable;
+        state->inner_matched = palloc0(sizeof(bool) * ht->capacity);
+    }
+
     state->phase = VHJ_PROBE;
 }
 
@@ -245,6 +321,10 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
         state->batch_count++;
     }
 
+    /* Reset per-batch matched tracking for LEFT/FULL */
+    if (state->batch_matched)
+        memset(state->batch_matched, 0, sizeof(bool) * state->batch_size);
+
     /* Probe hash table for each outer tuple in batch */
     for (batch_idx = 0; batch_idx < state->batch_count; batch_idx++)
     {
@@ -263,7 +343,7 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
             }
         }
         if (any_null)
-            continue;
+            continue;  /* NULL keys never match; LEFT/FULL handles below */
 
         /* Linear probe in hash table */
         pos = hashval & ht->mask;
@@ -277,8 +357,17 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
                 {
                     Datum outer_key = state->batch_keys[
                         batch_idx * state->num_keys + k];
+                    bool inner_null = ht->key_nulls[
+                        pos * ht->num_keys + k];
                     Datum inner_key = ht->keys[
                         pos * ht->num_keys + k];
+
+                    /* NULL inner keys never match */
+                    if (inner_null)
+                    {
+                        match = false;
+                        break;
+                    }
 
                     switch (state->key_types[k])
                     {
@@ -322,6 +411,12 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
                     state->results[state->result_count].outer_idx = batch_idx;
                     state->results[state->result_count].inner_idx = pos;
                     state->result_count++;
+
+                    /* Mark matched for outer join tracking */
+                    if (state->batch_matched)
+                        state->batch_matched[batch_idx] = true;
+                    if (state->inner_matched)
+                        state->inner_matched[pos] = true;
                 }
             }
             pos = (pos + 1) & ht->mask;
@@ -333,7 +428,14 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
     if (state->result_count > 0)
         state->phase = VHJ_EMIT;
     else if (state->batch_count < state->batch_size)
-        state->phase = VHJ_DONE;
+    {
+        /* Outer exhausted — check for RIGHT/FULL emit */
+        if ((state->jointype == JOIN_RIGHT || state->jointype == JOIN_FULL) &&
+            state->inner_matched)
+            state->phase = VHJ_RIGHT_EMIT;
+        else
+            state->phase = VHJ_DONE;
+    }
     /* else: stay in VHJ_PROBE to fetch next batch */
 }
 
@@ -364,8 +466,9 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
     state->outer_desc = CreateTupleDescCopy(outer_desc);
     state->inner_desc = CreateTupleDescCopy(inner_desc);
 
-    /* Deserialize key info */
+    /* Deserialize key info (jointype is first element) */
     vjoin_deserialize_keys(cscan->custom_private,
+                           &state->jointype,
                            &state->num_keys,
                            state->outer_keynos,
                            state->inner_keynos,
@@ -462,6 +565,16 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
     state->result_count = 0;
     state->result_pos = 0;
 
+    /* Outer join tracking arrays */
+    if (state->jointype == JOIN_LEFT || state->jointype == JOIN_FULL)
+        state->batch_matched = palloc0(sizeof(bool) * state->batch_size);
+    else
+        state->batch_matched = NULL;
+
+    state->inner_matched = NULL;  /* allocated after build phase */
+    state->left_emit_pos = 0;
+    state->right_emit_pos = 0;
+
     /* SIMD detection */
     state->use_simd = vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
                       vjoin_simd_caps.has_neon;
@@ -494,9 +607,23 @@ vjoin_hash_exec(CustomScanState *node)
             case VHJ_EMIT:
                 if (state->result_pos >= state->result_count)
                 {
-                    /* Buffer exhausted — get next batch */
-                    if (state->batch_count < state->batch_size)
-                        state->phase = VHJ_DONE;
+                    /* Buffer exhausted — check for unmatched outers */
+                    if (state->batch_matched &&
+                        (state->jointype == JOIN_LEFT ||
+                         state->jointype == JOIN_FULL))
+                    {
+                        state->left_emit_pos = 0;
+                        state->phase = VHJ_LEFT_EMIT;
+                    }
+                    else if (state->batch_count < state->batch_size)
+                    {
+                        if ((state->jointype == JOIN_RIGHT ||
+                             state->jointype == JOIN_FULL) &&
+                            state->inner_matched)
+                            state->phase = VHJ_RIGHT_EMIT;
+                        else
+                            state->phase = VHJ_DONE;
+                    }
                     else
                         state->phase = VHJ_PROBE;
                     continue;
@@ -521,6 +648,57 @@ vjoin_hash_exec(CustomScanState *node)
                         return ExecProject(projInfo);
                     return result;
                 }
+
+            case VHJ_LEFT_EMIT:
+                /* Emit unmatched outer tuples with NULL inner */
+                while (state->left_emit_pos < state->batch_count)
+                {
+                    int idx = state->left_emit_pos++;
+                    if (!state->batch_matched[idx])
+                    {
+                        result = vjoin_form_result_left(state, idx);
+                        ResetExprContext(econtext);
+                        econtext->ecxt_scantuple = result;
+                        if (projInfo)
+                            return ExecProject(projInfo);
+                        return result;
+                    }
+                }
+                /* All unmatched emitted — continue to next batch or done */
+                if (state->batch_count < state->batch_size)
+                {
+                    if ((state->jointype == JOIN_RIGHT ||
+                         state->jointype == JOIN_FULL) &&
+                        state->inner_matched)
+                        state->phase = VHJ_RIGHT_EMIT;
+                    else
+                        state->phase = VHJ_DONE;
+                }
+                else
+                    state->phase = VHJ_PROBE;
+                continue;
+
+            case VHJ_RIGHT_EMIT:
+                /* Emit unmatched inner tuples with NULL outer */
+                {
+                    VJoinHashTable *ht = state->hashtable;
+                    while (state->right_emit_pos < ht->capacity)
+                    {
+                        int pos = state->right_emit_pos++;
+                        if (ht->hashvals[pos] != 0 &&
+                            !state->inner_matched[pos])
+                        {
+                            result = vjoin_form_result_right(state, pos);
+                            ResetExprContext(econtext);
+                            econtext->ecxt_scantuple = result;
+                            if (projInfo)
+                                return ExecProject(projInfo);
+                            return result;
+                        }
+                    }
+                }
+                state->phase = VHJ_DONE;
+                continue;
 
             case VHJ_DONE:
                 return NULL;
@@ -561,13 +739,29 @@ vjoin_hash_rescan(CustomScanState *node)
     state->batch_count = 0;
     state->result_count = 0;
     state->result_pos = 0;
+    state->left_emit_pos = 0;
+    state->right_emit_pos = 0;
+
+    /* Reset inner matched tracking — hash table is reused */
+    if (state->inner_matched && state->hashtable)
+        memset(state->inner_matched, 0,
+               sizeof(bool) * state->hashtable->capacity);
 }
 
 void
 vjoin_hash_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
     VectorHashJoinState *state = (VectorHashJoinState *) node;
+    const char *jt;
 
+    switch (state->jointype)
+    {
+        case JOIN_LEFT:  jt = "Left";  break;
+        case JOIN_RIGHT: jt = "Right"; break;
+        case JOIN_FULL:  jt = "Full";  break;
+        default:         jt = "Inner"; break;
+    }
+    ExplainPropertyText("Join Type", jt, es);
     ExplainPropertyInteger("Hash Table Size", NULL,
                            state->hashtable ? state->hashtable->num_entries : 0,
                            es);

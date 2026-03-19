@@ -22,6 +22,7 @@
  */
 static void
 vmj_deserialize_keys(List *private_data,
+                     JoinType *jointype,
                      int *num_keys,
                      AttrNumber *outer_keynos,
                      AttrNumber *inner_keynos,
@@ -32,6 +33,7 @@ vmj_deserialize_keys(List *private_data,
     int idx = 0;
     int i;
 
+    *jointype = (JoinType) intVal(list_nth(private_data, idx++));
     *num_keys = intVal(list_nth(private_data, idx++));
     for (i = 0; i < *num_keys; i++)
     {
@@ -348,6 +350,107 @@ vmj_form_result(VectorMergeJoinState *state,
            state->inner_slot->tts_isnull,
            state->num_inner_attrs * sizeof(bool));
 
+    ExecStoreVirtualTuple(scan_slot);
+    return scan_slot;
+}
+
+/*
+ * Form result with outer values and NULL-filled inner (LEFT/FULL).
+ */
+static TupleTableSlot *
+vmj_form_result_left(VectorMergeJoinState *state, MinimalTuple outer_mt)
+{
+    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
+
+    ExecStoreMinimalTuple(outer_mt, state->outer_slot, false);
+    slot_getallattrs(state->outer_slot);
+
+    ExecClearTuple(scan_slot);
+    memcpy(scan_slot->tts_values,
+           state->outer_slot->tts_values,
+           state->num_outer_attrs * sizeof(Datum));
+    memcpy(scan_slot->tts_isnull,
+           state->outer_slot->tts_isnull,
+           state->num_outer_attrs * sizeof(bool));
+    memset(scan_slot->tts_values + state->num_outer_attrs,
+           0, state->num_inner_attrs * sizeof(Datum));
+    memset(scan_slot->tts_isnull + state->num_outer_attrs,
+           1, state->num_inner_attrs * sizeof(bool));
+    ExecStoreVirtualTuple(scan_slot);
+    return scan_slot;
+}
+
+/*
+ * Form result with NULL-filled outer and inner values (RIGHT/FULL).
+ */
+static TupleTableSlot *
+vmj_form_result_right(VectorMergeJoinState *state, MinimalTuple inner_mt)
+{
+    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
+
+    ExecStoreMinimalTuple(inner_mt, state->inner_slot, false);
+    slot_getallattrs(state->inner_slot);
+
+    ExecClearTuple(scan_slot);
+    memset(scan_slot->tts_values, 0,
+           state->num_outer_attrs * sizeof(Datum));
+    memset(scan_slot->tts_isnull, 1,
+           state->num_outer_attrs * sizeof(bool));
+    memcpy(scan_slot->tts_values + state->num_outer_attrs,
+           state->inner_slot->tts_values,
+           state->num_inner_attrs * sizeof(Datum));
+    memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
+           state->inner_slot->tts_isnull,
+           state->num_inner_attrs * sizeof(bool));
+    ExecStoreVirtualTuple(scan_slot);
+    return scan_slot;
+}
+
+/*
+ * Form result using current outer child slot + NULL inner (LEFT/FULL).
+ * Used in tuple-at-a-time path to avoid MinimalTuple copy.
+ */
+static TupleTableSlot *
+vmj_form_result_left_slot(VectorMergeJoinState *state)
+{
+    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
+    TupleTableSlot *os = state->outer_cur_slot;
+
+    slot_getallattrs(os);
+    ExecClearTuple(scan_slot);
+    memcpy(scan_slot->tts_values, os->tts_values,
+           state->num_outer_attrs * sizeof(Datum));
+    memcpy(scan_slot->tts_isnull, os->tts_isnull,
+           state->num_outer_attrs * sizeof(bool));
+    memset(scan_slot->tts_values + state->num_outer_attrs,
+           0, state->num_inner_attrs * sizeof(Datum));
+    memset(scan_slot->tts_isnull + state->num_outer_attrs,
+           1, state->num_inner_attrs * sizeof(bool));
+    ExecStoreVirtualTuple(scan_slot);
+    return scan_slot;
+}
+
+/*
+ * Form result using current inner child slot + NULL outer (RIGHT/FULL).
+ */
+static TupleTableSlot *
+vmj_form_result_right_slot(VectorMergeJoinState *state)
+{
+    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
+    TupleTableSlot *is = state->inner_cur_slot;
+
+    slot_getallattrs(is);
+    ExecClearTuple(scan_slot);
+    memset(scan_slot->tts_values, 0,
+           state->num_outer_attrs * sizeof(Datum));
+    memset(scan_slot->tts_isnull, 1,
+           state->num_outer_attrs * sizeof(bool));
+    memcpy(scan_slot->tts_values + state->num_outer_attrs,
+           is->tts_values,
+           state->num_inner_attrs * sizeof(Datum));
+    memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
+           is->tts_isnull,
+           state->num_inner_attrs * sizeof(bool));
     ExecStoreVirtualTuple(scan_slot);
     return scan_slot;
 }
@@ -706,8 +809,9 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
     state->outer_desc = outer_desc;
     state->inner_desc = inner_desc;
 
-    /* Deserialize key info */
+    /* Deserialize key info (jointype is first element) */
     vmj_deserialize_keys(cscan->custom_private,
+                         &state->jointype,
                          &state->num_keys,
                          state->outer_keynos,
                          state->inner_keynos,
@@ -800,8 +904,8 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
         }
     }
 
-    /* Allocate batch buffers for block merge (all_byval path) */
-    if (state->all_byval)
+    /* Allocate batch buffers for block merge (all_byval path, INNER only) */
+    if (state->all_byval && state->jointype == JOIN_INNER)
     {
         int bs = vjoin_batch_size;
 
@@ -850,7 +954,8 @@ vjoin_merge_exec(CustomScanState *node)
         switch (state->phase)
         {
             case VMJ_INIT:
-                if (state->all_byval && state->batch_size > 0)
+                if (state->all_byval && state->batch_size > 0 &&
+                    state->jointype == JOIN_INNER)
                 {
                     /* Block merge mode: fill both blocks */
                     vmj_batch_fill_side(state, true);
@@ -863,12 +968,36 @@ vjoin_merge_exec(CustomScanState *node)
                     state->phase = VMJ_BATCH_MERGE;
                     continue;
                 }
-                /* Legacy tuple-at-a-time path */
-                if (!vmj_fetch_outer(state) || !vmj_fetch_inner(state))
+                /* Tuple-at-a-time path */
+                if (!vmj_fetch_outer(state))
                 {
+                    /* No outer tuples at all */
+                    if (state->jointype == JOIN_RIGHT ||
+                        state->jointype == JOIN_FULL)
+                    {
+                        if (vmj_fetch_inner(state))
+                        {
+                            state->phase = VMJ_RIGHT_EMIT;
+                            continue;
+                        }
+                    }
                     state->phase = VMJ_DONE;
                     return NULL;
                 }
+                if (!vmj_fetch_inner(state))
+                {
+                    /* No inner tuples — outer still pending */
+                    if (state->jointype == JOIN_LEFT ||
+                        state->jointype == JOIN_FULL)
+                    {
+                        state->phase = VMJ_LEFT_EMIT;
+                        continue;
+                    }
+                    state->phase = VMJ_DONE;
+                    return NULL;
+                }
+                state->outer_matched = false;
+                state->inner_matched = false;
                 state->phase = VMJ_ADVANCE;
                 continue;
 
@@ -876,26 +1005,65 @@ vjoin_merge_exec(CustomScanState *node)
             {
                 int cmp;
 
-                /* Skip NULLs — they can never match in equijoin */
+                /* Skip NULLs — they can never match in equijoin.
+                 * For LEFT/FULL, emit outer NULLs with NULL inner.
+                 * For RIGHT/FULL, emit inner NULLs with NULL outer. */
                 while (!state->outer_done && state->outer_null[0])
                 {
-                    if (!vmj_fetch_outer(state))
+                    if (state->jointype == JOIN_LEFT ||
+                        state->jointype == JOIN_FULL)
                     {
-                        state->phase = VMJ_DONE;
-                        return NULL;
+                        TupleTableSlot *result;
+                        state->outer_matched = false;
+                        result = vmj_form_result_left_slot(state);
+                        if (!vmj_fetch_outer(state))
+                            ;
+                        ResetExprContext(econtext);
+                        econtext->ecxt_scantuple = result;
+                        if (projInfo)
+                            return ExecProject(projInfo);
+                        return result;
                     }
+                    if (!vmj_fetch_outer(state))
+                        break;
                 }
                 while (!state->inner_done && state->inner_null[0])
                 {
-                    if (!vmj_fetch_inner(state))
+                    if (state->jointype == JOIN_RIGHT ||
+                        state->jointype == JOIN_FULL)
                     {
-                        state->phase = VMJ_DONE;
-                        return NULL;
+                        TupleTableSlot *result;
+                        state->inner_matched = false;
+                        result = vmj_form_result_right_slot(state);
+                        if (!vmj_fetch_inner(state))
+                            ;
+                        ResetExprContext(econtext);
+                        econtext->ecxt_scantuple = result;
+                        if (projInfo)
+                            return ExecProject(projInfo);
+                        return result;
                     }
+                    if (!vmj_fetch_inner(state))
+                        break;
                 }
 
                 if (state->outer_done || state->inner_done)
                 {
+                    /* Drain remaining side for outer joins */
+                    if (!state->outer_done &&
+                        (state->jointype == JOIN_LEFT ||
+                         state->jointype == JOIN_FULL))
+                    {
+                        state->phase = VMJ_LEFT_EMIT;
+                        continue;
+                    }
+                    if (!state->inner_done &&
+                        (state->jointype == JOIN_RIGHT ||
+                         state->jointype == JOIN_FULL))
+                    {
+                        state->phase = VMJ_RIGHT_EMIT;
+                        continue;
+                    }
                     state->phase = VMJ_DONE;
                     return NULL;
                 }
@@ -904,8 +1072,46 @@ vjoin_merge_exec(CustomScanState *node)
                 if (cmp < 0)
                 {
                     /* outer < inner — advance outer */
+                    if ((state->jointype == JOIN_LEFT ||
+                         state->jointype == JOIN_FULL) &&
+                        !state->outer_matched)
+                    {
+                        /* Emit unmatched outer with NULL inner */
+                        TupleTableSlot *result;
+                        result = vmj_form_result_left_slot(state);
+                        state->outer_matched = false;
+                        if (!vmj_fetch_outer(state))
+                        {
+                            if (!state->inner_done &&
+                                (state->jointype == JOIN_RIGHT ||
+                                 state->jointype == JOIN_FULL))
+                            {
+                                ResetExprContext(econtext);
+                                econtext->ecxt_scantuple = result;
+                                /* Must emit this result, then go to RIGHT_EMIT */
+                                state->phase = VMJ_RIGHT_EMIT;
+                                if (projInfo)
+                                    return ExecProject(projInfo);
+                                return result;
+                            }
+                            state->phase = VMJ_DONE;
+                        }
+                        ResetExprContext(econtext);
+                        econtext->ecxt_scantuple = result;
+                        if (projInfo)
+                            return ExecProject(projInfo);
+                        return result;
+                    }
+                    state->outer_matched = false;
                     if (!vmj_fetch_outer(state))
                     {
+                        if (!state->inner_done &&
+                            (state->jointype == JOIN_RIGHT ||
+                             state->jointype == JOIN_FULL))
+                        {
+                            state->phase = VMJ_RIGHT_EMIT;
+                            continue;
+                        }
                         state->phase = VMJ_DONE;
                         return NULL;
                     }
@@ -914,8 +1120,45 @@ vjoin_merge_exec(CustomScanState *node)
                 else if (cmp > 0)
                 {
                     /* outer > inner — advance inner */
+                    if ((state->jointype == JOIN_RIGHT ||
+                         state->jointype == JOIN_FULL) &&
+                        !state->inner_matched)
+                    {
+                        /* Emit unmatched inner with NULL outer */
+                        TupleTableSlot *result;
+                        result = vmj_form_result_right_slot(state);
+                        state->inner_matched = false;
+                        if (!vmj_fetch_inner(state))
+                        {
+                            if (!state->outer_done &&
+                                (state->jointype == JOIN_LEFT ||
+                                 state->jointype == JOIN_FULL))
+                            {
+                                ResetExprContext(econtext);
+                                econtext->ecxt_scantuple = result;
+                                state->phase = VMJ_LEFT_EMIT;
+                                if (projInfo)
+                                    return ExecProject(projInfo);
+                                return result;
+                            }
+                            state->phase = VMJ_DONE;
+                        }
+                        ResetExprContext(econtext);
+                        econtext->ecxt_scantuple = result;
+                        if (projInfo)
+                            return ExecProject(projInfo);
+                        return result;
+                    }
+                    state->inner_matched = false;
                     if (!vmj_fetch_inner(state))
                     {
+                        if (!state->outer_done &&
+                            (state->jointype == JOIN_LEFT ||
+                             state->jointype == JOIN_FULL))
+                        {
+                            state->phase = VMJ_LEFT_EMIT;
+                            continue;
+                        }
                         state->phase = VMJ_DONE;
                         return NULL;
                     }
@@ -985,8 +1228,13 @@ vjoin_merge_exec(CustomScanState *node)
                         if (!state->outer_multi && !state->inner_multi)
                         {
                             /* Singleton — return pre-formed result (zero copy!) */
+                            state->outer_matched = true;
+                            state->inner_matched = true;
                             ResetExprContext(econtext);
                             econtext->ecxt_scantuple = scan_slot;
+
+                            state->outer_matched = false;
+                            state->inner_matched = false;
 
                             if (qual && !ExecQual(qual, econtext))
                                 continue;
@@ -1006,6 +1254,8 @@ vjoin_merge_exec(CustomScanState *node)
                             scan_slot->tts_values + state->num_outer_attrs,
                             scan_slot->tts_isnull + state->num_outer_attrs);
                         MemoryContextReset(state->match_ctx);
+                        state->outer_matched = true;
+                        state->inner_matched = true;
                         state->phase = VMJ_MATCH_OUTER;
                         continue;
                     }
@@ -1036,6 +1286,9 @@ vjoin_merge_exec(CustomScanState *node)
                         {
                             TupleTableSlot *result;
 
+                            state->outer_matched = false;
+                            state->inner_matched = false;
+
                             result = vmj_form_result(state,
                                                      state->saved_outer,
                                                      state->saved_inner);
@@ -1057,6 +1310,8 @@ vjoin_merge_exec(CustomScanState *node)
                         else
                         {
                             MemoryContextReset(state->match_ctx);
+                            state->outer_matched = true;
+                            state->inner_matched = true;
                             state->phase = VMJ_MATCH_OUTER;
                             continue;
                         }
@@ -1086,7 +1341,9 @@ vjoin_merge_exec(CustomScanState *node)
 
                 if (state->emit_outer_pos >= state->outer_group_count)
                 {
-                    /* Exhausted cross product — back to advance */
+                    /* Exhausted cross product — both sides matched */
+                    state->outer_matched = false;
+                    state->inner_matched = false;
                     state->phase = VMJ_ADVANCE;
                     continue;
                 }
@@ -1219,6 +1476,55 @@ vjoin_merge_exec(CustomScanState *node)
                 }
             }
 
+            case VMJ_LEFT_EMIT:
+            {
+                /* Drain remaining outer tuples with NULL inner */
+                TupleTableSlot *result;
+
+                if (state->outer_done)
+                {
+                    if (!state->inner_done &&
+                        (state->jointype == JOIN_RIGHT ||
+                         state->jointype == JOIN_FULL))
+                    {
+                        state->phase = VMJ_RIGHT_EMIT;
+                        continue;
+                    }
+                    state->phase = VMJ_DONE;
+                    return NULL;
+                }
+
+                result = vmj_form_result_left_slot(state);
+                vmj_fetch_outer(state);
+
+                ResetExprContext(econtext);
+                econtext->ecxt_scantuple = result;
+                if (projInfo)
+                    return ExecProject(projInfo);
+                return result;
+            }
+
+            case VMJ_RIGHT_EMIT:
+            {
+                /* Drain remaining inner tuples with NULL outer */
+                TupleTableSlot *result;
+
+                if (state->inner_done)
+                {
+                    state->phase = VMJ_DONE;
+                    return NULL;
+                }
+
+                result = vmj_form_result_right_slot(state);
+                vmj_fetch_inner(state);
+
+                ResetExprContext(econtext);
+                econtext->ecxt_scantuple = result;
+                if (projInfo)
+                    return ExecProject(projInfo);
+                return result;
+            }
+
             case VMJ_DONE:
                 return NULL;
         }
@@ -1272,6 +1578,9 @@ vjoin_merge_rescan(CustomScanState *node)
     state->batch_result_pos = 0;
     state->batch_cp_oi = -1;
 
+    state->outer_matched = false;
+    state->inner_matched = false;
+
     state->phase = VMJ_INIT;
 }
 
@@ -1279,7 +1588,16 @@ void
 vjoin_merge_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
     VectorMergeJoinState *state = (VectorMergeJoinState *) node;
+    const char *jt;
 
+    switch (state->jointype)
+    {
+        case JOIN_LEFT:  jt = "Left";  break;
+        case JOIN_RIGHT: jt = "Right"; break;
+        case JOIN_FULL:  jt = "Full";  break;
+        default:         jt = "Inner"; break;
+    }
+    ExplainPropertyText("Join Type", jt, es);
     ExplainPropertyInteger("Keys", NULL, state->num_keys, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);
     if (state->batch_size > 0)
