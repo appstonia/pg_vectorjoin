@@ -4,6 +4,7 @@
 #include "pg_vectorjoin.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "nodes/nodes.h"
 #include "utils/tuplestore.h"
 
 /* ---------- Open-addressing hash table ---------- */
@@ -40,6 +41,8 @@ typedef enum VHJPhase
     VHJ_BUILD,
     VHJ_PROBE,
     VHJ_EMIT,
+    VHJ_LEFT_EMIT,
+    VHJ_RIGHT_EMIT,
     VHJ_DONE
 } VHJPhase;
 
@@ -102,6 +105,13 @@ typedef struct VectorHashJoinState
     MemoryContext batch_ctx;
 
     bool        use_simd;
+
+    /* Outer join support */
+    JoinType    jointype;
+    bool       *batch_matched;      /* [batch_size] — outer tuple matched? */
+    int         left_emit_pos;      /* scan pos for LEFT/FULL unmatched outer */
+    bool       *inner_matched;      /* [ht capacity] — inner tuple matched? */
+    int         right_emit_pos;     /* scan pos for RIGHT/FULL unmatched inner */
 } VectorHashJoinState;
 
 /* ---------- Block Nested Loop state ---------- */
@@ -111,6 +121,8 @@ typedef enum NLPhase
     NL_SCAN_INNER,
     NL_EMIT,
     NL_THETA_SCAN,
+    NL_LEFT_EMIT,
+    NL_RIGHT_EMIT,
     NL_DONE
 } NLPhase;
 
@@ -186,6 +198,14 @@ typedef struct VJoinNestLoopState
     int        *theta_match_buf;     /* [block_size] match indices from SIMD */
     int         theta_match_count;
     int         theta_match_pos;
+
+    /* Outer join support */
+    JoinType    jointype;
+    bool       *block_matched;      /* [block_size] — outer tuple matched? */
+    bool       *inner_matched;      /* [inner_store count] — inner matched? */
+    int         inner_match_count;  /* capacity of inner_matched */
+    int         inner_scan_idx;     /* current inner tuple index during scan */
+    int         right_emit_pos;     /* scan pos for RIGHT/FULL unmatched inner */
 } VJoinNestLoopState;
 
 /* ---------- Vectorized Merge Join state ---------- */
@@ -199,6 +219,8 @@ typedef enum VMJPhase
     VMJ_BATCH_FILL,
     VMJ_BATCH_MERGE,
     VMJ_BATCH_EMIT,
+    VMJ_LEFT_EMIT,
+    VMJ_RIGHT_EMIT,
     VMJ_DONE
 } VMJPhase;
 
@@ -304,6 +326,11 @@ typedef struct VectorMergeJoinState
     int         batch_cp_oe;            /* outer group end */
     int         batch_cp_ie;            /* inner group end */
     int         batch_cp_ii_start;      /* inner group start for reset */
+
+    /* Outer join support */
+    JoinType    jointype;
+    bool        outer_matched;          /* current outer tuple has a match */
+    bool        inner_matched;          /* current inner tuple has a match */
 } VectorMergeJoinState;
 
 #endif /* VJOIN_STATE_H */
