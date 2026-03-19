@@ -1,10 +1,12 @@
 #include "postgres.h"
 #include "access/htup_details.h"
+#include "access/parallel.h"
 #include "vjoin_compat.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "nodes/extensible.h"
 #include "nodes/value.h"
+#include "storage/shm_toc.h"
 #include "utils/memutils.h"
 #include "utils/datum.h"
 #include "utils/typcache.h"
@@ -1550,4 +1552,46 @@ vjoin_merge_explain(CustomScanState *node, List *ancestors, ExplainState *es)
     ExplainPropertyBool("SIMD", state->use_simd, es);
     if (state->batch_size > 0)
         ExplainPropertyInteger("Batch Size", NULL, state->batch_size, es);
+}
+
+/* ----------------------------------------------------------------
+ *      Parallel DSM callbacks
+ *
+ * Each parallel worker sorts its partial outer independently and
+ * merge-joins against the full sorted inner child.
+ * ---------------------------------------------------------------- */
+
+Size
+vjoin_merge_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+    return sizeof(VJoinParallelState);
+}
+
+void
+vjoin_merge_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                            void *coordinate)
+{
+    VJoinParallelState *pstate = (VJoinParallelState *) coordinate;
+
+    pstate->initialized = 1;
+}
+
+void
+vjoin_merge_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                              void *coordinate)
+{
+    /* Workers re-sort on rescan — nothing to reset */
+}
+
+void
+vjoin_merge_initialize_worker(CustomScanState *node, shm_toc *toc,
+                               void *coordinate)
+{
+    /* Worker processes its own sorted merge via vjoin_merge_begin/exec */
+}
+
+void
+vjoin_merge_shutdown(CustomScanState *node)
+{
+    /* All cleanup handled by vjoin_merge_end */
 }

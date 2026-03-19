@@ -1,10 +1,12 @@
 #include "postgres.h"
 #include "access/htup_details.h"
+#include "access/parallel.h"
 #include "vjoin_compat.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "nodes/extensible.h"
 #include "nodes/value.h"
+#include "storage/shm_toc.h"
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
 #include "utils/datum.h"
@@ -1314,4 +1316,46 @@ vjoin_nestloop_explain(CustomScanState *node, List *ancestors, ExplainState *es)
         if (state->theta_strategy != 0)
             ExplainPropertyBool("Theta SIMD", true, es);
     }
+}
+
+/* ----------------------------------------------------------------
+ *      Parallel DSM callbacks
+ *
+ * Each parallel worker independently materializes the full inner
+ * child into its own tuplestore and scans it for each outer block.
+ * ---------------------------------------------------------------- */
+
+Size
+vjoin_nestloop_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+    return sizeof(VJoinParallelState);
+}
+
+void
+vjoin_nestloop_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                               void *coordinate)
+{
+    VJoinParallelState *pstate = (VJoinParallelState *) coordinate;
+
+    pstate->initialized = 1;
+}
+
+void
+vjoin_nestloop_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                                 void *coordinate)
+{
+    /* Workers rebuild their tuplestore on rescan — nothing to reset */
+}
+
+void
+vjoin_nestloop_initialize_worker(CustomScanState *node, shm_toc *toc,
+                                  void *coordinate)
+{
+    /* Worker builds its own local tuplestore via vjoin_nestloop_begin/exec */
+}
+
+void
+vjoin_nestloop_shutdown(CustomScanState *node)
+{
+    /* All cleanup handled by vjoin_nestloop_end */
 }

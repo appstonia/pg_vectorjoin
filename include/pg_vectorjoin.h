@@ -69,6 +69,16 @@ void vjoin_hash_end(CustomScanState *node);
 void vjoin_hash_rescan(CustomScanState *node);
 void vjoin_hash_explain(CustomScanState *node, List *ancestors, ExplainState *es);
 
+/* Hash join parallel callbacks */
+Size vjoin_hash_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+void vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                                void *coordinate);
+void vjoin_hash_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                                  void *coordinate);
+void vjoin_hash_initialize_worker(CustomScanState *node, shm_toc *toc,
+                                   void *coordinate);
+void vjoin_hash_shutdown(CustomScanState *node);
+
 /* NL executor callbacks */
 void vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags);
 TupleTableSlot *vjoin_nestloop_exec(CustomScanState *node);
@@ -76,12 +86,32 @@ void vjoin_nestloop_end(CustomScanState *node);
 void vjoin_nestloop_rescan(CustomScanState *node);
 void vjoin_nestloop_explain(CustomScanState *node, List *ancestors, ExplainState *es);
 
+/* NL parallel callbacks */
+Size vjoin_nestloop_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+void vjoin_nestloop_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                                    void *coordinate);
+void vjoin_nestloop_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                                      void *coordinate);
+void vjoin_nestloop_initialize_worker(CustomScanState *node, shm_toc *toc,
+                                       void *coordinate);
+void vjoin_nestloop_shutdown(CustomScanState *node);
+
 /* Merge join executor callbacks */
 void vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags);
 TupleTableSlot *vjoin_merge_exec(CustomScanState *node);
 void vjoin_merge_end(CustomScanState *node);
 void vjoin_merge_rescan(CustomScanState *node);
 void vjoin_merge_explain(CustomScanState *node, List *ancestors, ExplainState *es);
+
+/* Merge join parallel callbacks */
+Size vjoin_merge_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+void vjoin_merge_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                                 void *coordinate);
+void vjoin_merge_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                                   void *coordinate);
+void vjoin_merge_initialize_worker(CustomScanState *node, shm_toc *toc,
+                                    void *coordinate);
+void vjoin_merge_shutdown(CustomScanState *node);
 
 /* Hash table functions (vjoin_hashtable.c) */
 struct VJoinHashTable;

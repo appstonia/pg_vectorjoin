@@ -1,11 +1,13 @@
 #include "postgres.h"
 #include "access/htup_details.h"
 #include "access/tupdesc.h"
+#include "access/parallel.h"
 #include "vjoin_compat.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "nodes/extensible.h"
 #include "nodes/value.h"
+#include "storage/shm_toc.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -767,4 +769,47 @@ vjoin_hash_explain(CustomScanState *node, List *ancestors, ExplainState *es)
                            es);
     ExplainPropertyInteger("Batch Size", NULL, state->batch_size, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);
+}
+
+/* ----------------------------------------------------------------
+ *      Parallel DSM callbacks
+ *
+ * Each parallel worker independently builds its own hash table from
+ * the full inner child and probes with its partial outer child.
+ * The shared state is minimal — just for protocol compliance.
+ * ---------------------------------------------------------------- */
+
+Size
+vjoin_hash_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+    return sizeof(VJoinParallelState);
+}
+
+void
+vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                           void *coordinate)
+{
+    VJoinParallelState *pstate = (VJoinParallelState *) coordinate;
+
+    pstate->initialized = 1;
+}
+
+void
+vjoin_hash_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+                             void *coordinate)
+{
+    /* Workers rebuild their hash table on rescan — nothing to reset */
+}
+
+void
+vjoin_hash_initialize_worker(CustomScanState *node, shm_toc *toc,
+                              void *coordinate)
+{
+    /* Worker builds its own local hash table via vjoin_hash_begin/exec */
+}
+
+void
+vjoin_hash_shutdown(CustomScanState *node)
+{
+    /* All cleanup handled by vjoin_hash_end */
 }

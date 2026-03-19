@@ -71,6 +71,11 @@ CustomExecMethods vjoin_hash_exec_methods = {
     .ExecCustomScan = vjoin_hash_exec,
     .EndCustomScan = vjoin_hash_end,
     .ReScanCustomScan = vjoin_hash_rescan,
+    .EstimateDSMCustomScan = vjoin_hash_estimate_dsm,
+    .InitializeDSMCustomScan = vjoin_hash_initialize_dsm,
+    .ReInitializeDSMCustomScan = vjoin_hash_reinitialize_dsm,
+    .InitializeWorkerCustomScan = vjoin_hash_initialize_worker,
+    .ShutdownCustomScan = vjoin_hash_shutdown,
     .ExplainCustomScan = vjoin_hash_explain,
 };
 
@@ -80,6 +85,11 @@ CustomExecMethods vjoin_nestloop_exec_methods = {
     .ExecCustomScan = vjoin_nestloop_exec,
     .EndCustomScan = vjoin_nestloop_end,
     .ReScanCustomScan = vjoin_nestloop_rescan,
+    .EstimateDSMCustomScan = vjoin_nestloop_estimate_dsm,
+    .InitializeDSMCustomScan = vjoin_nestloop_initialize_dsm,
+    .ReInitializeDSMCustomScan = vjoin_nestloop_reinitialize_dsm,
+    .InitializeWorkerCustomScan = vjoin_nestloop_initialize_worker,
+    .ShutdownCustomScan = vjoin_nestloop_shutdown,
     .ExplainCustomScan = vjoin_nestloop_explain,
 };
 
@@ -89,6 +99,11 @@ CustomExecMethods vjoin_merge_exec_methods = {
     .ExecCustomScan = vjoin_merge_exec,
     .EndCustomScan = vjoin_merge_end,
     .ReScanCustomScan = vjoin_merge_rescan,
+    .EstimateDSMCustomScan = vjoin_merge_estimate_dsm,
+    .InitializeDSMCustomScan = vjoin_merge_initialize_dsm,
+    .ReInitializeDSMCustomScan = vjoin_merge_reinitialize_dsm,
+    .InitializeWorkerCustomScan = vjoin_merge_initialize_worker,
+    .ShutdownCustomScan = vjoin_merge_shutdown,
     .ExplainCustomScan = vjoin_merge_explain,
 };
 

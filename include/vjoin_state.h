@@ -7,6 +7,19 @@
 #include "nodes/nodes.h"
 #include "utils/tuplestore.h"
 
+/* ---------- Parallel shared state ---------- */
+/*
+ * Minimal DSM-resident struct shared between leader and workers.
+ * Each worker independently builds its own join resources (hash table,
+ * tuplestore, etc.) and probes with its partial outer scan output.
+ * This struct exists for proper DSM protocol compliance and can be
+ * extended with barrier coordination or shared hash table in the future.
+ */
+typedef struct VJoinParallelState
+{
+    int     initialized;    /* set to 1 by leader */
+} VJoinParallelState;
+
 /* ---------- Open-addressing hash table ---------- */
 typedef struct VJoinHashTable
 {

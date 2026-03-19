@@ -348,8 +348,12 @@ vjoin_try_hashjoin(PlannerInfo *root,
         add_path(joinrel, &cpath->path);
     }
 
-    /* --- Parallel path --- */
-    if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL)
+    /* --- Parallel path ---
+     * Only INNER/LEFT are safe: each worker independently builds its own
+     * hash table and probes its partial outer.  RIGHT/FULL need cross-worker
+     * inner_matched coordination, so they stay non-parallel for now. */
+    if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
+        (jointype == JOIN_INNER || jointype == JOIN_LEFT))
     {
         Path *par_outer = (Path *) linitial(outerrel->partial_pathlist);
         Path *par_inner = NULL;
@@ -504,16 +508,31 @@ vjoin_try_nestloop(PlannerInfo *root,
         add_path(joinrel, &cpath->path);
     }
 
-    /* --- Parallel path --- */
-    if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL)
+    /* --- Parallel path ---
+     * Only INNER/LEFT are safe for the same reason as hash join. */
+    if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
+        (jointype == JOIN_INNER || jointype == JOIN_LEFT))
     {
         Path *par_outer = (Path *) linitial(outerrel->partial_pathlist);
+        Path *par_inner = NULL;
         int   parallel_workers;
+        ListCell *lc2;
 
-        if (par_outer != NULL && inner_path != NULL)
+        /* Find cheapest non-parameterized parallel-safe inner path.
+         * Must NOT be a GatherPath — each worker needs its own
+         * independent full scan of the inner relation. */
+        foreach(lc2, innerrel->pathlist)
+        {
+            Path *p = (Path *) lfirst(lc2);
+            if (p->parallel_safe && p->param_info == NULL &&
+                (par_inner == NULL || p->total_cost < par_inner->total_cost))
+                par_inner = p;
+        }
+
+        if (par_outer != NULL && par_inner != NULL)
         {
             outer_rows = par_outer->rows;
-            inner_rows = inner_path->rows;
+            inner_rows = par_inner->rows;
 
             num_blocks = ceil(outer_rows / vjoin_batch_size);
             parallel_workers = par_outer->parallel_workers;
@@ -522,7 +541,7 @@ vjoin_try_nestloop(PlannerInfo *root,
 
             startup_cost = par_outer->startup_cost;
             run_cost = par_outer->total_cost - par_outer->startup_cost +
-                       num_blocks * inner_path->total_cost +
+                       num_blocks * par_inner->total_cost +
                        outer_rows * inner_rows * cpu_operator_cost *
                        vjoin_cost_factor / simd_width;
 
@@ -539,7 +558,7 @@ vjoin_try_nestloop(PlannerInfo *root,
             cpath->path.total_cost = startup_cost + run_cost;
             cpath->path.pathkeys = NIL;
             cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-            cpath->custom_paths = list_make2(par_outer, inner_path);
+            cpath->custom_paths = list_make2(par_outer, par_inner);
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
             cpath->custom_restrictinfo = extra->restrictlist;
 #endif
@@ -747,16 +766,19 @@ vjoin_try_mergejoin(PlannerInfo *root,
 
     add_path(joinrel, &cpath->path);
 
-    /* --- Parallel merge path --- */
+    /* --- Parallel merge path ---
+     * Only INNER/LEFT: RIGHT/FULL need cross-worker inner tracking. */
     {
         Path       *par_outer = NULL;
+        Path       *par_inner = NULL;
         bool        par_is_parallel = false;
         int         par_workers;
         CustomPath *pcpath;
         Cost        par_startup, par_run;
         double      par_outer_rows;
 
-        if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL)
+        if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
+            (jointype == JOIN_INNER || jointype == JOIN_LEFT))
         {
             par_outer = get_cheapest_path_for_pathkeys(
                                 outerrel->partial_pathlist,
@@ -769,6 +791,40 @@ vjoin_try_mergejoin(PlannerInfo *root,
                                                       outer_pathkeys, -1.0);
             }
             par_is_parallel = true;
+
+            /* Find cheapest parallel-safe sorted inner path.
+             * Must not be a GatherPath — each worker needs its own
+             * independent full scan of the inner relation. */
+            {
+                ListCell *lc3;
+                foreach(lc3, innerrel->pathlist)
+                {
+                    Path *p = (Path *) lfirst(lc3);
+                    if (!p->parallel_safe || p->param_info != NULL)
+                        continue;
+                    if (!pathkeys_contained_in(inner_pathkeys, p->pathkeys))
+                        continue;
+                    if (par_inner == NULL || p->total_cost < par_inner->total_cost)
+                        par_inner = p;
+                }
+            }
+            if (par_inner == NULL)
+            {
+                /* Find cheapest parallel-safe base path, then sort it */
+                Path *base_inner = NULL;
+                ListCell *lc3;
+                foreach(lc3, innerrel->pathlist)
+                {
+                    Path *p = (Path *) lfirst(lc3);
+                    if (p->parallel_safe && p->param_info == NULL &&
+                        (base_inner == NULL || p->total_cost < base_inner->total_cost))
+                        base_inner = p;
+                }
+                if (base_inner != NULL)
+                    par_inner = (Path *) create_sort_path(root, innerrel,
+                                                          base_inner,
+                                                          inner_pathkeys, -1.0);
+            }
         }
         else if (outerrel->partial_pathlist == NIL)
         {
@@ -788,9 +844,10 @@ vjoin_try_mergejoin(PlannerInfo *root,
                 par_outer = (Path *) create_sort_path(root, outerrel,
                                                       outerrel->cheapest_total_path,
                                                       outer_pathkeys, -1.0);
+            par_inner = inner_path;  /* reuse the non-parallel inner */
         }
 
-        if (par_outer != NULL)
+        if (par_outer != NULL && par_inner != NULL)
         {
             if (par_is_parallel)
             {
@@ -805,11 +862,11 @@ vjoin_try_mergejoin(PlannerInfo *root,
                 par_outer_rows = par_outer->rows;
             }
 
-            par_startup = par_outer->startup_cost + inner_path->startup_cost;
+            par_startup = par_outer->startup_cost + par_inner->startup_cost;
             par_run = ((par_outer->total_cost - par_outer->startup_cost) +
-                       (inner_path->total_cost - inner_path->startup_cost)) *
+                       (par_inner->total_cost - par_inner->startup_cost)) *
                       vjoin_cost_factor +
-                      (par_outer_rows + inner_rows) * cpu_operator_cost * vjoin_cost_factor / 4.0;
+                      (par_outer_rows + par_inner->rows) * cpu_operator_cost * vjoin_cost_factor / 4.0;
 
             pcpath = makeNode(CustomPath);
             pcpath->path.pathtype = T_CustomScan;
@@ -836,7 +893,7 @@ vjoin_try_mergejoin(PlannerInfo *root,
             pcpath->path.total_cost = par_startup + par_run;
             pcpath->path.pathkeys = NIL;
             pcpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-            pcpath->custom_paths = list_make2(par_outer, inner_path);
+            pcpath->custom_paths = list_make2(par_outer, par_inner);
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
             pcpath->custom_restrictinfo = extra->restrictlist;
 #endif
