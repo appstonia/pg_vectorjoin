@@ -309,7 +309,7 @@ vjoin_try_nestloop(PlannerInfo *root,
     double      outer_rows,
                 inner_rows,
                 num_blocks;
-    int         simd_width = 4;
+    int         simd_width = (nkeys > 0) ? 4 : 1;
 
     /* --- Non-parallel path --- */
     if (outer_path != NULL && inner_path != NULL)
@@ -346,6 +346,17 @@ vjoin_try_nestloop(PlannerInfo *root,
                                                     inner_keynos, key_types,
                                                     hash_procs, eq_oprs,
                                                     collations);
+        /* Append join qual expressions for executor evaluation */
+        {
+            List *join_clauses = NIL;
+            ListCell *rlc;
+            foreach(rlc, extra->restrictlist)
+            {
+                RestrictInfo *ri = lfirst_node(RestrictInfo, rlc);
+                join_clauses = lappend(join_clauses, copyObject(ri->clause));
+            }
+            cpath->custom_private = lappend(cpath->custom_private, join_clauses);
+        }
         cpath->methods = &vjoin_nestloop_path_methods;
 
         add_path(joinrel, &cpath->path);
@@ -394,6 +405,17 @@ vjoin_try_nestloop(PlannerInfo *root,
                                                         inner_keynos, key_types,
                                                         hash_procs, eq_oprs,
                                                         collations);
+            /* Append join qual expressions for executor evaluation */
+            {
+                List *join_clauses = NIL;
+                ListCell *rlc;
+                foreach(rlc, extra->restrictlist)
+                {
+                    RestrictInfo *ri = lfirst_node(RestrictInfo, rlc);
+                    join_clauses = lappend(join_clauses, copyObject(ri->clause));
+                }
+                cpath->custom_private = lappend(cpath->custom_private, join_clauses);
+            }
             cpath->methods = &vjoin_nestloop_path_methods;
 
             add_partial_path(joinrel, &cpath->path);
@@ -746,21 +768,23 @@ vjoin_pathlist_hook(PlannerInfo *root,
         list_free(inner_tl);
     }
 
-    if (nkeys == 0)
-        return;
+    /* Hash join and merge join require at least one equality key */
+    if (nkeys > 0)
+    {
+        if (vjoin_enable_hashjoin)
+            vjoin_try_hashjoin(root, joinrel, outerrel, innerrel, extra,
+                               nkeys, outer_keynos, inner_keynos, key_types,
+                               hash_procs, eq_oprs, collations);
 
-    if (vjoin_enable_hashjoin)
-        vjoin_try_hashjoin(root, joinrel, outerrel, innerrel, extra,
-                           nkeys, outer_keynos, inner_keynos, key_types,
-                           hash_procs, eq_oprs, collations);
+        if (vjoin_enable_mergejoin)
+            vjoin_try_mergejoin(root, joinrel, outerrel, innerrel, extra,
+                                nkeys, outer_keynos, inner_keynos, key_types,
+                                hash_procs, eq_oprs, collations);
+    }
 
+    /* Nested loop works for both equi-join (nkeys>0) and theta-join (nkeys==0) */
     if (vjoin_enable_nestloop)
         vjoin_try_nestloop(root, joinrel, outerrel, innerrel, extra,
                       nkeys, outer_keynos, inner_keynos, key_types,
                       hash_procs, eq_oprs, collations);
-
-    if (vjoin_enable_mergejoin)
-        vjoin_try_mergejoin(root, joinrel, outerrel, innerrel, extra,
-                            nkeys, outer_keynos, inner_keynos, key_types,
-                            hash_procs, eq_oprs, collations);
 }

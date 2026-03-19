@@ -110,6 +110,7 @@ typedef enum NLPhase
     NL_LOAD_BLOCK,
     NL_SCAN_INNER,
     NL_EMIT,
+    NL_THETA_SCAN,
     NL_DONE
 } NLPhase;
 
@@ -166,6 +167,10 @@ typedef struct VJoinNestLoopState
 
     MemoryContext block_ctx;
     bool        use_simd;
+
+    /* Theta-join direct iteration state (used when num_keys == 0) */
+    int         theta_outer_pos;
+    bool        theta_has_inner;
 } VJoinNestLoopState;
 
 /* ---------- Vectorized Merge Join state ---------- */

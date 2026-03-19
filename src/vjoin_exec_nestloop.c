@@ -478,17 +478,34 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
 
     /* Block buffer */
     state->block_size = vjoin_batch_size;
-    state->block_keys = palloc(sizeof(Datum) * state->block_size *
-                               state->num_keys);
-    state->block_nulls = palloc(sizeof(bool) * state->block_size *
-                                state->num_keys);
+    if (state->num_keys > 0)
+    {
+        state->block_keys = palloc(sizeof(Datum) * state->block_size *
+                                   state->num_keys);
+        state->block_nulls = palloc(sizeof(bool) * state->block_size *
+                                    state->num_keys);
+    }
+    else
+    {
+        state->block_keys = NULL;
+        state->block_nulls = NULL;
+    }
     state->block_tuples = palloc(sizeof(MinimalTuple) * state->block_size);
 
-    /* Result buffer */
-    state->result_capacity = state->block_size * 4;
-    state->results = palloc(sizeof(VJoinMatch) * state->result_capacity);
-    state->result_inner_tuples = palloc(sizeof(MinimalTuple) *
-                                        state->result_capacity);
+    /* Result buffer (only needed for equi-join key matching) */
+    if (state->num_keys > 0)
+    {
+        state->result_capacity = state->block_size * 4;
+        state->results = palloc(sizeof(VJoinMatch) * state->result_capacity);
+        state->result_inner_tuples = palloc(sizeof(MinimalTuple) *
+                                            state->result_capacity);
+    }
+    else
+    {
+        state->result_capacity = 0;
+        state->results = NULL;
+        state->result_inner_tuples = NULL;
+    }
     state->result_count = 0;
     state->result_pos = 0;
 
@@ -503,8 +520,9 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
                                              "NestLoop block",
                                              ALLOCSET_DEFAULT_SIZES);
 
-    state->use_simd = vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
-                      vjoin_simd_caps.has_neon;
+    state->use_simd = (state->num_keys > 0) &&
+                       (vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
+                        vjoin_simd_caps.has_neon);
 
     /* Inner materialization */
     state->inner_store = tuplestore_begin_heap(false, false, work_mem);
@@ -514,7 +532,13 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
 
     state->inner_exhausted = false;
     state->outer_exhausted = false;
+    state->theta_has_inner = false;
+    state->theta_outer_pos = 0;
     state->phase = NL_LOAD_BLOCK;
+
+    /* Initialize join quals from custom_exprs (handles theta-join conditions) */
+    if (cscan->custom_exprs != NIL)
+        node->ss.ps.qual = ExecInitQual(cscan->custom_exprs, (PlanState *) node);
 }
 
 TupleTableSlot *
@@ -544,13 +568,19 @@ vjoin_nestloop_exec(CustomScanState *node)
                     continue;
                 }
 
-                /* Rescan inner: use tuplestore if already materialized */
                 state->inner_exhausted = false;
                 if (state->inner_stored)
                     tuplestore_rescan(state->inner_store);
                 else
                     ExecReScan(state->inner_ps);
-                state->phase = NL_SCAN_INNER;
+
+                if (state->num_keys == 0)
+                {
+                    state->theta_has_inner = false;
+                    state->phase = NL_THETA_SCAN;
+                }
+                else
+                    state->phase = NL_SCAN_INNER;
                 continue;
 
             case NL_SCAN_INNER:
@@ -608,6 +638,93 @@ vjoin_nestloop_exec(CustomScanState *node)
 
             case NL_DONE:
                 return NULL;
+
+            case NL_THETA_SCAN:
+            {
+                TupleTableSlot *scan_slot = node->ss.ss_ScanTupleSlot;
+
+                for (;;)
+                {
+                    /* Fetch next inner tuple if needed */
+                    if (!state->theta_has_inner)
+                    {
+                        TupleTableSlot *isl;
+
+                        if (state->inner_stored)
+                        {
+                            if (!tuplestore_gettupleslot(state->inner_store,
+                                                        true, false,
+                                                        state->store_slot))
+                            {
+                                state->inner_exhausted = true;
+                                state->phase = NL_LOAD_BLOCK;
+                                break;
+                            }
+                            isl = state->store_slot;
+                        }
+                        else
+                        {
+                            isl = ExecProcNode(state->inner_ps);
+                            if (TupIsNull(isl))
+                            {
+                                state->inner_exhausted = true;
+                                state->inner_stored = true;
+                                state->phase = NL_LOAD_BLOCK;
+                                break;
+                            }
+                            tuplestore_puttupleslot(state->inner_store, isl);
+                        }
+
+                        /* Deform inner once for entire outer block scan */
+                        ExecStoreMinimalTuple(
+                            ExecCopySlotMinimalTuple(isl),
+                            state->inner_slot, true);
+                        slot_getallattrs(state->inner_slot);
+                        state->theta_has_inner = true;
+                        state->theta_outer_pos = 0;
+                    }
+
+                    /* Iterate remaining outer tuples in block */
+                    while (state->theta_outer_pos < state->block_count)
+                    {
+                        int oi = state->theta_outer_pos++;
+
+                        ExecStoreMinimalTuple(state->block_tuples[oi],
+                                              state->outer_slot, false);
+                        slot_getallattrs(state->outer_slot);
+
+                        ExecClearTuple(scan_slot);
+                        memcpy(scan_slot->tts_values,
+                               state->outer_slot->tts_values,
+                               state->num_outer_attrs * sizeof(Datum));
+                        memcpy(scan_slot->tts_isnull,
+                               state->outer_slot->tts_isnull,
+                               state->num_outer_attrs * sizeof(bool));
+                        memcpy(scan_slot->tts_values + state->num_outer_attrs,
+                               state->inner_slot->tts_values,
+                               state->num_inner_attrs * sizeof(Datum));
+                        memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
+                               state->inner_slot->tts_isnull,
+                               state->num_inner_attrs * sizeof(bool));
+                        ExecStoreVirtualTuple(scan_slot);
+
+                        ResetExprContext(econtext);
+                        econtext->ecxt_scantuple = scan_slot;
+
+                        if (!qual || ExecQual(qual, econtext))
+                        {
+                            if (projInfo)
+                                return ExecProject(projInfo);
+                            return scan_slot;
+                        }
+                    }
+
+                    /* Done with this inner tuple, fetch next */
+                    state->theta_has_inner = false;
+                }
+
+                continue;
+            }
         }
     }
 }
@@ -649,6 +766,8 @@ vjoin_nestloop_rescan(CustomScanState *node)
     state->result_pos = 0;
     state->inner_exhausted = false;
     state->outer_exhausted = false;
+    state->theta_has_inner = false;
+    state->theta_outer_pos = 0;
 }
 
 void
@@ -658,4 +777,6 @@ vjoin_nestloop_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
     ExplainPropertyInteger("Block Size", NULL, state->block_size, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);
+    if (state->num_keys == 0)
+        ExplainPropertyBool("Theta Join", true, es);
 }

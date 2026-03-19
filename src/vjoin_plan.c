@@ -51,7 +51,7 @@ vjoin_hash_plan(PlannerInfo *root, RelOptInfo *rel,
     cscan->scan.plan.targetlist = tlist;
     cscan->custom_scan_tlist = vjoin_build_scan_tlist(
         outer_plan->targetlist, inner_plan->targetlist);
-    cscan->scan.plan.qual = NIL;       /* quals applied in ExecCustomScan */
+    cscan->scan.plan.qual = NIL;
     cscan->scan.scanrelid = 0;         /* not a real relation scan */
     cscan->flags = best_path->flags;
     cscan->custom_plans = custom_plans;
@@ -80,8 +80,13 @@ vjoin_nestloop_plan(PlannerInfo *root, RelOptInfo *rel,
     cscan->scan.scanrelid = 0;
     cscan->flags = best_path->flags;
     cscan->custom_plans = custom_plans;
-    cscan->custom_exprs = NIL;
-    cscan->custom_private = best_path->custom_private;
+    /* Extract join qual expressions from custom_private (last element) */
+    {
+        List *full = best_path->custom_private;
+        int   len = list_length(full);
+        cscan->custom_exprs = (List *) llast(full);
+        cscan->custom_private = list_truncate(list_copy(full), len - 1);
+    }
     cscan->custom_relids = rel->relids;
     cscan->methods = &vjoin_nestloop_scan_methods;
 
