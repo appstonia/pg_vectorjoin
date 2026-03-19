@@ -146,6 +146,10 @@ typedef struct VJoinNestLoopState
     bool       *block_nulls;        /* [block_size * num_keys] */
     MinimalTuple *block_tuples;     /* [block_size] */
 
+    /* Pre-deformed outer values for theta scan (num_keys == 0) */
+    Datum      *block_values;       /* [block_size * num_outer_attrs] */
+    bool       *block_isnull;       /* [block_size * num_outer_attrs] */
+
     /* Result buffer */
     VJoinMatch *results;
     MinimalTuple *result_inner_tuples;  /* parallel with results */
@@ -171,6 +175,17 @@ typedef struct VJoinNestLoopState
     /* Theta-join direct iteration state (used when num_keys == 0) */
     int         theta_outer_pos;
     bool        theta_has_inner;
+
+    /* Theta SIMD support (single-key INT4/INT8/FLOAT8 theta-join) */
+    int         theta_strategy;      /* 0=none, 1=LT,2=LE,4=GE,5=GT,6=NE */
+    AttrNumber  theta_outer_keyno;
+    AttrNumber  theta_inner_keyno;
+    Oid         theta_keytype;
+    void       *theta_typed_keys;    /* [block_size] typed key array */
+    bool       *theta_block_nulls;   /* [block_size] */
+    int        *theta_match_buf;     /* [block_size] match indices from SIMD */
+    int         theta_match_count;
+    int         theta_match_pos;
 } VJoinNestLoopState;
 
 /* ---------- Vectorized Merge Join state ---------- */
