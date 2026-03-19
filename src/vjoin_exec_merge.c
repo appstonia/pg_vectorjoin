@@ -355,58 +355,6 @@ vmj_form_result(VectorMergeJoinState *state,
 }
 
 /*
- * Form result with outer values and NULL-filled inner (LEFT/FULL).
- */
-static TupleTableSlot *
-vmj_form_result_left(VectorMergeJoinState *state, MinimalTuple outer_mt)
-{
-    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-
-    ExecStoreMinimalTuple(outer_mt, state->outer_slot, false);
-    slot_getallattrs(state->outer_slot);
-
-    ExecClearTuple(scan_slot);
-    memcpy(scan_slot->tts_values,
-           state->outer_slot->tts_values,
-           state->num_outer_attrs * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull,
-           state->outer_slot->tts_isnull,
-           state->num_outer_attrs * sizeof(bool));
-    memset(scan_slot->tts_values + state->num_outer_attrs,
-           0, state->num_inner_attrs * sizeof(Datum));
-    memset(scan_slot->tts_isnull + state->num_outer_attrs,
-           1, state->num_inner_attrs * sizeof(bool));
-    ExecStoreVirtualTuple(scan_slot);
-    return scan_slot;
-}
-
-/*
- * Form result with NULL-filled outer and inner values (RIGHT/FULL).
- */
-static TupleTableSlot *
-vmj_form_result_right(VectorMergeJoinState *state, MinimalTuple inner_mt)
-{
-    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-
-    ExecStoreMinimalTuple(inner_mt, state->inner_slot, false);
-    slot_getallattrs(state->inner_slot);
-
-    ExecClearTuple(scan_slot);
-    memset(scan_slot->tts_values, 0,
-           state->num_outer_attrs * sizeof(Datum));
-    memset(scan_slot->tts_isnull, 1,
-           state->num_outer_attrs * sizeof(bool));
-    memcpy(scan_slot->tts_values + state->num_outer_attrs,
-           state->inner_slot->tts_values,
-           state->num_inner_attrs * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
-           state->inner_slot->tts_isnull,
-           state->num_inner_attrs * sizeof(bool));
-    ExecStoreVirtualTuple(scan_slot);
-    return scan_slot;
-}
-
-/*
  * Form result using current outer child slot + NULL inner (LEFT/FULL).
  * Used in tuple-at-a-time path to avoid MinimalTuple copy.
  */
