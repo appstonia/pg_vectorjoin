@@ -383,6 +383,11 @@ vjoin_try_hashjoin(PlannerInfo *root,
             run_cost = par_outer->total_cost +
                        outer_rows * cpu_operator_cost * 2.0 * vjoin_cost_factor;
 
+            /* Gather tuple-queue overhead: each result row must be
+             * serialized through shared memory to the leader process */
+            run_cost += clamp_row_est(joinrel->rows / parallel_workers) *
+                        cpu_tuple_cost;
+
             cpath = makeNode(CustomPath);
             cpath->path.pathtype = T_CustomScan;
             cpath->path.parent = joinrel;
@@ -544,6 +549,10 @@ vjoin_try_nestloop(PlannerInfo *root,
                        num_blocks * par_inner->total_cost +
                        outer_rows * inner_rows * cpu_operator_cost *
                        vjoin_cost_factor / simd_width;
+
+            /* Gather tuple-queue overhead */
+            run_cost += clamp_row_est(joinrel->rows / parallel_workers) *
+                        cpu_tuple_cost;
 
             cpath = makeNode(CustomPath);
             cpath->path.pathtype = T_CustomScan;
@@ -867,6 +876,11 @@ vjoin_try_mergejoin(PlannerInfo *root,
                        (par_inner->total_cost - par_inner->startup_cost)) *
                       vjoin_cost_factor +
                       (par_outer_rows + par_inner->rows) * cpu_operator_cost * vjoin_cost_factor / 4.0;
+
+            /* Gather tuple-queue overhead (parallel paths only) */
+            if (par_is_parallel)
+                par_run += clamp_row_est(joinrel->rows / par_workers) *
+                           cpu_tuple_cost;
 
             pcpath = makeNode(CustomPath);
             pcpath->path.pathtype = T_CustomScan;
