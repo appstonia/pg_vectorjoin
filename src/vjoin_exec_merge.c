@@ -1564,14 +1564,14 @@ vjoin_merge_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 Size
 vjoin_merge_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 {
-    return sizeof(VJoinParallelState);
+    return sizeof(VJoinGenericParallelState);
 }
 
 void
 vjoin_merge_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
                             void *coordinate)
 {
-    VJoinParallelState *pstate = (VJoinParallelState *) coordinate;
+    VJoinGenericParallelState *pstate = (VJoinGenericParallelState *) coordinate;
 
     pstate->initialized = 1;
 }

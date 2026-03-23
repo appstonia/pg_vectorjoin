@@ -5,19 +5,48 @@
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "nodes/nodes.h"
+#include "storage/barrier.h"
+#include "utils/dsa.h"
 #include "utils/tuplestore.h"
 
-/* ---------- Parallel shared state ---------- */
+/* ---------- Generic parallel state for NL / Merge (DSM-resident) ---------- */
+typedef struct VJoinGenericParallelState
+{
+    int     initialized;    /* set to 1 by leader */
+} VJoinGenericParallelState;
+
+/* ---------- Parallel shared state for Hash Join (DSM-resident) ---------- */
 /*
- * Minimal DSM-resident struct shared between leader and workers.
- * Each worker independently builds its own join resources (hash table,
- * tuplestore, etc.) and probes with its partial outer scan output.
- * This struct exists for proper DSM protocol compliance and can be
- * extended with barrier coordination or shared hash table in the future.
+ * Leader builds the hash table locally, then copies the three flat arrays
+ * (hashvals, all_values, all_isnull) into DSA shared memory.  Workers
+ * attach to DSA and create a read-only VJoinHashTable wrapper that points
+ * directly at the shared arrays — zero memcpy on the reader side.
+ *
+ * Barrier phases:
+ *   0 → build:     leader builds HT and copies to DSA
+ *   1 → probe:     all participants probe with partial outer
  */
 typedef struct VJoinParallelState
 {
-    int     initialized;    /* set to 1 by leader */
+    Barrier     barrier;        /* build/probe synchronization */
+    dsa_handle  dsa_handle;     /* handle for DSA area */
+
+    /* Shared hash table metadata */
+    int         capacity;
+    int         mask;
+    int         num_entries;
+    int         num_all_attrs;
+    int         num_keys;
+
+    bool        all_attrs_byval; /* true if every inner attr is pass-by-value */
+
+    /* DSA pointers to the flat arrays */
+    dsa_pointer hashvals_dp;    /* uint32[capacity] */
+    dsa_pointer all_values_dp;  /* Datum[capacity * num_all_attrs] */
+    dsa_pointer all_isnull_dp;  /* bool[capacity * num_all_attrs] */
+    dsa_pointer inner_keynos_dp;/* AttrNumber[num_keys] */
+    dsa_pointer vardata_dp;     /* flat buffer for all pass-by-ref datum data */
+    dsa_pointer attr_byval_dp;  /* bool[num_all_attrs] */
 } VJoinParallelState;
 
 /* ---------- Open-addressing hash table ---------- */
@@ -120,6 +149,13 @@ typedef struct VectorHashJoinState
     int         left_emit_pos;      /* scan pos for LEFT/FULL unmatched outer */
     bool       *inner_matched;      /* [ht capacity] — inner tuple matched? */
     int         right_emit_pos;     /* scan pos for RIGHT/FULL unmatched inner */
+
+    /* Parallel support (leader-builds, workers-probe) */
+    bool        is_parallel;        /* true if running under Gather */
+    bool        is_leader;          /* true if this is the leader process */
+    VJoinParallelState *pstate;     /* pointer to DSM-resident shared state */
+    dsa_area   *dsa;                /* attached DSA area (leader + workers) */
+    int         cached_ht_entries;  /* snapshot for EXPLAIN after DSM detach */
 } VectorHashJoinState;
 
 /* ---------- Block Nested Loop state ---------- */

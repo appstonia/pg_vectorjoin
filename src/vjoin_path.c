@@ -349,8 +349,9 @@ vjoin_try_hashjoin(PlannerInfo *root,
     }
 
     /* --- Parallel path ---
-     * Only INNER/LEFT are safe: each worker independently builds its own
-     * hash table and probes its partial outer.  RIGHT/FULL need cross-worker
+     * Leader builds the hash table and shares it via DSA.  Workers
+     * attach to the shared HT and only probe with their partial outer.
+     * Only INNER/LEFT are safe: RIGHT/FULL need cross-worker
      * inner_matched coordination, so they stay non-parallel for now. */
     if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
         (jointype == JOIN_INNER || jointype == JOIN_LEFT))
@@ -378,15 +379,13 @@ vjoin_try_hashjoin(PlannerInfo *root,
             outer_rows = par_outer->rows;
             inner_rows = par_inner->rows;
 
+            /* Build cost: only leader builds (not multiplied by workers) */
             startup_cost = par_inner->total_cost +
                            inner_rows * cpu_operator_cost * 2.0;
+
+            /* Probe cost: split across all participants */
             run_cost = par_outer->total_cost +
                        outer_rows * cpu_operator_cost * 2.0 * vjoin_cost_factor;
-
-            /* Gather tuple-queue overhead: each result row must be
-             * serialized through shared memory to the leader process */
-            run_cost += clamp_row_est(joinrel->rows / parallel_workers) *
-                        cpu_tuple_cost;
 
             cpath = makeNode(CustomPath);
             cpath->path.pathtype = T_CustomScan;

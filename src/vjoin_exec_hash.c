@@ -7,8 +7,11 @@
 #include "executor/tuptable.h"
 #include "nodes/extensible.h"
 #include "nodes/value.h"
+#include "storage/barrier.h"
+#include "storage/lwlock.h"
 #include "storage/shm_toc.h"
 #include "utils/datum.h"
+#include "utils/dsa.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "fmgr.h"
@@ -137,6 +140,11 @@ vjoin_form_result(VectorHashJoinState *state,
 /*
  * Build phase: read all inner tuples into hash table.
  * Pre-deforms all inner attributes for fast result emission.
+ *
+ * In parallel mode only the leader builds.  After building, the leader
+ * copies the flat arrays into DSA shared memory and all participants
+ * (leader + workers) synchronize at the barrier.  Workers then attach
+ * a read-only wrapper to the shared hash table.
  */
 static void
 vjoin_hash_build(VectorHashJoinState *state)
@@ -144,6 +152,36 @@ vjoin_hash_build(VectorHashJoinState *state)
     TupleTableSlot *slot;
     MemoryContext oldctx;
 
+    /*
+     * Parallel worker: skip build — the leader builds and shares via DSA.
+     * Wait at the barrier for the leader to finish, then attach.
+     */
+    if (state->is_parallel && !state->is_leader)
+    {
+        BarrierArriveAndWait(&state->pstate->barrier, 0);
+
+        /* Destroy the empty local HT created during begin */
+        if (state->hashtable)
+        {
+            vjoin_ht_destroy(state->hashtable);
+            state->hashtable = NULL;
+        }
+
+        /* Attach read-only wrapper to the shared hash table */
+        state->hashtable = vjoin_ht_attach_from_dsa(state->pstate,
+                                                     state->dsa,
+                                                     state->hash_ctx);
+        state->cached_ht_entries = state->hashtable->num_entries;
+
+        /* Allocate inner_matched after attach so we know capacity */
+        if (state->jointype == JOIN_RIGHT || state->jointype == JOIN_FULL)
+            state->inner_matched = palloc0(sizeof(bool) * state->hashtable->capacity);
+
+        state->phase = VHJ_PROBE;
+        return;
+    }
+
+    /* Leader (parallel) or non-parallel: build the hash table locally */
     oldctx = MemoryContextSwitchTo(state->hash_ctx);
 
     for (;;)
@@ -205,6 +243,16 @@ vjoin_hash_build(VectorHashJoinState *state)
     }
 
     MemoryContextSwitchTo(oldctx);
+
+    /* Cache entry count before DSA (for EXPLAIN after DSM detach) */
+    state->cached_ht_entries = state->hashtable->num_entries;
+
+    /* In parallel mode, serialize HT to DSA and signal workers */
+    if (state->is_parallel)
+    {
+        vjoin_ht_serialize_to_dsa(state->hashtable, state->dsa, state->pstate);
+        BarrierArriveAndWait(&state->pstate->barrier, 0);
+    }
 
     /* Allocate inner_matched after build so we know capacity */
     if (state->jointype == JOIN_RIGHT || state->jointype == JOIN_FULL)
@@ -505,7 +553,18 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
                                              "VectorHashJoin batch",
                                              ALLOCSET_DEFAULT_SIZES);
 
-    /* Create hash table (estimate based on inner plan rows) */
+    /* Initialize parallel fields — will be set properly by DSM callbacks */
+    state->is_parallel = false;
+    state->is_leader = false;
+    state->pstate = NULL;
+    state->dsa = NULL;
+    state->cached_ht_entries = 0;
+
+    /* Create hash table (estimate based on inner plan rows).
+     * In parallel-worker mode the HT is created later from DSA,
+     * but we don't know yet whether we're a worker — that's set by
+     * initialize_worker.  Create it unconditionally; workers will
+     * destroy it and replace with the shared wrapper during build. */
     {
         double inner_rows = inner_ps->plan->plan_rows;
         bool   *inner_byval;
@@ -704,12 +763,26 @@ vjoin_hash_end(CustomScanState *node)
     if (state->inner_desc)
         FreeTupleDesc(state->inner_desc);
 
+    /*
+     * For parallel workers, the HT wrapper points into DSA shared memory.
+     * We must not pfree those arrays — just destroy the wrapper context.
+     * For leader/non-parallel, the HT owns its own allocations.
+     */
     if (state->hashtable)
         vjoin_ht_destroy(state->hashtable);
     if (state->hash_ctx)
         MemoryContextDelete(state->hash_ctx);
     if (state->batch_ctx)
         MemoryContextDelete(state->batch_ctx);
+
+    /* Detach DSA — the shared memory persists until leader destroys it */
+    if (state->dsa)
+    {
+        dsa_detach(state->dsa);
+        state->dsa = NULL;
+    }
+    state->hashtable = NULL;
+    state->pstate = NULL;
 }
 
 void
@@ -747,19 +820,24 @@ vjoin_hash_explain(CustomScanState *node, List *ancestors, ExplainState *es)
         default:         jt = "Inner"; break;
     }
     ExplainPropertyText("Join Type", jt, es);
+
+    /* Use cached count — safe even after DSM detach */
     ExplainPropertyInteger("Hash Table Size", NULL,
-                           state->hashtable ? state->hashtable->num_entries : 0,
-                           es);
+                           state->cached_ht_entries, es);
     ExplainPropertyInteger("Batch Size", NULL, state->batch_size, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);
 }
 
 /* ----------------------------------------------------------------
- *      Parallel DSM callbacks
+ *      Parallel DSM callbacks — Leader-builds, Workers-probe
  *
- * Each parallel worker independently builds its own hash table from
- * the full inner child and probes with its partial outer child.
- * The shared state is minimal — just for protocol compliance.
+ * The leader creates a DSA area and initializes a Barrier in the
+ * shared VJoinParallelState.  During the build phase, only the leader
+ * reads the inner child and populates the hash table.  It then copies
+ * the flat arrays into DSA and arrives at the barrier.  Workers wait
+ * at the barrier, then create a read-only HT wrapper pointing at the
+ * shared DSA arrays.  All participants then probe with their own
+ * partial outer scan.
  * ---------------------------------------------------------------- */
 
 Size
@@ -772,23 +850,44 @@ void
 vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
                            void *coordinate)
 {
+    VectorHashJoinState *state = (VectorHashJoinState *) node;
     VJoinParallelState *pstate = (VJoinParallelState *) coordinate;
 
-    pstate->initialized = 1;
+    /* Create DSA in the DSM segment */
+    state->dsa = dsa_create(LWTRANCHE_PARALLEL_HASH_JOIN);
+    dsa_pin_mapping(state->dsa);
+
+    /* Initialize the shared state */
+    pstate->dsa_handle = dsa_get_handle(state->dsa);
+    BarrierInit(&pstate->barrier, pcxt->nworkers_to_launch + 1);
+    pstate->num_entries = 0;
+
+    state->pstate = pstate;
+    state->is_parallel = true;
+    state->is_leader = true;
 }
 
 void
 vjoin_hash_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
                              void *coordinate)
 {
-    /* Workers rebuild their hash table on rescan — nothing to reset */
+    /* Rescan is not supported for parallel VHJ — hash table stays valid */
 }
 
 void
 vjoin_hash_initialize_worker(CustomScanState *node, shm_toc *toc,
                               void *coordinate)
 {
-    /* Worker builds its own local hash table via vjoin_hash_begin/exec */
+    VectorHashJoinState *state = (VectorHashJoinState *) node;
+    VJoinParallelState *pstate = (VJoinParallelState *) coordinate;
+
+    /* Attach to the DSA area created by the leader */
+    state->dsa = dsa_attach(pstate->dsa_handle);
+    dsa_pin_mapping(state->dsa);
+
+    state->pstate = pstate;
+    state->is_parallel = true;
+    state->is_leader = false;
 }
 
 void

@@ -4,6 +4,7 @@
 #include "postgres.h"
 #include "nodes/extensible.h"
 #include "optimizer/paths.h"
+#include "utils/dsa.h"
 
 /* Constants */
 #define VJOIN_MAX_KEYS          8
@@ -115,6 +116,7 @@ void vjoin_merge_shutdown(CustomScanState *node);
 
 /* Hash table functions (vjoin_hashtable.c) */
 struct VJoinHashTable;
+struct VJoinParallelState;
 typedef struct VJoinHashTable VJoinHashTable;
 VJoinHashTable *vjoin_ht_create(int estimated_rows, int num_keys,
                                 int num_all_attrs, MemoryContext parent,
@@ -123,6 +125,11 @@ VJoinHashTable *vjoin_ht_create(int estimated_rows, int num_keys,
 void vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
                      Datum *all_values, bool *all_isnull);
 void vjoin_ht_destroy(VJoinHashTable *ht);
+void vjoin_ht_serialize_to_dsa(VJoinHashTable *ht, dsa_area *dsa,
+                                struct VJoinParallelState *pstate);
+VJoinHashTable *vjoin_ht_attach_from_dsa(struct VJoinParallelState *pstate,
+                                          dsa_area *dsa,
+                                          MemoryContext parent);
 
 #include "fmgr.h"
 

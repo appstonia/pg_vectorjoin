@@ -1328,14 +1328,14 @@ vjoin_nestloop_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 Size
 vjoin_nestloop_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 {
-    return sizeof(VJoinParallelState);
+    return sizeof(VJoinGenericParallelState);
 }
 
 void
 vjoin_nestloop_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
                                void *coordinate)
 {
-    VJoinParallelState *pstate = (VJoinParallelState *) coordinate;
+    VJoinGenericParallelState *pstate = (VJoinGenericParallelState *) coordinate;
 
     pstate->initialized = 1;
 }

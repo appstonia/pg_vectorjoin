@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "utils/datum.h"
+#include "utils/dsa.h"
 #include "utils/memutils.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
@@ -172,4 +173,204 @@ vjoin_ht_destroy(VJoinHashTable *ht)
 {
     if (ht && ht->htctx)
         MemoryContextDelete(ht->htctx);
+}
+
+/*
+ * Copy a locally-built hash table's flat arrays into DSA shared memory
+ * and fill the parallel state metadata so workers can attach.
+ *
+ * For pass-by-reference Datums (text, varchar, etc.) the Datum is a
+ * pointer into the leader's private heap — unusable by workers.  We
+ * deep-copy all such data into a single flat DSA buffer and store
+ * *offsets* (from the buffer start) in the shared all_values array.
+ * Workers translate offsets back to valid local pointers after attach.
+ */
+void
+vjoin_ht_serialize_to_dsa(VJoinHashTable *ht, dsa_area *dsa,
+                           VJoinParallelState *pstate)
+{
+    Size hv_sz  = sizeof(uint32) * ht->capacity;
+    Size val_sz = sizeof(Datum) * ht->capacity * ht->num_all_attrs;
+    Size null_sz = sizeof(bool) * ht->capacity * ht->num_all_attrs;
+    Size kn_sz  = sizeof(AttrNumber) * ht->num_keys;
+    Size bv_sz  = sizeof(bool) * ht->num_all_attrs;
+    int  na     = ht->num_all_attrs;
+    int  cap    = ht->capacity;
+
+    pstate->capacity       = cap;
+    pstate->mask           = ht->mask;
+    pstate->num_entries    = ht->num_entries;
+    pstate->num_all_attrs  = na;
+    pstate->num_keys       = ht->num_keys;
+    pstate->all_attrs_byval = ht->all_attrs_byval;
+
+    /* hashvals — no pointers, safe to memcpy */
+    pstate->hashvals_dp = dsa_allocate(dsa, hv_sz);
+    memcpy(dsa_get_address(dsa, pstate->hashvals_dp), ht->hashvals, hv_sz);
+
+    /* all_isnull — no pointers */
+    pstate->all_isnull_dp = dsa_allocate(dsa, null_sz);
+    memcpy(dsa_get_address(dsa, pstate->all_isnull_dp), ht->all_isnull, null_sz);
+
+    /* inner_keynos */
+    pstate->inner_keynos_dp = dsa_allocate(dsa, kn_sz);
+    memcpy(dsa_get_address(dsa, pstate->inner_keynos_dp), ht->inner_keynos, kn_sz);
+
+    /* attr_byval (workers need this for pointer fixup) */
+    pstate->attr_byval_dp = dsa_allocate(dsa, bv_sz);
+    memcpy(dsa_get_address(dsa, pstate->attr_byval_dp), ht->attr_byval, bv_sz);
+
+    /* all_values — deep-copy pass-by-ref data into a flat DSA buffer */
+    pstate->all_values_dp = dsa_allocate(dsa, val_sz);
+    {
+        Datum *shared_vals = (Datum *) dsa_get_address(dsa, pstate->all_values_dp);
+        memcpy(shared_vals, ht->all_values, val_sz);
+
+        if (!ht->all_attrs_byval)
+        {
+            /* Pass 1: compute total size of all pass-by-ref data */
+            Size total_vardata = 0;
+            int  i, a;
+
+            for (i = 0; i < cap; i++)
+            {
+                if (ht->hashvals[i] == 0)
+                    continue;
+                for (a = 0; a < na; a++)
+                {
+                    int idx = i * na + a;
+                    if (!ht->attr_byval[a] && !ht->all_isnull[idx])
+                        total_vardata += MAXALIGN(datumGetSize(
+                            ht->all_values[idx], false, ht->attr_typlen[a]));
+                }
+            }
+
+            if (total_vardata > 0)
+            {
+                /* Pass 2: allocate one buffer, copy data, store offsets */
+                dsa_pointer var_dp;
+                char       *var_buf;
+                Size        offset = 0;
+
+                var_dp  = dsa_allocate_extended(dsa, total_vardata,
+                                               DSA_ALLOC_HUGE);
+                var_buf = (char *) dsa_get_address(dsa, var_dp);
+                pstate->vardata_dp = var_dp;
+
+                for (i = 0; i < cap; i++)
+                {
+                    if (ht->hashvals[i] == 0)
+                        continue;
+                    for (a = 0; a < na; a++)
+                    {
+                        int idx = i * na + a;
+                        if (!ht->attr_byval[a] && !ht->all_isnull[idx])
+                        {
+                            Size dsz = datumGetSize(
+                                ht->all_values[idx], false, ht->attr_typlen[a]);
+                            memcpy(var_buf + offset,
+                                   DatumGetPointer(ht->all_values[idx]), dsz);
+                            /* Store offset from buffer start */
+                            shared_vals[idx] = (Datum) offset;
+                            offset += MAXALIGN(dsz);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                pstate->vardata_dp = InvalidDsaPointer;
+            }
+        }
+        else
+        {
+            pstate->vardata_dp = InvalidDsaPointer;
+        }
+    }
+}
+
+/*
+ * Create a read-only VJoinHashTable wrapper that points at DSA shared
+ * memory.  For tables with pass-by-ref columns the all_values array is
+ * copied locally and offsets are translated back to valid pointers.
+ */
+VJoinHashTable *
+vjoin_ht_attach_from_dsa(VJoinParallelState *pstate, dsa_area *dsa,
+                          MemoryContext parent)
+{
+    MemoryContext htctx;
+    VJoinHashTable *ht;
+    int na  = pstate->num_all_attrs;
+    int cap = pstate->capacity;
+
+    htctx = AllocSetContextCreate(parent,
+                                  "VJoinHashTable (shared)",
+                                  ALLOCSET_DEFAULT_SIZES);
+
+    ht = (VJoinHashTable *) MemoryContextAllocZero(htctx,
+                                                    sizeof(VJoinHashTable));
+    ht->htctx          = htctx;
+    ht->capacity       = cap;
+    ht->mask           = pstate->mask;
+    ht->num_entries    = pstate->num_entries;
+    ht->num_all_attrs  = na;
+    ht->num_keys       = pstate->num_keys;
+    ht->all_attrs_byval = pstate->all_attrs_byval;
+
+    /* These arrays are pure values / booleans — shared read-only */
+    ht->hashvals    = (uint32 *)    dsa_get_address(dsa, pstate->hashvals_dp);
+    ht->all_isnull  = (bool *)      dsa_get_address(dsa, pstate->all_isnull_dp);
+    ht->inner_keynos = (AttrNumber *) dsa_get_address(dsa, pstate->inner_keynos_dp);
+
+    if (pstate->all_attrs_byval)
+    {
+        /* All byval: Datums are values, not pointers — share directly */
+        ht->all_values = (Datum *) dsa_get_address(dsa, pstate->all_values_dp);
+    }
+    else
+    {
+        /*
+         * Has pass-by-ref columns: the shared all_values array stores
+         * *offsets* for byref Datums.  Make a local copy and convert
+         * each offset to a valid local pointer via dsa_get_address.
+         */
+        Size   val_sz = sizeof(Datum) * cap * na;
+        Datum *local_vals;
+
+        local_vals = (Datum *) MemoryContextAlloc(htctx, val_sz);
+        memcpy(local_vals,
+               dsa_get_address(dsa, pstate->all_values_dp), val_sz);
+
+        if (DsaPointerIsValid(pstate->vardata_dp))
+        {
+            bool *attr_byval = (bool *) dsa_get_address(dsa,
+                                                         pstate->attr_byval_dp);
+            char *var_base   = (char *) dsa_get_address(dsa,
+                                                         pstate->vardata_dp);
+            int   i, a;
+
+            for (i = 0; i < cap; i++)
+            {
+                if (ht->hashvals[i] == 0)
+                    continue;
+                for (a = 0; a < na; a++)
+                {
+                    int idx = i * na + a;
+                    if (!attr_byval[a] && !ht->all_isnull[idx])
+                    {
+                        /* offset → local pointer */
+                        Size off = (Size) local_vals[idx];
+                        local_vals[idx] = PointerGetDatum(var_base + off);
+                    }
+                }
+            }
+        }
+
+        ht->all_values = local_vals;
+    }
+
+    ht->attr_byval  = NULL;
+    ht->attr_typlen = NULL;
+
+    return ht;
 }
