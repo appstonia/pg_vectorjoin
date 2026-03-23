@@ -24,9 +24,6 @@ typedef struct VJoinParallelState
 typedef struct VJoinHashTable
 {
     uint32     *hashvals;       /* [capacity] — 0 means empty slot */
-    MinimalTuple *tuples;       /* [capacity] */
-    Datum      *keys;           /* [capacity * num_keys] */
-    bool       *key_nulls;      /* [capacity * num_keys] */
     Datum      *all_values;     /* [capacity * num_all_attrs] pre-deformed */
     bool       *all_isnull;     /* [capacity * num_all_attrs] */
     int         num_all_attrs;  /* total inner attrs */
@@ -34,10 +31,10 @@ typedef struct VJoinHashTable
     int         mask;           /* capacity - 1 */
     int         num_entries;
     int         num_keys;
-    bool       *key_byval;      /* [num_keys] — pass-by-value per key */
-    int16      *key_typlen;     /* [num_keys] — type length per key */
+    AttrNumber *inner_keynos;   /* [num_keys] — 1-based attr positions of keys */
     bool       *attr_byval;     /* [num_all_attrs] — pass-by-value per attr */
     int16      *attr_typlen;    /* [num_all_attrs] — type length per attr */
+    bool        all_attrs_byval; /* true if all attrs are pass-by-value */
     MemoryContext htctx;
 } VJoinHashTable;
 
@@ -94,9 +91,7 @@ typedef struct VectorHashJoinState
     int         batch_size;
     int         batch_count;       /* tuples in current batch */
     int         batch_pos;         /* next unprocessed in batch */
-    Datum      *batch_keys;        /* [batch_size * num_keys] */
-    bool       *batch_nulls;       /* [batch_size * num_keys] */
-    uint32     *batch_hashes;      /* [batch_size] */
+    uint32     *batch_hashes;      /* [batch_size] — 0 means NULL key */
     Datum      *batch_values;      /* [batch_size * num_outer_attrs] deformed */
     bool       *batch_isnull;      /* [batch_size * num_outer_attrs] */
 

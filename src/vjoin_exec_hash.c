@@ -150,25 +150,26 @@ vjoin_hash_build(VectorHashJoinState *state)
     {
         bool    has_null = false;
         uint32  hashval;
-        Datum   keyvals[VJOIN_MAX_KEYS];
-        bool    keynulls[VJOIN_MAX_KEYS];
         int     i;
 
-        /* Pull inner tuple in parent context, copy into hash_ctx */
+        /* Pull inner tuple in parent context */
         MemoryContextSwitchTo(oldctx);
         slot = ExecProcNode(state->inner_ps);
-        MemoryContextSwitchTo(state->hash_ctx);
         if (TupIsNull(slot))
             break;
 
-        /* Extract key values */
-        has_null = false;
+        /* Deform all attributes once — keys are read from here too */
+        slot_getallattrs(slot);
+        MemoryContextSwitchTo(state->hash_ctx);
+
+        /* Check for NULL keys */
         for (i = 0; i < state->num_keys; i++)
         {
-            keyvals[i] = slot_getattr(slot, state->inner_keynos[i],
-                                      &keynulls[i]);
-            if (keynulls[i])
+            if (slot->tts_isnull[state->inner_keynos[i] - 1])
+            {
                 has_null = true;
+                break;
+            }
         }
 
         /* Skip NULL keys — NULLs never match in equijoin.
@@ -177,36 +178,29 @@ vjoin_hash_build(VectorHashJoinState *state)
         {
             if (state->jointype == JOIN_RIGHT || state->jointype == JOIN_FULL)
             {
-                slot_getallattrs(slot);
                 vjoin_ht_insert(state->hashtable, 1 /* dummy nonzero hash */,
-                                ExecCopySlotMinimalTuple(slot),
-                                keyvals, keynulls,
                                 slot->tts_values, slot->tts_isnull);
             }
             continue;
         }
 
-        /* Compute hash */
+        /* Compute hash from key values already deformed in slot */
         hashval = 0;
         for (i = 0; i < state->num_keys; i++)
         {
+            Datum d = slot->tts_values[state->inner_keynos[i] - 1];
             uint32 h;
             if (vjoin_is_fast_type(state->key_types[i]))
-                h = vjoin_hash_datum(keyvals[i], state->key_types[i]);
+                h = vjoin_hash_datum(d, state->key_types[i]);
             else
-                h = vjoin_hash_datum_generic(keyvals[i],
+                h = vjoin_hash_datum_generic(d,
                                              &state->hash_finfo[i],
                                              state->key_collations[i]);
             hashval = (i == 0) ? h : vjoin_combine_hashes(hashval, h);
         }
 
-        /* Deform all inner attributes for fast emit */
-        slot_getallattrs(slot);
-
         /* Insert into hash table with full deformed values */
         vjoin_ht_insert(state->hashtable, hashval,
-                        ExecCopySlotMinimalTuple(slot),
-                        keyvals, keynulls,
                         slot->tts_values, slot->tts_isnull);
     }
 
@@ -269,6 +263,7 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
     TupleTableSlot *slot;
     VJoinHashTable *ht = state->hashtable;
     int batch_idx;
+    int noa = state->num_outer_attrs;
 
     oldctx = MemoryContextSwitchTo(state->batch_ctx);
     MemoryContextReset(state->batch_ctx);
@@ -294,20 +289,19 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
         /* Extract all outer attributes into batch Datum arrays */
         vjoin_extract_outer_attrs(state, slot, batch_idx);
 
-        /* Compute hash from pre-extracted key values */
-        off = batch_idx * state->num_outer_attrs;
+        /* Compute hash from key values within batch_values */
+        off = batch_idx * noa;
         for (i = 0; i < state->num_keys; i++)
         {
             int keyoff = state->outer_keynos[i] - 1;  /* 1-based → 0-based */
-            bool isnull = state->batch_isnull[off + keyoff];
-            Datum d = state->batch_values[off + keyoff];
-
-            state->batch_keys[batch_idx * state->num_keys + i] = d;
-            state->batch_nulls[batch_idx * state->num_keys + i] = isnull;
-            if (isnull)
+            if (state->batch_isnull[off + keyoff])
+            {
                 has_null = true;
+                break;
+            }
             else
             {
+                Datum d = state->batch_values[off + keyoff];
                 uint32 h;
                 if (vjoin_is_fast_type(state->key_types[i]))
                     h = vjoin_hash_datum(d, state->key_types[i]);
@@ -332,20 +326,13 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
     {
         uint32  hashval = state->batch_hashes[batch_idx];
         int     pos;
-        bool    any_null = false;
-        int     k;
+        int     ooff;
 
-        /* Check for NULL in outer keys */
-        for (k = 0; k < state->num_keys; k++)
-        {
-            if (state->batch_nulls[batch_idx * state->num_keys + k])
-            {
-                any_null = true;
-                break;
-            }
-        }
-        if (any_null)
-            continue;  /* NULL keys never match; LEFT/FULL handles below */
+        /* NULL keys never match — hash was set to 0 */
+        if (hashval == 0)
+            continue;
+
+        ooff = batch_idx * noa;
 
         /* Linear probe in hash table */
         pos = hashval & ht->mask;
@@ -353,19 +340,20 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
         {
             if (ht->hashvals[pos] == hashval)
             {
-                /* Compare all keys */
+                /* Compare all keys via all_values at inner_keynos offsets */
                 bool match = true;
+                int ioff = pos * ht->num_all_attrs;
+                int k;
+
                 for (k = 0; k < state->num_keys; k++)
                 {
-                    Datum outer_key = state->batch_keys[
-                        batch_idx * state->num_keys + k];
-                    bool inner_null = ht->key_nulls[
-                        pos * ht->num_keys + k];
-                    Datum inner_key = ht->keys[
-                        pos * ht->num_keys + k];
+                    int inner_attr = ht->inner_keynos[k] - 1;
+                    Datum outer_key = state->batch_values[
+                        ooff + (state->outer_keynos[k] - 1)];
+                    Datum inner_key = ht->all_values[ioff + inner_attr];
 
                     /* NULL inner keys never match */
-                    if (inner_null)
+                    if (ht->all_isnull[ioff + inner_attr])
                     {
                         match = false;
                         break;
@@ -540,8 +528,7 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
                                            state->num_keys,
                                            state->num_inner_attrs,
                                            state->hash_ctx,
-                                           state->key_byval,
-                                           state->key_typlen,
+                                           state->inner_keynos,
                                            inner_byval,
                                            inner_typlen);
 
@@ -551,10 +538,6 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
 
     /* Allocate batch buffers */
     state->batch_size = vjoin_batch_size;
-    state->batch_keys = palloc(sizeof(Datum) * state->batch_size *
-                               state->num_keys);
-    state->batch_nulls = palloc(sizeof(bool) * state->batch_size *
-                                state->num_keys);
     state->batch_hashes = palloc(sizeof(uint32) * state->batch_size);
     state->batch_values = palloc(sizeof(Datum) * state->batch_size *
                                  state->num_outer_attrs);

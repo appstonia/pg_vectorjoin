@@ -118,10 +118,9 @@ struct VJoinHashTable;
 typedef struct VJoinHashTable VJoinHashTable;
 VJoinHashTable *vjoin_ht_create(int estimated_rows, int num_keys,
                                 int num_all_attrs, MemoryContext parent,
-                                bool *key_byval, int16 *key_typlen,
+                                AttrNumber *inner_keynos,
                                 bool *attr_byval, int16 *attr_typlen);
 void vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
-                     MinimalTuple tuple, Datum *keyvals, bool *keynulls,
                      Datum *all_values, bool *all_isnull);
 void vjoin_ht_destroy(VJoinHashTable *ht);
 
