@@ -5,6 +5,7 @@
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "nodes/nodes.h"
+#include "port/atomics.h"
 #include "storage/barrier.h"
 #include "utils/dsa.h"
 #include "utils/tuplestore.h"
@@ -39,6 +40,10 @@ typedef struct VJoinParallelState
     int         num_keys;
 
     bool        all_attrs_byval; /* true if every inner attr is pass-by-value */
+    bool        built_in_dsa;    /* true if leader built HT directly in DSA */
+    bool        parallel_build;  /* true if all participants build concurrently */
+
+    pg_atomic_uint32  num_entries_atomic;  /* CAS counter for parallel build */
 
     /* DSA pointers to the flat arrays */
     dsa_pointer hashvals_dp;    /* uint32[capacity] */
@@ -47,6 +52,9 @@ typedef struct VJoinParallelState
     dsa_pointer inner_keynos_dp;/* AttrNumber[num_keys] */
     dsa_pointer vardata_dp;     /* flat buffer for all pass-by-ref datum data */
     dsa_pointer attr_byval_dp;  /* bool[num_all_attrs] */
+
+    /* Pre-allocation: estimated inner rows for DSA-direct build */
+    int         est_inner_rows;
 } VJoinParallelState;
 
 /* ---------- Open-addressing hash table ---------- */
@@ -65,6 +73,11 @@ typedef struct VJoinHashTable
     int16      *attr_typlen;    /* [num_all_attrs] — type length per attr */
     bool        all_attrs_byval; /* true if all attrs are pass-by-value */
     MemoryContext htctx;
+
+    /* DSA-direct build: arrays live in shared memory, not palloc'd */
+    bool        is_shared;      /* true = arrays are DSA-backed */
+    dsa_area   *dsa;            /* DSA area (only when is_shared) */
+    struct VJoinParallelState *pstate; /* shared state (only when is_shared) */
 } VJoinHashTable;
 
 /* ---------- Result buffer entry ---------- */

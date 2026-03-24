@@ -10,6 +10,7 @@
 #include "storage/barrier.h"
 #include "storage/lwlock.h"
 #include "storage/shm_toc.h"
+#include "port/atomics.h"
 #include "utils/datum.h"
 #include "utils/dsa.h"
 #include "utils/lsyscache.h"
@@ -18,6 +19,16 @@
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
+
+/* Round up to next power of 2 (duplicated from vjoin_hashtable.c) */
+static inline int
+next_power_of_2(int n)
+{
+    int p = 1;
+    while (p < n)
+        p <<= 1;
+    return p;
+}
 
 /*
  * Deserialize key info from custom_private.
@@ -145,16 +156,172 @@ vjoin_form_result(VectorHashJoinState *state,
  * copies the flat arrays into DSA shared memory and all participants
  * (leader + workers) synchronize at the barrier.  Workers then attach
  * a read-only wrapper to the shared hash table.
+ *
+ * When the inner child is parallel-aware and all inner attrs are byval,
+ * all participants (leader + workers) scan inner concurrently and insert
+ * into the shared DSA hash table using CAS-based lock-free insertion.
  */
 static void
 vjoin_hash_build(VectorHashJoinState *state)
 {
     TupleTableSlot *slot;
     MemoryContext oldctx;
+    bool parallel_build;
 
     /*
-     * Parallel worker: skip build — the leader builds and shares via DSA.
-     * Wait at the barrier for the leader to finish, then attach.
+     * Determine if all participants should build concurrently.
+     * Requires: parallel mode + byval inner attrs + parallel-aware inner scan.
+     */
+    parallel_build = state->is_parallel &&
+                     state->hashtable->all_attrs_byval &&
+                     state->inner_ps->plan->parallel_aware;
+
+    /*
+     * All-participants parallel build (byval + parallel inner scan).
+     * Leader and workers all scan inner chunks and CAS-insert into shared HT.
+     */
+    if (parallel_build)
+    {
+        VJoinParallelState *ps = state->pstate;
+        dsa_area   *dsa = state->dsa;
+        int         na = state->num_inner_attrs;
+
+        /* Destroy the local HT created during begin — we'll use shared DSA */
+        if (state->is_leader)
+        {
+            /* Leader: save type metadata, create shared HT */
+            bool  *saved_byval  = palloc(sizeof(bool) * na);
+            int16 *saved_typlen = palloc(sizeof(int16) * na);
+
+            memcpy(saved_byval, state->hashtable->attr_byval, sizeof(bool) * na);
+            memcpy(saved_typlen, state->hashtable->attr_typlen, sizeof(int16) * na);
+
+            vjoin_ht_destroy(state->hashtable);
+
+            state->hashtable = vjoin_ht_create_shared(
+                ps, dsa, state->num_keys, na,
+                state->hash_ctx, state->inner_keynos,
+                saved_byval, saved_typlen);
+
+            /* Signal that workers can read DSA pointers for parallel build */
+            pg_write_barrier();
+            ps->parallel_build = true;
+
+            pfree(saved_byval);
+            pfree(saved_typlen);
+        }
+        else
+        {
+            /* Worker: wait for leader to set up shared HT metadata */
+            while (!ps->parallel_build)
+                pg_spin_delay();
+            pg_read_barrier();
+
+            /* Destroy local empty HT */
+            vjoin_ht_destroy(state->hashtable);
+            state->hashtable = NULL;
+
+            /* Create thin wrapper pointing at shared DSA arrays */
+            {
+                MemoryContext  htctx;
+                VJoinHashTable *ht;
+
+                htctx = AllocSetContextCreate(state->hash_ctx,
+                                              "VJoinHashTable (parallel-build)",
+                                              ALLOCSET_DEFAULT_SIZES);
+                ht = (VJoinHashTable *)
+                    MemoryContextAllocZero(htctx, sizeof(VJoinHashTable));
+
+                ht->htctx          = htctx;
+                ht->capacity       = ps->capacity;
+                ht->mask           = ps->mask;
+                ht->num_entries    = 0;
+                ht->num_all_attrs  = ps->num_all_attrs;
+                ht->num_keys       = ps->num_keys;
+                ht->all_attrs_byval = true;
+                ht->is_shared      = true;
+                ht->dsa            = dsa;
+                ht->pstate         = ps;
+
+                ht->hashvals     = (uint32 *)    dsa_get_address(dsa, ps->hashvals_dp);
+                ht->all_values   = (Datum *)     dsa_get_address(dsa, ps->all_values_dp);
+                ht->all_isnull   = (bool *)      dsa_get_address(dsa, ps->all_isnull_dp);
+                ht->inner_keynos = (AttrNumber *) dsa_get_address(dsa, ps->inner_keynos_dp);
+                ht->attr_byval   = NULL;
+                ht->attr_typlen  = NULL;
+
+                state->hashtable = ht;
+            }
+        }
+
+        /* All participants: scan inner and CAS-insert */
+        for (;;)
+        {
+            bool    has_null = false;
+            uint32  hashval;
+            int     i;
+
+            slot = ExecProcNode(state->inner_ps);
+            if (TupIsNull(slot))
+                break;
+
+            slot_getallattrs(slot);
+
+            /* Check for NULL keys */
+            for (i = 0; i < state->num_keys; i++)
+            {
+                if (slot->tts_isnull[state->inner_keynos[i] - 1])
+                {
+                    has_null = true;
+                    break;
+                }
+            }
+            if (has_null)
+                continue;  /* skip NULLs in parallel build (INNER/LEFT only) */
+
+            /* Compute hash */
+            hashval = 0;
+            for (i = 0; i < state->num_keys; i++)
+            {
+                Datum d = slot->tts_values[state->inner_keynos[i] - 1];
+                uint32 h;
+                if (vjoin_is_fast_type(state->key_types[i]))
+                    h = vjoin_hash_datum(d, state->key_types[i]);
+                else
+                    h = vjoin_hash_datum_generic(d,
+                                                 &state->hash_finfo[i],
+                                                 state->key_collations[i]);
+                hashval = (i == 0) ? h : vjoin_combine_hashes(hashval, h);
+            }
+
+            vjoin_ht_insert_cas(state->hashtable, ps, hashval,
+                                slot->tts_values, slot->tts_isnull);
+        }
+
+        /* Barrier: all participants done building */
+        BarrierArriveAndWait(&ps->barrier, 0);
+
+        /* Read final entry count from atomic counter */
+        {
+            uint32 total = pg_atomic_read_u32(&ps->num_entries_atomic);
+            state->hashtable->num_entries = (int) total;
+            state->cached_ht_entries = (int) total;
+
+            if (state->is_leader)
+            {
+                ps->num_entries     = (int) total;
+                ps->all_attrs_byval = true;
+                ps->built_in_dsa   = true;
+            }
+        }
+
+        state->phase = VHJ_PROBE;
+        return;
+    }
+
+    /*
+     * Parallel worker (leader-only build): skip build, wait at barrier,
+     * then attach to the shared HT.
      */
     if (state->is_parallel && !state->is_leader)
     {
@@ -167,10 +334,50 @@ vjoin_hash_build(VectorHashJoinState *state)
             state->hashtable = NULL;
         }
 
-        /* Attach read-only wrapper to the shared hash table */
-        state->hashtable = vjoin_ht_attach_from_dsa(state->pstate,
-                                                     state->dsa,
-                                                     state->hash_ctx);
+        if (state->pstate->built_in_dsa)
+        {
+            /*
+             * Fast path: leader built directly in DSA (byval tables).
+             * Create a thin read-only wrapper pointing at shared arrays.
+             */
+            VJoinParallelState *ps = state->pstate;
+            dsa_area      *dsa = state->dsa;
+            MemoryContext  htctx;
+            VJoinHashTable *ht;
+
+            htctx = AllocSetContextCreate(state->hash_ctx,
+                                          "VJoinHashTable (shared-direct)",
+                                          ALLOCSET_DEFAULT_SIZES);
+            ht = (VJoinHashTable *)
+                MemoryContextAllocZero(htctx, sizeof(VJoinHashTable));
+
+            ht->htctx          = htctx;
+            ht->capacity       = ps->capacity;
+            ht->mask           = ps->mask;
+            ht->num_entries    = ps->num_entries;
+            ht->num_all_attrs  = ps->num_all_attrs;
+            ht->num_keys       = ps->num_keys;
+            ht->all_attrs_byval = ps->all_attrs_byval;
+            ht->is_shared      = false;  /* worker doesn't write */
+
+            /* Point directly at shared DSA arrays — zero memcpy */
+            ht->hashvals     = (uint32 *)    dsa_get_address(dsa, ps->hashvals_dp);
+            ht->all_values   = (Datum *)     dsa_get_address(dsa, ps->all_values_dp);
+            ht->all_isnull   = (bool *)      dsa_get_address(dsa, ps->all_isnull_dp);
+            ht->inner_keynos = (AttrNumber *) dsa_get_address(dsa, ps->inner_keynos_dp);
+            ht->attr_byval   = NULL;
+            ht->attr_typlen  = NULL;
+
+            state->hashtable = ht;
+        }
+        else
+        {
+            /* Slow path: byref table — attach with offset→pointer fixup */
+            state->hashtable = vjoin_ht_attach_from_dsa(state->pstate,
+                                                         state->dsa,
+                                                         state->hash_ctx);
+        }
+
         state->cached_ht_entries = state->hashtable->num_entries;
 
         /* Allocate inner_matched after attach so we know capacity */
@@ -181,7 +388,35 @@ vjoin_hash_build(VectorHashJoinState *state)
         return;
     }
 
-    /* Leader (parallel) or non-parallel: build the hash table locally */
+    /*
+     * Leader (parallel) or non-parallel: build the hash table.
+     *
+     * For parallel + all-byval, switch to a DSA-backed HT so that
+     * the build writes directly into shared memory — no serialize step.
+     */
+    if (state->is_parallel && state->hashtable->all_attrs_byval)
+    {
+        /* Copy type metadata out of the local HT's context before destroying */
+        int    na = state->num_inner_attrs;
+        bool  *saved_byval  = palloc(sizeof(bool) * na);
+        int16 *saved_typlen = palloc(sizeof(int16) * na);
+
+        memcpy(saved_byval, state->hashtable->attr_byval, sizeof(bool) * na);
+        memcpy(saved_typlen, state->hashtable->attr_typlen, sizeof(int16) * na);
+
+        vjoin_ht_destroy(state->hashtable);
+
+        /* Create a shared HT that writes directly into pre-allocated DSA arrays */
+        state->hashtable = vjoin_ht_create_shared(
+            state->pstate, state->dsa,
+            state->num_keys, na,
+            state->hash_ctx, state->inner_keynos,
+            saved_byval, saved_typlen);
+
+        pfree(saved_byval);
+        pfree(saved_typlen);
+    }
+
     oldctx = MemoryContextSwitchTo(state->hash_ctx);
 
     for (;;)
@@ -247,10 +482,28 @@ vjoin_hash_build(VectorHashJoinState *state)
     /* Cache entry count before DSA (for EXPLAIN after DSM detach) */
     state->cached_ht_entries = state->hashtable->num_entries;
 
-    /* In parallel mode, serialize HT to DSA and signal workers */
+    /* In parallel mode, share the HT */
     if (state->is_parallel)
     {
-        vjoin_ht_serialize_to_dsa(state->hashtable, state->dsa, state->pstate);
+        if (state->hashtable->is_shared)
+        {
+            /*
+             * DSA-direct path (byval): HT is already in shared memory.
+             * Just publish metadata to pstate so workers can read it.
+             */
+            VJoinParallelState *ps = state->pstate;
+            ps->num_entries    = state->hashtable->num_entries;
+            ps->all_attrs_byval = true;
+            ps->built_in_dsa  = true;
+        }
+        else
+        {
+            /* Byref path: serialize HT arrays into DSA (existing logic) */
+            vjoin_ht_serialize_to_dsa(state->hashtable, state->dsa,
+                                      state->pstate);
+            state->pstate->built_in_dsa = false;
+        }
+
         BarrierArriveAndWait(&state->pstate->barrier, 0);
     }
 
@@ -852,6 +1105,8 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 {
     VectorHashJoinState *state = (VectorHashJoinState *) node;
     VJoinParallelState *pstate = (VJoinParallelState *) coordinate;
+    double inner_rows;
+    int    est_capacity;
 
     /* Create DSA in the DSM segment */
     state->dsa = dsa_create(LWTRANCHE_PARALLEL_HASH_JOIN);
@@ -861,6 +1116,37 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     pstate->dsa_handle = dsa_get_handle(state->dsa);
     BarrierInit(&pstate->barrier, pcxt->nworkers_to_launch + 1);
     pstate->num_entries = 0;
+    pstate->built_in_dsa = false;
+    pstate->parallel_build = false;
+    pg_atomic_init_u32(&pstate->num_entries_atomic, 0);
+
+    /*
+     * Pre-allocate DSA arrays based on estimated inner rows.
+     * This lets us build the HT directly in shared memory for byval tables,
+     * eliminating the serialize step.  Use 2× the normal load factor to
+     * minimize rehash probability (rehash in DSA is more expensive).
+     */
+    inner_rows = state->inner_ps->plan->plan_rows;
+    if (inner_rows < 64)
+        inner_rows = 64;
+    est_capacity = next_power_of_2((int)(inner_rows * VJOIN_HT_LOAD_FACTOR * 2));
+    pstate->est_inner_rows = (int) inner_rows;
+    pstate->num_all_attrs = state->num_inner_attrs;
+    pstate->num_keys = state->num_keys;
+    pstate->capacity = est_capacity;
+    pstate->mask = est_capacity - 1;
+
+    /* Pre-allocate the main arrays in DSA shared memory */
+    pstate->hashvals_dp = dsa_allocate0(state->dsa,
+                                        sizeof(uint32) * est_capacity);
+    pstate->all_values_dp = dsa_allocate0(state->dsa,
+                                          sizeof(Datum) * est_capacity * state->num_inner_attrs);
+    pstate->all_isnull_dp = dsa_allocate0(state->dsa,
+                                          sizeof(bool) * est_capacity * state->num_inner_attrs);
+    pstate->inner_keynos_dp = dsa_allocate(state->dsa,
+                                           sizeof(AttrNumber) * state->num_keys);
+    pstate->vardata_dp = InvalidDsaPointer;
+    pstate->attr_byval_dp = InvalidDsaPointer;
 
     state->pstate = pstate;
     state->is_parallel = true;

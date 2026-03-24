@@ -24,7 +24,7 @@ bool    vjoin_enable_hashjoin = true;
 bool    vjoin_enable_nestloop = true;
 bool    vjoin_enable_mergejoin = true;
 int     vjoin_batch_size = VJOIN_DEFAULT_BATCH;
-double  vjoin_cost_factor = 0.1;
+double  vjoin_cost_factor = 0.5;
 
 /* Saved previous hooks */
 set_join_pathlist_hook_type prev_join_pathlist_hook = NULL;

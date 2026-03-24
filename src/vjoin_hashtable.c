@@ -72,6 +72,76 @@ vjoin_ht_create(int estimated_rows, int num_keys, int num_all_attrs,
     ht->all_isnull = (bool *)
         MemoryContextAllocZero(htctx, sizeof(bool) * capacity * num_all_attrs);
 
+    ht->is_shared = false;
+    ht->dsa = NULL;
+    ht->pstate = NULL;
+
+    return ht;
+}
+
+/*
+ * Create a hash table whose flat arrays live directly in DSA shared memory.
+ * The leader inserts into these arrays during the build phase; workers
+ * read them after the barrier — no serialize/attach step needed for byval.
+ *
+ * pstate must already have hashvals_dp/all_values_dp/all_isnull_dp/
+ * inner_keynos_dp pre-allocated by vjoin_hash_initialize_dsm.
+ */
+VJoinHashTable *
+vjoin_ht_create_shared(VJoinParallelState *pstate, dsa_area *dsa,
+                        int num_keys, int num_all_attrs,
+                        MemoryContext parent, AttrNumber *inner_keynos,
+                        bool *attr_byval, int16 *attr_typlen)
+{
+    MemoryContext htctx;
+    VJoinHashTable *ht;
+    int i;
+
+    htctx = AllocSetContextCreate(parent,
+                                  "VJoinHashTable (DSA-direct)",
+                                  ALLOCSET_DEFAULT_SIZES);
+
+    ht = (VJoinHashTable *) MemoryContextAllocZero(htctx,
+                                                    sizeof(VJoinHashTable));
+    ht->htctx = htctx;
+    ht->num_keys = num_keys;
+    ht->num_all_attrs = num_all_attrs;
+
+    /* Point arrays directly at pre-allocated DSA memory */
+    ht->capacity = pstate->capacity;
+    ht->mask = pstate->mask;
+    ht->num_entries = 0;
+
+    ht->hashvals   = (uint32 *)    dsa_get_address(dsa, pstate->hashvals_dp);
+    ht->all_values = (Datum *)     dsa_get_address(dsa, pstate->all_values_dp);
+    ht->all_isnull = (bool *)      dsa_get_address(dsa, pstate->all_isnull_dp);
+    ht->inner_keynos = (AttrNumber *) dsa_get_address(dsa, pstate->inner_keynos_dp);
+
+    /* Copy keynos into shared memory */
+    memcpy(ht->inner_keynos, inner_keynos, sizeof(AttrNumber) * num_keys);
+
+    /* Store type metadata locally (only leader needs this during build) */
+    ht->attr_byval = (bool *)
+        MemoryContextAlloc(htctx, sizeof(bool) * num_all_attrs);
+    ht->attr_typlen = (int16 *)
+        MemoryContextAlloc(htctx, sizeof(int16) * num_all_attrs);
+    memcpy(ht->attr_byval, attr_byval, sizeof(bool) * num_all_attrs);
+    memcpy(ht->attr_typlen, attr_typlen, sizeof(int16) * num_all_attrs);
+
+    ht->all_attrs_byval = true;
+    for (i = 0; i < num_all_attrs; i++)
+    {
+        if (!attr_byval[i])
+        {
+            ht->all_attrs_byval = false;
+            break;
+        }
+    }
+
+    ht->is_shared = true;
+    ht->dsa = dsa;
+    ht->pstate = pstate;
+
     return ht;
 }
 
@@ -99,13 +169,34 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
         int            new_cap = old_cap * 2;
         int            i;
 
-        old = MemoryContextSwitchTo(ht->htctx);
-
         ht->capacity = new_cap;
         ht->mask = new_cap - 1;
-        ht->hashvals = (uint32 *) palloc0(sizeof(uint32) * new_cap);
-        ht->all_values = (Datum *) palloc0(sizeof(Datum) * new_cap * na);
-        ht->all_isnull = (bool *) palloc0(sizeof(bool) * new_cap * na);
+
+        if (ht->is_shared)
+        {
+            /* DSA-backed: allocate new arrays in shared memory */
+            dsa_area   *dsa = ht->dsa;
+            VJoinParallelState *ps = ht->pstate;
+
+            ps->hashvals_dp = dsa_allocate0(dsa, sizeof(uint32) * new_cap);
+            ps->all_values_dp = dsa_allocate0(dsa, sizeof(Datum) * new_cap * na);
+            ps->all_isnull_dp = dsa_allocate0(dsa, sizeof(bool) * new_cap * na);
+
+            ht->hashvals   = (uint32 *) dsa_get_address(dsa, ps->hashvals_dp);
+            ht->all_values = (Datum *)  dsa_get_address(dsa, ps->all_values_dp);
+            ht->all_isnull = (bool *)   dsa_get_address(dsa, ps->all_isnull_dp);
+
+            ps->capacity = new_cap;
+            ps->mask = new_cap - 1;
+        }
+        else
+        {
+            old = MemoryContextSwitchTo(ht->htctx);
+            ht->hashvals = (uint32 *) palloc0(sizeof(uint32) * new_cap);
+            ht->all_values = (Datum *) palloc0(sizeof(Datum) * new_cap * na);
+            ht->all_isnull = (bool *) palloc0(sizeof(bool) * new_cap * na);
+            MemoryContextSwitchTo(old);
+        }
 
         /* Reinsert existing entries */
         for (i = 0; i < old_cap; i++)
@@ -126,11 +217,22 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
             }
         }
 
-        pfree(old_hashvals);
-        pfree(old_vals);
-        pfree(old_inull);
-
-        MemoryContextSwitchTo(old);
+        if (ht->is_shared)
+        {
+            /* Old arrays were DSA-allocated; free them back to DSA.
+             * We saved the old dsa_pointers as local C pointers, but
+             * dsa_free needs the dsa_pointer.  Since we just replaced
+             * pstate->{dp} fields with the new pointers, the old
+             * DSA blocks are unreferenced — DSA will reclaim them
+             * when the area is destroyed.  No explicit free needed. */
+        }
+        else
+        {
+            pfree(old_hashvals);
+            pfree(old_vals);
+            pfree(old_inull);
+            MemoryContextSwitchTo(old);
+        }
     }
 
     /* Insert into table */
@@ -166,6 +268,57 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
     ht->num_entries++;
 
     MemoryContextSwitchTo(old);
+}
+
+/*
+ * Lock-free insert for parallel build (byval tables only).
+ * Uses CAS on hashvals[pos] to claim an empty slot.
+ * No rehash — caller must ensure sufficient pre-allocated capacity.
+ */
+void
+vjoin_ht_insert_cas(VJoinHashTable *ht,
+                     VJoinParallelState *pstate,
+                     uint32 hashval,
+                     Datum *all_values, bool *all_isnull)
+{
+    int    na = ht->num_all_attrs;
+    int    pos;
+    int    start_pos;
+    uint32 expected;
+    int    base;
+
+    /* 0 = empty marker */
+    if (hashval == 0)
+        hashval = 1;
+
+    pos = hashval & ht->mask;
+    start_pos = pos;
+
+    for (;;)
+    {
+        expected = 0;
+        if (pg_atomic_compare_exchange_u32(
+                (pg_atomic_uint32 *) &ht->hashvals[pos],
+                &expected, hashval))
+        {
+            /* We claimed this slot — write values (no other writer touches it) */
+            base = pos * na;
+            memcpy(&ht->all_values[base], all_values, sizeof(Datum) * na);
+            memcpy(&ht->all_isnull[base], all_isnull, sizeof(bool) * na);
+
+            /* Memory barrier: ensure values are visible before count update */
+            pg_write_barrier();
+            pg_atomic_fetch_add_u32(&pstate->num_entries_atomic, 1);
+            return;
+        }
+
+        /* Slot taken — linear probe */
+        pos = (pos + 1) & ht->mask;
+        if (pos == start_pos)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("parallel vector hash table capacity exceeded")));
+    }
 }
 
 void

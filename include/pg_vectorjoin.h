@@ -122,8 +122,18 @@ VJoinHashTable *vjoin_ht_create(int estimated_rows, int num_keys,
                                 int num_all_attrs, MemoryContext parent,
                                 AttrNumber *inner_keynos,
                                 bool *attr_byval, int16 *attr_typlen);
+VJoinHashTable *vjoin_ht_create_shared(struct VJoinParallelState *pstate,
+                                        dsa_area *dsa,
+                                        int num_keys, int num_all_attrs,
+                                        MemoryContext parent,
+                                        AttrNumber *inner_keynos,
+                                        bool *attr_byval, int16 *attr_typlen);
 void vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
                      Datum *all_values, bool *all_isnull);
+void vjoin_ht_insert_cas(VJoinHashTable *ht,
+                         struct VJoinParallelState *pstate,
+                         uint32 hashval,
+                         Datum *all_values, bool *all_isnull);
 void vjoin_ht_destroy(VJoinHashTable *ht);
 void vjoin_ht_serialize_to_dsa(VJoinHashTable *ht, dsa_area *dsa,
                                 struct VJoinParallelState *pstate);

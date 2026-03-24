@@ -349,69 +349,125 @@ vjoin_try_hashjoin(PlannerInfo *root,
     }
 
     /* --- Parallel path ---
-     * Leader builds the hash table and shares it via DSA.  Workers
-     * attach to the shared HT and only probe with their partial outer.
+     * If inner has partial paths, all participants build concurrently
+     * using CAS-based lock-free insert (parallel build).
+     * Otherwise fall back to leader-only build.
      * Only INNER/LEFT are safe: RIGHT/FULL need cross-worker
-     * inner_matched coordination, so they stay non-parallel for now. */
+     * inner_matched coordination, so they stay non-parallel for now.
+     *
+     * Require at least 3 workers: with fewer, non-parallel VHJ is
+     * already competitive with native parallel HJ, and the DSM/barrier
+     * overhead isn't justified. */
     if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
         (jointype == JOIN_INNER || jointype == JOIN_LEFT))
     {
         Path *par_outer = (Path *) linitial(outerrel->partial_pathlist);
-        Path *par_inner = NULL;
         int   parallel_workers;
-        ListCell *lc2;
 
-        /* Find cheapest non-parameterized parallel-safe inner path */
-        foreach(lc2, innerrel->pathlist)
+        parallel_workers = par_outer->parallel_workers;
+        if (parallel_workers <= 0)
+            parallel_workers = 1;
+
+        if (parallel_workers >= 3)
         {
-            Path *p = (Path *) lfirst(lc2);
-            if (p->parallel_safe && p->param_info == NULL &&
-                (par_inner == NULL || p->total_cost < par_inner->total_cost))
-                par_inner = p;
-        }
+            Path *par_inner_partial = NULL;
+            Path *par_inner_full = NULL;
+            Path *par_inner;
+            bool  parallel_build;
+            ListCell *lc2;
 
-        if (par_outer != NULL && par_inner != NULL)
-        {
-            parallel_workers = par_outer->parallel_workers;
-            if (parallel_workers <= 0)
-                parallel_workers = 1;
+            /* Try partial inner path first (enables parallel build) */
+            foreach(lc2, innerrel->partial_pathlist)
+            {
+                Path *p = (Path *) lfirst(lc2);
+                if (p->param_info == NULL &&
+                    (par_inner_partial == NULL ||
+                     p->total_cost < par_inner_partial->total_cost))
+                    par_inner_partial = p;
+            }
 
-            outer_rows = par_outer->rows;
-            inner_rows = par_inner->rows;
+            /* Also find cheapest non-parameterized parallel-safe full path */
+            foreach(lc2, innerrel->pathlist)
+            {
+                Path *p = (Path *) lfirst(lc2);
+                if (p->parallel_safe && p->param_info == NULL &&
+                    (par_inner_full == NULL ||
+                     p->total_cost < par_inner_full->total_cost))
+                    par_inner_full = p;
+            }
 
-            /* Build cost: only leader builds (not multiplied by workers) */
-            startup_cost = par_inner->total_cost +
-                           inner_rows * cpu_operator_cost * 2.0;
+            /* Prefer parallel build when partial inner is available */
+            if (par_inner_partial != NULL)
+            {
+                par_inner = par_inner_partial;
+                parallel_build = true;
+            }
+            else if (par_inner_full != NULL)
+            {
+                par_inner = par_inner_full;
+                parallel_build = false;
+            }
+            else
+                par_inner = NULL;
 
-            /* Probe cost: split across all participants */
-            run_cost = par_outer->total_cost +
-                       outer_rows * cpu_operator_cost * 2.0 * vjoin_cost_factor;
+            if (par_inner != NULL)
+            {
+                outer_rows = par_outer->rows;
 
-            cpath = makeNode(CustomPath);
-            cpath->path.pathtype = T_CustomScan;
-            cpath->path.parent = joinrel;
-            cpath->path.pathtarget = joinrel->reltarget;
-            cpath->path.param_info = NULL;
-            cpath->path.parallel_aware = true;
-            cpath->path.parallel_safe = true;
-            cpath->path.parallel_workers = parallel_workers;
-            cpath->path.rows = clamp_row_est(joinrel->rows / parallel_workers);
-            cpath->path.startup_cost = startup_cost;
-            cpath->path.total_cost = startup_cost + run_cost;
-            cpath->path.pathkeys = NIL;
-            cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-            cpath->custom_paths = list_make2(par_outer, par_inner);
+                if (parallel_build)
+                {
+                    double nprocs = parallel_workers + 1.0;
+
+                    startup_cost = par_inner->total_cost +
+                                   par_inner->rows * cpu_operator_cost * 2.0;
+
+                    run_cost = par_outer->total_cost +
+                               outer_rows * cpu_operator_cost * 2.0 *
+                               vjoin_cost_factor;
+                    run_cost /= nprocs;
+                }
+                else
+                {
+                    double nprocs = parallel_workers + 1.0;
+
+                    inner_rows = par_inner->rows;
+                    startup_cost = par_inner->total_cost +
+                                   inner_rows * cpu_operator_cost * 2.0;
+
+                    run_cost = par_outer->total_cost +
+                               outer_rows * cpu_operator_cost * 2.0 *
+                               vjoin_cost_factor;
+                    run_cost /= nprocs;
+                }
+
+                cpath = makeNode(CustomPath);
+                cpath->path.pathtype = T_CustomScan;
+                cpath->path.parent = joinrel;
+                cpath->path.pathtarget = joinrel->reltarget;
+                cpath->path.param_info = NULL;
+                cpath->path.parallel_aware = true;
+                cpath->path.parallel_safe = true;
+                cpath->path.parallel_workers = parallel_workers;
+                cpath->path.rows = clamp_row_est(joinrel->rows /
+                                                  parallel_workers);
+                cpath->path.startup_cost = startup_cost;
+                cpath->path.total_cost = startup_cost + run_cost;
+                cpath->path.pathkeys = NIL;
+                cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+                cpath->custom_paths = list_make2(par_outer, par_inner);
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
-            cpath->custom_restrictinfo = extra->restrictlist;
+                cpath->custom_restrictinfo = extra->restrictlist;
 #endif
-            cpath->custom_private = vjoin_build_private(jointype, nkeys,
-                                                        outer_keynos,
-                                                        inner_keynos, key_types,
-                                                        hash_procs, eq_oprs,
-                                                        collations);
-            cpath->methods = &vjoin_hash_path_methods;
+                cpath->custom_private = vjoin_build_private(jointype, nkeys,
+                                                            outer_keynos,
+                                                            inner_keynos,
+                                                            key_types,
+                                                            hash_procs, eq_oprs,
+                                                            collations);
+                cpath->methods = &vjoin_hash_path_methods;
 
-            add_partial_path(joinrel, &cpath->path);
+                add_partial_path(joinrel, &cpath->path);
+            }
         }
     }
 }
@@ -741,9 +797,8 @@ vjoin_try_mergejoin(PlannerInfo *root,
      * Apply cost_factor to the join processing portion (not child scan costs).
      */
     startup_cost = outer_path->startup_cost + inner_path->startup_cost;
-    run_cost = ((outer_path->total_cost - outer_path->startup_cost) +
-                (inner_path->total_cost - inner_path->startup_cost)) *
-               vjoin_cost_factor +
+    run_cost = (outer_path->total_cost - outer_path->startup_cost) +
+               (inner_path->total_cost - inner_path->startup_cost) +
                (outer_rows + inner_rows) * cpu_operator_cost * vjoin_cost_factor / 4.0;
 
     cpath = makeNode(CustomPath);
@@ -871,9 +926,8 @@ vjoin_try_mergejoin(PlannerInfo *root,
             }
 
             par_startup = par_outer->startup_cost + par_inner->startup_cost;
-            par_run = ((par_outer->total_cost - par_outer->startup_cost) +
-                       (par_inner->total_cost - par_inner->startup_cost)) *
-                      vjoin_cost_factor +
+            par_run = (par_outer->total_cost - par_outer->startup_cost) +
+                      (par_inner->total_cost - par_inner->startup_cost) +
                       (par_outer_rows + par_inner->rows) * cpu_operator_cost * vjoin_cost_factor / 4.0;
 
             /* Gather tuple-queue overhead (parallel paths only) */
