@@ -407,9 +407,23 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
                 remaining * ncols * sizeof(Datum));
         memmove(isnull, &isnull[*pos_p * ncols],
                 remaining * ncols * sizeof(bool));
+        /* Shift ob_matched for outer side (LEFT JOIN) */
+        if (is_outer && state->ob_matched)
+        {
+            memmove(state->ob_matched, &state->ob_matched[*pos_p],
+                    remaining * sizeof(bool));
+        }
     }
     *count_p = remaining;
     *pos_p = 0;
+
+    /* Reset ob_matched for new entries + batch_left_pos */
+    if (is_outer && state->ob_matched)
+    {
+        memset(&state->ob_matched[remaining], 0,
+               (batch_size - remaining) * sizeof(bool));
+        state->batch_left_pos = 0;
+    }
 
     /* Fill the rest from child plan */
     while (*count_p < batch_size)
@@ -489,6 +503,46 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
     Datum  *ik = state->ib_keys;
     VJoinMatch *results = state->batch_results;
     int     max_results = state->batch_result_capacity;
+    bool   *ob_matched = state->ob_matched;     /* NULL for INNER */
+
+    /* Resume interrupted cross-product from previous call */
+    if (state->batch_cp_oi >= 0)
+    {
+        int o  = state->batch_cp_oi;
+        int i  = state->batch_cp_ii;
+        int oe = state->batch_cp_oe;
+        int ie = state->batch_cp_ie;
+        int ii_start = state->batch_cp_ii_start;
+
+        while (o < oe && nr < max_results)
+        {
+            if (ob_matched)
+                ob_matched[o] = true;
+            results[nr].outer_idx = o;
+            results[nr].inner_idx = i;
+            nr++;
+            if (++i >= ie)
+            {
+                i = ii_start;
+                o++;
+            }
+        }
+
+        if (o < oe)
+        {
+            /* Still not finished — update saved position */
+            state->batch_cp_oi = o;
+            state->batch_cp_ii = i;
+            state->batch_result_count = nr;
+            state->batch_result_pos = 0;
+            return;
+        }
+
+        /* Completed interrupted cross-product */
+        state->batch_cp_oi = -1;
+        oi = oe;
+        ii = ie;
+    }
 
     while (oi < ob_count && ii < ib_count && nr < max_results)
     {
@@ -541,14 +595,37 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
                 (ie == ib_count && !state->ib_exhausted))
                 break;
 
-            /* Add cross product to results */
-            for (o = oi; o < oe && nr < max_results; o++)
-                for (i = ii; i < ie && nr < max_results; i++)
+            /* Emit cross-product with flat loop for clean save/resume */
+            o = oi;
+            i = ii;
+            while (o < oe && nr < max_results)
+            {
+                if (ob_matched)
+                    ob_matched[o] = true;
+                results[nr].outer_idx = o;
+                results[nr].inner_idx = i;
+                nr++;
+                if (++i >= ie)
                 {
-                    results[nr].outer_idx = o;
-                    results[nr].inner_idx = i;
-                    nr++;
+                    i = ii;
+                    o++;
                 }
+            }
+
+            if (o < oe)
+            {
+                /* Cross-product interrupted — save for resumption */
+                state->batch_cp_oi = o;
+                state->batch_cp_ii = i;
+                state->batch_cp_oe = oe;
+                state->batch_cp_ie = ie;
+                state->batch_cp_ii_start = ii;
+                state->ob_pos = oi;
+                state->ib_pos = ii;
+                state->batch_result_count = nr;
+                state->batch_result_pos = 0;
+                return;
+            }
 
             oi = oe;
             ii = ie;
@@ -577,6 +654,44 @@ vmj_batch_do_merge_generic(VectorMergeJoinState *state)
     Oid     collation = state->key_collations[0];
     VJoinMatch *results = state->batch_results;
     int     max_results = state->batch_result_capacity;
+    bool   *ob_matched = state->ob_matched;
+
+    /* Resume interrupted cross-product from previous call */
+    if (state->batch_cp_oi >= 0)
+    {
+        int o  = state->batch_cp_oi;
+        int i  = state->batch_cp_ii;
+        int oe = state->batch_cp_oe;
+        int ie = state->batch_cp_ie;
+        int ii_start = state->batch_cp_ii_start;
+
+        while (o < oe && nr < max_results)
+        {
+            if (ob_matched)
+                ob_matched[o] = true;
+            results[nr].outer_idx = o;
+            results[nr].inner_idx = i;
+            nr++;
+            if (++i >= ie)
+            {
+                i = ii_start;
+                o++;
+            }
+        }
+
+        if (o < oe)
+        {
+            state->batch_cp_oi = o;
+            state->batch_cp_ii = i;
+            state->batch_result_count = nr;
+            state->batch_result_pos = 0;
+            return;
+        }
+
+        state->batch_cp_oi = -1;
+        oi = oe;
+        ii = ie;
+    }
 
     while (oi < state->ob_count && ii < state->ib_count && nr < max_results)
     {
@@ -612,13 +727,36 @@ vmj_batch_do_merge_generic(VectorMergeJoinState *state)
                 (ie == state->ib_count && !state->ib_exhausted))
                 break;
 
-            for (o = oi; o < oe && nr < max_results; o++)
-                for (i = ii; i < ie && nr < max_results; i++)
+            /* Flat cross-product with save/resume support */
+            o = oi;
+            i = ii;
+            while (o < oe && nr < max_results)
+            {
+                if (ob_matched)
+                    ob_matched[o] = true;
+                results[nr].outer_idx = o;
+                results[nr].inner_idx = i;
+                nr++;
+                if (++i >= ie)
                 {
-                    results[nr].outer_idx = o;
-                    results[nr].inner_idx = i;
-                    nr++;
+                    i = ii;
+                    o++;
                 }
+            }
+
+            if (o < oe)
+            {
+                state->batch_cp_oi = o;
+                state->batch_cp_ii = i;
+                state->batch_cp_oe = oe;
+                state->batch_cp_ie = ie;
+                state->batch_cp_ii_start = ii;
+                state->ob_pos = oi;
+                state->ib_pos = ii;
+                state->batch_result_count = nr;
+                state->batch_result_pos = 0;
+                return;
+            }
 
             oi = oe;
             ii = ie;
@@ -669,6 +807,33 @@ vmj_batch_form_result(VectorMergeJoinState *state,
     memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
            &state->ib_isnull[inner_off],
            state->num_inner_attrs * sizeof(bool));
+
+    ExecStoreVirtualTuple(scan_slot);
+    return scan_slot;
+}
+
+/*
+ * Form result with outer from batch arrays + NULL inner (LEFT JOIN).
+ */
+static TupleTableSlot *
+vmj_batch_form_result_left(VectorMergeJoinState *state, int outer_idx)
+{
+    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
+    int outer_off = outer_idx * state->num_outer_attrs;
+
+    ExecClearTuple(scan_slot);
+
+    memcpy(scan_slot->tts_values,
+           &state->ob_values[outer_off],
+           state->num_outer_attrs * sizeof(Datum));
+    memcpy(scan_slot->tts_isnull,
+           &state->ob_isnull[outer_off],
+           state->num_outer_attrs * sizeof(bool));
+
+    memset(scan_slot->tts_values + state->num_outer_attrs,
+           0, state->num_inner_attrs * sizeof(Datum));
+    memset(scan_slot->tts_isnull + state->num_outer_attrs,
+           1, state->num_inner_attrs * sizeof(bool));
 
     ExecStoreVirtualTuple(scan_slot);
     return scan_slot;
@@ -798,8 +963,9 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
         }
     }
 
-    /* Allocate batch buffers for block merge (all_byval path, INNER only) */
-    if (state->all_byval && state->jointype == JOIN_INNER)
+    /* Allocate batch buffers for block merge (all_byval, INNER/LEFT) */
+    if (state->all_byval &&
+        (state->jointype == JOIN_INNER || state->jointype == JOIN_LEFT))
     {
         int bs = vjoin_batch_size;
 
@@ -826,6 +992,18 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
         state->batch_result_pos   = 0;
 
         state->batch_cp_oi = -1;
+
+        /* LEFT JOIN: allocate matched-tracking array */
+        if (state->jointype == JOIN_LEFT)
+        {
+            state->ob_matched = palloc0(sizeof(bool) * bs);
+            state->batch_left_pos = 0;
+        }
+        else
+        {
+            state->ob_matched = NULL;
+            state->batch_left_pos = 0;
+        }
     }
     else
     {
@@ -849,13 +1027,25 @@ vjoin_merge_exec(CustomScanState *node)
         {
             case VMJ_INIT:
                 if (state->all_byval && state->batch_size > 0 &&
-                    state->jointype == JOIN_INNER)
+                    (state->jointype == JOIN_INNER ||
+                     state->jointype == JOIN_LEFT))
                 {
                     /* Block merge mode: fill both blocks */
                     vmj_batch_fill_side(state, true);
                     vmj_batch_fill_side(state, false);
-                    if (state->ob_count == 0 || state->ib_count == 0)
+                    if (state->ob_count == 0)
                     {
+                        state->phase = VMJ_DONE;
+                        return NULL;
+                    }
+                    if (state->ib_count == 0)
+                    {
+                        if (state->jointype == JOIN_LEFT)
+                        {
+                            /* No inner at all — all outers are unmatched */
+                            state->phase = VMJ_BATCH_LEFT;
+                            continue;
+                        }
                         state->phase = VMJ_DONE;
                         return NULL;
                     }
@@ -1293,8 +1483,14 @@ vjoin_merge_exec(CustomScanState *node)
                 /*
                  * No matches: one (or both) blocks is exhausted,
                  * or we stopped at a boundary-spanning group.
-                 * Try to refill the side that ran out.
+                 * For LEFT JOIN, emit unmatched outers before refilling.
                  */
+                if (state->ob_matched &&
+                    state->batch_left_pos < state->ob_pos)
+                {
+                    state->phase = VMJ_BATCH_LEFT;
+                    continue;
+                }
                 if (state->ob_pos >= state->ob_count)
                 {
                     if (state->ob_exhausted)
@@ -1314,12 +1510,23 @@ vjoin_merge_exec(CustomScanState *node)
                 {
                     if (state->ib_exhausted)
                     {
+                        /* Inner exhausted — remaining outers are unmatched */
+                        if (state->ob_matched)
+                        {
+                            state->phase = VMJ_BATCH_LEFT;
+                            continue;
+                        }
                         state->phase = VMJ_DONE;
                         return NULL;
                     }
                     vmj_batch_fill_side(state, false);
                     if (state->ib_count == 0)
                     {
+                        if (state->ob_matched)
+                        {
+                            state->phase = VMJ_BATCH_LEFT;
+                            continue;
+                        }
                         state->phase = VMJ_DONE;
                         return NULL;
                     }
@@ -1335,6 +1542,11 @@ vjoin_merge_exec(CustomScanState *node)
                     vmj_batch_fill_side(state, false);
                 if (state->ob_count == 0 || state->ib_count == 0)
                 {
+                    if (state->ob_matched && state->ob_count > 0)
+                    {
+                        state->phase = VMJ_BATCH_LEFT;
+                        continue;
+                    }
                     state->phase = VMJ_DONE;
                     return NULL;
                 }
@@ -1368,6 +1580,83 @@ vjoin_merge_exec(CustomScanState *node)
                         return ExecProject(projInfo);
                     return result;
                 }
+            }
+
+            case VMJ_BATCH_LEFT:
+            {
+                /*
+                 * LEFT JOIN batch: emit unmatched outer tuples with NULL inner.
+                 * Scans ob_matched[batch_left_pos .. limit) for false entries.
+                 * limit = ob_pos normally, or ob_count when inner is exhausted
+                 * (remaining outers past ob_pos can never match).
+                 */
+                TupleTableSlot *result;
+                int limit = state->ob_pos;
+
+                /* If inner is fully consumed, all remaining outers are unmatched */
+                if (state->ib_exhausted &&
+                    (state->ib_count == 0 || state->ib_pos >= state->ib_count))
+                    limit = state->ob_count;
+
+                while (state->batch_left_pos < limit)
+                {
+                    int idx = state->batch_left_pos++;
+                    if (!state->ob_matched[idx])
+                    {
+                        result = vmj_batch_form_result_left(state, idx);
+                        ResetExprContext(econtext);
+                        econtext->ecxt_scantuple = result;
+
+                        if (qual && !ExecQual(qual, econtext))
+                            continue;
+
+                        if (projInfo)
+                            return ExecProject(projInfo);
+                        return result;
+                    }
+                }
+
+                /*
+                 * All unmatched outers emitted for current range.
+                 * Continue with refill or finish.
+                 */
+                if (limit == state->ob_count)
+                {
+                    /* Whole block scanned — mark all as consumed before refill */
+                    state->ob_pos = state->ob_count;
+                    if (state->ob_exhausted)
+                    {
+                        state->phase = VMJ_DONE;
+                        return NULL;
+                    }
+                    vmj_batch_fill_side(state, true);
+                    if (state->ob_count == 0)
+                    {
+                        state->phase = VMJ_DONE;
+                        return NULL;
+                    }
+                    /* If inner is exhausted, stay in VMJ_BATCH_LEFT */
+                    if (state->ib_exhausted &&
+                        (state->ib_count == 0 || state->ib_pos >= state->ib_count))
+                        continue;
+                }
+                else if (state->ob_pos >= state->ob_count)
+                {
+                    /* Outer block consumed — refill */
+                    if (state->ob_exhausted)
+                    {
+                        state->phase = VMJ_DONE;
+                        return NULL;
+                    }
+                    vmj_batch_fill_side(state, true);
+                    if (state->ob_count == 0)
+                    {
+                        state->phase = VMJ_DONE;
+                        return NULL;
+                    }
+                }
+                state->phase = VMJ_BATCH_MERGE;
+                continue;
             }
 
             case VMJ_LEFT_EMIT:
@@ -1471,6 +1760,9 @@ vjoin_merge_rescan(CustomScanState *node)
     state->batch_result_count = 0;
     state->batch_result_pos = 0;
     state->batch_cp_oi = -1;
+    state->batch_left_pos = 0;
+    if (state->ob_matched)
+        memset(state->ob_matched, 0, sizeof(bool) * state->batch_size);
 
     state->outer_matched = false;
     state->inner_matched = false;

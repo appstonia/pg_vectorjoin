@@ -277,6 +277,7 @@ typedef enum VMJPhase
     VMJ_BATCH_FILL,
     VMJ_BATCH_MERGE,
     VMJ_BATCH_EMIT,
+    VMJ_BATCH_LEFT,
     VMJ_LEFT_EMIT,
     VMJ_RIGHT_EMIT,
     VMJ_DONE
@@ -384,6 +385,10 @@ typedef struct VectorMergeJoinState
     int         batch_cp_oe;            /* outer group end */
     int         batch_cp_ie;            /* inner group end */
     int         batch_cp_ii_start;      /* inner group start for reset */
+
+    /* Batch LEFT JOIN: track which outer tuples had at least one match */
+    bool       *ob_matched;             /* [batch_size], NULL if INNER */
+    int         batch_left_pos;         /* scan position for unmatched outers */
 
     /* Outer join support */
     JoinType    jointype;
