@@ -131,7 +131,6 @@ VJoinHashTable *vjoin_ht_create_shared(struct VJoinParallelState *pstate,
 void vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
                      Datum *all_values, bool *all_isnull);
 void vjoin_ht_insert_cas(VJoinHashTable *ht,
-                         struct VJoinParallelState *pstate,
                          uint32 hashval,
                          Datum *all_values, bool *all_isnull);
 void vjoin_ht_destroy(VJoinHashTable *ht);

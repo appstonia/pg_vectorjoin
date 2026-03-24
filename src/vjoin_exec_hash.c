@@ -255,6 +255,8 @@ vjoin_hash_build(VectorHashJoinState *state)
         }
 
         /* All participants: scan inner and CAS-insert */
+        {
+        int local_count = 0;
         for (;;)
         {
             bool    has_null = false;
@@ -294,9 +296,13 @@ vjoin_hash_build(VectorHashJoinState *state)
                 hashval = (i == 0) ? h : vjoin_combine_hashes(hashval, h);
             }
 
-            vjoin_ht_insert_cas(state->hashtable, ps, hashval,
+            vjoin_ht_insert_cas(state->hashtable, hashval,
                                 slot->tts_values, slot->tts_isnull);
+            local_count++;
         }
+
+        /* One atomic add per participant instead of per-insert */
+        pg_atomic_fetch_add_u32(&ps->num_entries_atomic, local_count);
 
         /* Barrier: all participants done building */
         BarrierArriveAndWait(&ps->barrier, 0);
@@ -314,6 +320,7 @@ vjoin_hash_build(VectorHashJoinState *state)
                 ps->built_in_dsa   = true;
             }
         }
+        } /* end local_count block */
 
         state->phase = VHJ_PROBE;
         return;
@@ -1123,13 +1130,14 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     /*
      * Pre-allocate DSA arrays based on estimated inner rows.
      * This lets us build the HT directly in shared memory for byval tables,
-     * eliminating the serialize step.  Use 2× the normal load factor to
-     * minimize rehash probability (rehash in DSA is more expensive).
+     * eliminating the serialize step.  VJOIN_HT_LOAD_FACTOR (2×) gives a
+     * ~38-50% load factor after power-of-2 rounding — good balance between
+     * probe efficiency and memory footprint (fits in L3 cache).
      */
     inner_rows = state->inner_ps->plan->plan_rows;
     if (inner_rows < 64)
         inner_rows = 64;
-    est_capacity = next_power_of_2((int)(inner_rows * VJOIN_HT_LOAD_FACTOR * 2));
+    est_capacity = next_power_of_2((int)(inner_rows * VJOIN_HT_LOAD_FACTOR));
     pstate->est_inner_rows = (int) inner_rows;
     pstate->num_all_attrs = state->num_inner_attrs;
     pstate->num_keys = state->num_keys;

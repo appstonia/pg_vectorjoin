@@ -355,9 +355,7 @@ vjoin_try_hashjoin(PlannerInfo *root,
      * Only INNER/LEFT are safe: RIGHT/FULL need cross-worker
      * inner_matched coordination, so they stay non-parallel for now.
      *
-     * Require at least 3 workers: with fewer, non-parallel VHJ is
-     * already competitive with native parallel HJ, and the DSM/barrier
-     * overhead isn't justified. */
+     * Require at least 2 workers so the DSM/barrier overhead is justified. */
     if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
         (jointype == JOIN_INNER || jointype == JOIN_LEFT))
     {
@@ -368,7 +366,7 @@ vjoin_try_hashjoin(PlannerInfo *root,
         if (parallel_workers <= 0)
             parallel_workers = 1;
 
-        if (parallel_workers >= 3)
+        if (parallel_workers >= 2)
         {
             Path *par_inner_partial = NULL;
             Path *par_inner_full = NULL;

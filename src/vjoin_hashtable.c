@@ -277,7 +277,6 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
  */
 void
 vjoin_ht_insert_cas(VJoinHashTable *ht,
-                     VJoinParallelState *pstate,
                      uint32 hashval,
                      Datum *all_values, bool *all_isnull)
 {
@@ -305,10 +304,6 @@ vjoin_ht_insert_cas(VJoinHashTable *ht,
             base = pos * na;
             memcpy(&ht->all_values[base], all_values, sizeof(Datum) * na);
             memcpy(&ht->all_isnull[base], all_isnull, sizeof(bool) * na);
-
-            /* Memory barrier: ensure values are visible before count update */
-            pg_write_barrier();
-            pg_atomic_fetch_add_u32(&pstate->num_entries_atomic, 1);
             return;
         }
 
