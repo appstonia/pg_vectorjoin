@@ -30,35 +30,7 @@ next_power_of_2(int n)
     return p;
 }
 
-/*
- * Deserialize key info from custom_private.
- */
-static void
-vjoin_deserialize_keys(List *private_data,
-                       JoinType *jointype,
-                       int *num_keys,
-                       AttrNumber *outer_keynos,
-                       AttrNumber *inner_keynos,
-                       Oid *key_types,
-                       Oid *hash_funcs,
-                       Oid *eq_funcs,
-                       Oid *key_collations)
-{
-    int idx = 0;
-    int i;
-
-    *jointype = (JoinType) intVal(list_nth(private_data, idx++));
-    *num_keys = intVal(list_nth(private_data, idx++));
-    for (i = 0; i < *num_keys; i++)
-    {
-        outer_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
-        inner_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
-        key_types[i] = (Oid) intVal(list_nth(private_data, idx++));
-        hash_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
-        eq_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
-        key_collations[i] = (Oid) intVal(list_nth(private_data, idx++));
-    }
-}
+/* vjoin_deserialize_keys now lives in vjoin_plan.c */
 
 /*
  * Form result with outer values and NULL-filled inner (for LEFT/FULL).

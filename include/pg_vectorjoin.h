@@ -47,6 +47,17 @@ void vjoin_pathlist_hook(PlannerInfo *root,
                          JoinType jointype,
                          JoinPathExtraData *extra);
 
+/* Shared deserialization (vjoin_plan.c) */
+int vjoin_deserialize_keys(List *private_data,
+                           JoinType *jointype,
+                           int *num_keys,
+                           AttrNumber *outer_keynos,
+                           AttrNumber *inner_keynos,
+                           Oid *key_types,
+                           Oid *hash_funcs,
+                           Oid *eq_funcs,
+                           Oid *key_collations);
+
 /* PlanCustomPath callbacks */
 Plan *vjoin_hash_plan(PlannerInfo *root, RelOptInfo *rel,
                       CustomPath *best_path, List *tlist,

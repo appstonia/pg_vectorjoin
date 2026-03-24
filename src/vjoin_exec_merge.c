@@ -19,34 +19,7 @@
 
 #define VMJ_INITIAL_GROUP_CAPACITY 64
 
-/*
- * Deserialize key info from custom_private.
- */
-static void
-vmj_deserialize_keys(List *private_data,
-                     JoinType *jointype,
-                     int *num_keys,
-                     AttrNumber *outer_keynos,
-                     AttrNumber *inner_keynos,
-                     Oid *key_types,
-                     Oid *eq_funcs,
-                     Oid *key_collations)
-{
-    int idx = 0;
-    int i;
-
-    *jointype = (JoinType) intVal(list_nth(private_data, idx++));
-    *num_keys = intVal(list_nth(private_data, idx++));
-    for (i = 0; i < *num_keys; i++)
-    {
-        outer_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
-        inner_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
-        key_types[i] = (Oid) intVal(list_nth(private_data, idx++));
-        idx++;  /* skip hash_proc */
-        eq_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
-        key_collations[i] = (Oid) intVal(list_nth(private_data, idx++));
-    }
-}
+/* vjoin_deserialize_keys now lives in vjoin_plan.c */
 
 /*
  * Compare keys: returns -1, 0, or +1.
@@ -203,119 +176,82 @@ vmj_fetch_inner(VectorMergeJoinState *state)
 }
 
 /*
- * Collect all outer tuples with the same key into outer_group.
+ * Collect all tuples with the same key into the specified group array.
  * first_mt is the already-saved first tuple of the group.
- * If outer_multi is true, the current child slot has the second tuple
+ * If *_multi is true, the current child slot has the second tuple
  * (with the same key); we copy it and keep fetching.
- * After return, outer_key holds the NEXT different key (or outer_done=true).
+ * After return, the corresponding key[] holds the NEXT key (or *_done=true).
  */
 static void
-vmj_collect_outer_group(VectorMergeJoinState *state, MinimalTuple first_mt)
+vmj_collect_group(VectorMergeJoinState *state, bool is_outer,
+                  MinimalTuple first_mt)
 {
     MemoryContext oldctx;
+    MinimalTuple **group;
+    int           *count;
+    int           *capacity;
+    bool           multi;
 
-    state->outer_group_count = 0;
+    if (is_outer)
+    {
+        group    = &state->outer_group;
+        count    = &state->outer_group_count;
+        capacity = &state->outer_group_capacity;
+        multi    = state->outer_multi;
+    }
+    else
+    {
+        group    = &state->inner_group;
+        count    = &state->inner_group_count;
+        capacity = &state->inner_group_capacity;
+        multi    = state->inner_multi;
+    }
+
+    *count = 0;
     oldctx = MemoryContextSwitchTo(state->match_ctx);
 
     /* First tuple — already saved, copy into match_ctx */
-    if (state->outer_group_count >= state->outer_group_capacity)
+    if (*count >= *capacity)
     {
-        state->outer_group_capacity *= 2;
-        state->outer_group = repalloc(state->outer_group,
-            sizeof(MinimalTuple) * state->outer_group_capacity);
+        *capacity *= 2;
+        *group = repalloc(*group, sizeof(MinimalTuple) * *capacity);
     }
-    state->outer_group[state->outer_group_count++] = vjoin_heap_copy_minimal_tuple(first_mt);
+    (*group)[(*count)++] = vjoin_heap_copy_minimal_tuple(first_mt);
 
     MemoryContextSwitchTo(oldctx);
 
-    /* If outer_multi, current child slot has the second tuple */
-    if (state->outer_multi)
+    if (multi)
     {
-        TupleTableSlot *slot = state->outer_cur_slot;
+        TupleTableSlot *slot = is_outer ? state->outer_cur_slot
+                                        : state->inner_cur_slot;
 
         oldctx = MemoryContextSwitchTo(state->match_ctx);
-        if (state->outer_group_count >= state->outer_group_capacity)
+        if (*count >= *capacity)
         {
-            state->outer_group_capacity *= 2;
-            state->outer_group = repalloc(state->outer_group,
-                sizeof(MinimalTuple) * state->outer_group_capacity);
+            *capacity *= 2;
+            *group = repalloc(*group, sizeof(MinimalTuple) * *capacity);
         }
-        state->outer_group[state->outer_group_count++] = ExecCopySlotMinimalTuple(slot);
+        (*group)[(*count)++] = ExecCopySlotMinimalTuple(slot);
         MemoryContextSwitchTo(oldctx);
 
         /* Keep fetching while key matches */
-        while (vmj_fetch_outer(state))
+        while (is_outer ? vmj_fetch_outer(state) : vmj_fetch_inner(state))
         {
+            Datum *cur_key  = is_outer ? state->outer_key  : state->inner_key;
+            bool  *cur_null = is_outer ? state->outer_null  : state->inner_null;
+
             if (!vmj_keys_equal(state, state->match_key, state->match_null,
-                                state->outer_key, state->outer_null))
+                                cur_key, cur_null))
                 break;
 
-            slot = state->outer_cur_slot;
+            slot = is_outer ? state->outer_cur_slot : state->inner_cur_slot;
             oldctx = MemoryContextSwitchTo(state->match_ctx);
-            if (state->outer_group_count >= state->outer_group_capacity)
+            if (*count >= *capacity)
             {
-                state->outer_group_capacity *= 2;
-                state->outer_group = repalloc(state->outer_group,
-                    sizeof(MinimalTuple) * state->outer_group_capacity);
+                *capacity *= 2;
+                *group = repalloc(*group, sizeof(MinimalTuple) * *capacity);
             }
-            state->outer_group[state->outer_group_count++] = ExecCopySlotMinimalTuple(slot);
-            MemoryContextSwitchTo(oldctx);
-        }
-    }
-}
-
-/*
- * Collect all inner tuples with the same key into inner_group.
- * first_mt is the already-saved first tuple of the group.
- * If inner_multi is true, the current child slot has the second tuple.
- */
-static void
-vmj_collect_inner_group(VectorMergeJoinState *state, MinimalTuple first_mt)
-{
-    MemoryContext oldctx;
-
-    state->inner_group_count = 0;
-    oldctx = MemoryContextSwitchTo(state->match_ctx);
-
-    if (state->inner_group_count >= state->inner_group_capacity)
-    {
-        state->inner_group_capacity *= 2;
-        state->inner_group = repalloc(state->inner_group,
-            sizeof(MinimalTuple) * state->inner_group_capacity);
-    }
-    state->inner_group[state->inner_group_count++] = vjoin_heap_copy_minimal_tuple(first_mt);
-
-    MemoryContextSwitchTo(oldctx);
-
-    if (state->inner_multi)
-    {
-        TupleTableSlot *slot = state->inner_cur_slot;
-
-        oldctx = MemoryContextSwitchTo(state->match_ctx);
-        if (state->inner_group_count >= state->inner_group_capacity)
-        {
-            state->inner_group_capacity *= 2;
-            state->inner_group = repalloc(state->inner_group,
-                sizeof(MinimalTuple) * state->inner_group_capacity);
-        }
-        state->inner_group[state->inner_group_count++] = ExecCopySlotMinimalTuple(slot);
-        MemoryContextSwitchTo(oldctx);
-
-        while (vmj_fetch_inner(state))
-        {
-            if (!vmj_keys_equal(state, state->match_key, state->match_null,
-                                state->inner_key, state->inner_null))
-                break;
-
-            slot = state->inner_cur_slot;
-            oldctx = MemoryContextSwitchTo(state->match_ctx);
-            if (state->inner_group_count >= state->inner_group_capacity)
-            {
-                state->inner_group_capacity *= 2;
-                state->inner_group = repalloc(state->inner_group,
-                    sizeof(MinimalTuple) * state->inner_group_capacity);
-            }
-            state->inner_group[state->inner_group_count++] = ExecCopySlotMinimalTuple(slot);
+            (*group)[(*count)++] = ExecCopySlotMinimalTuple(slot);
             MemoryContextSwitchTo(oldctx);
         }
     }
@@ -509,7 +445,8 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
  * Inline key comparison for batch merge (single key).
  */
 static inline int
-vmj_batch_compare_key(Datum a, Datum b, Oid keytype)
+vmj_batch_compare_key(Datum a, Datum b, Oid keytype,
+                      FmgrInfo *cmp_finfo, Oid collation)
 {
     switch (keytype)
     {
@@ -529,7 +466,8 @@ vmj_batch_compare_key(Datum a, Datum b, Oid keytype)
             return (av < bv) ? -1 : (av > bv) ? 1 : 0;
         }
         default:
-            return (a < b) ? -1 : (a > b) ? 1 : 0;
+            return DatumGetInt32(FunctionCall2Coll(cmp_finfo, collation,
+                                                   a, b));
     }
 }
 
@@ -635,12 +573,15 @@ vmj_batch_do_merge_generic(VectorMergeJoinState *state)
     Datum  *ok = state->ob_keys;
     Datum  *ik = state->ib_keys;
     Oid     keytype = state->key_types[0];
+    FmgrInfo *cmp_finfo = &state->cmp_finfo[0];
+    Oid     collation = state->key_collations[0];
     VJoinMatch *results = state->batch_results;
     int     max_results = state->batch_result_capacity;
 
     while (oi < state->ob_count && ii < state->ib_count && nr < max_results)
     {
-        int cmp = vmj_batch_compare_key(ok[oi], ik[ii], keytype);
+        int cmp = vmj_batch_compare_key(ok[oi], ik[ii], keytype,
+                                         cmp_finfo, collation);
 
         if (cmp < 0)
         {
@@ -659,10 +600,12 @@ vmj_batch_do_merge_generic(VectorMergeJoinState *state)
             int     o, i;
 
             while (oe < state->ob_count &&
-                   vmj_batch_compare_key(ok[oe], match_val, keytype) == 0)
+                   vmj_batch_compare_key(ok[oe], match_val, keytype,
+                                         cmp_finfo, collation) == 0)
                 oe++;
             while (ie < state->ib_count &&
-                   vmj_batch_compare_key(ik[ie], match_val, keytype) == 0)
+                   vmj_batch_compare_key(ik[ie], match_val, keytype,
+                                         cmp_finfo, collation) == 0)
                 ie++;
 
             if ((oe == state->ob_count && !state->ob_exhausted) ||
@@ -760,14 +703,15 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
     state->inner_desc = inner_desc;
 
     /* Deserialize key info (jointype is first element) */
-    vmj_deserialize_keys(cscan->custom_private,
-                         &state->jointype,
-                         &state->num_keys,
-                         state->outer_keynos,
-                         state->inner_keynos,
-                         state->key_types,
-                         state->eq_funcs,
-                         state->key_collations);
+    vjoin_deserialize_keys(cscan->custom_private,
+                           &state->jointype,
+                           &state->num_keys,
+                           state->outer_keynos,
+                           state->inner_keynos,
+                           state->key_types,
+                           NULL,
+                           state->eq_funcs,
+                           state->key_collations);
 
     /* Set up generic comparison/equality functions and type metadata */
     {
@@ -1270,14 +1214,14 @@ vjoin_merge_exec(CustomScanState *node)
             }
 
             case VMJ_MATCH_OUTER:
-                vmj_collect_outer_group(state, state->saved_outer);
+                vmj_collect_group(state, true, state->saved_outer);
                 pfree(state->saved_outer);
                 state->saved_outer = NULL;
                 state->phase = VMJ_MATCH_INNER;
                 continue;
 
             case VMJ_MATCH_INNER:
-                vmj_collect_inner_group(state, state->saved_inner);
+                vmj_collect_group(state, false, state->saved_inner);
                 pfree(state->saved_inner);
                 state->saved_inner = NULL;
                 state->emit_outer_pos = 0;

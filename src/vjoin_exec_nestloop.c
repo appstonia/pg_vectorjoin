@@ -18,9 +18,8 @@
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
 
-/*
- * Deserialize key info from custom_private.
- */
+/* vjoin_deserialize_keys now lives in vjoin_plan.c.
+ * Nestloop reads extra theta fields after it. */
 static void
 nl_deserialize_keys(List *private_data,
                      JoinType *jointype,
@@ -35,22 +34,13 @@ nl_deserialize_keys(List *private_data,
                      AttrNumber *theta_inner_keyno,
                      Oid *theta_keytype)
 {
-    int idx = 0;
-    int i;
+    int idx;
 
-    *jointype = (JoinType) intVal(list_nth(private_data, idx++));
-    *num_keys = intVal(list_nth(private_data, idx++));
-    for (i = 0; i < *num_keys; i++)
-    {
-        outer_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
-        inner_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
-        key_types[i] = (Oid) intVal(list_nth(private_data, idx++));
-        idx++;  /* skip hash_proc */
-        eq_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
-        key_collations[i] = (Oid) intVal(list_nth(private_data, idx++));
-    }
+    idx = vjoin_deserialize_keys(private_data, jointype, num_keys,
+                                 outer_keynos, inner_keynos, key_types,
+                                 NULL, eq_funcs, key_collations);
 
-    /* Theta SIMD info */
+    /* Theta SIMD info (appended after standard key fields) */
     *theta_strategy = intVal(list_nth(private_data, idx++));
     if (*theta_strategy != 0)
     {

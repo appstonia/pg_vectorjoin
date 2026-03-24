@@ -6,6 +6,43 @@
 #include "vjoin_state.h"
 
 /*
+ * Deserialize key info from custom_private.
+ * If hash_funcs is NULL, the hash_proc field is skipped.
+ * Returns the list index after the last consumed element, so callers
+ * with extra trailing fields (e.g. theta info) can continue reading.
+ */
+int
+vjoin_deserialize_keys(List *private_data,
+                       JoinType *jointype,
+                       int *num_keys,
+                       AttrNumber *outer_keynos,
+                       AttrNumber *inner_keynos,
+                       Oid *key_types,
+                       Oid *hash_funcs,
+                       Oid *eq_funcs,
+                       Oid *key_collations)
+{
+    int idx = 0;
+    int i;
+
+    *jointype = (JoinType) intVal(list_nth(private_data, idx++));
+    *num_keys = intVal(list_nth(private_data, idx++));
+    for (i = 0; i < *num_keys; i++)
+    {
+        outer_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
+        inner_keynos[i] = (AttrNumber) intVal(list_nth(private_data, idx++));
+        key_types[i] = (Oid) intVal(list_nth(private_data, idx++));
+        if (hash_funcs)
+            hash_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
+        else
+            idx++;  /* skip hash_proc */
+        eq_funcs[i] = (Oid) intVal(list_nth(private_data, idx++));
+        key_collations[i] = (Oid) intVal(list_nth(private_data, idx++));
+    }
+    return idx;
+}
+
+/*
  * Build custom_scan_tlist from outer + inner child plan targetlists.
  * This defines the "wide" tuple that our scan slot will hold:
  * [all outer columns] ++ [all inner columns].

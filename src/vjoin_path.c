@@ -928,6 +928,16 @@ vjoin_try_mergejoin(PlannerInfo *root,
                       (par_inner->total_cost - par_inner->startup_cost) +
                       (par_outer_rows + par_inner->rows) * cpu_operator_cost * vjoin_cost_factor / 4.0;
 
+            /*
+             * Each worker re-scans the full inner independently, causing
+             * I/O contention on shared buffers.  Add a small penalty so
+             * the planner correctly prefers shared-inner approaches
+             * (e.g. parallel hash join) when inner is large.
+             */
+            if (par_is_parallel && par_workers > 1)
+                par_run += (par_inner->total_cost - par_inner->startup_cost) *
+                           0.1 * (par_workers - 1);
+
             /* Gather tuple-queue overhead (parallel paths only) */
             if (par_is_parallel)
                 par_run += clamp_row_est(joinrel->rows / par_workers) *
