@@ -257,6 +257,10 @@ vjoin_hash_build(VectorHashJoinState *state)
         /* All participants: scan inner and CAS-insert */
         {
         int local_count = 0;
+        bool had_overflow = false;
+        List *overflow_tuples = NIL;   /* List of MinimalTuple */
+        List *overflow_hashes = NIL;   /* parallel List of uint32 (boxed) */
+
         for (;;)
         {
             bool    has_null = false;
@@ -296,8 +300,25 @@ vjoin_hash_build(VectorHashJoinState *state)
                 hashval = (i == 0) ? h : vjoin_combine_hashes(hashval, h);
             }
 
-            vjoin_ht_insert_cas(state->hashtable, hashval,
-                                slot->tts_values, slot->tts_isnull);
+            if (had_overflow)
+            {
+                /* Table was full — buffer remaining tuples locally */
+                overflow_tuples = lappend(overflow_tuples,
+                                          ExecCopySlotMinimalTuple(slot));
+                overflow_hashes = lappend_int(overflow_hashes, (int) hashval);
+                continue;
+            }
+
+            if (!vjoin_ht_insert_cas(state->hashtable, hashval,
+                                     slot->tts_values, slot->tts_isnull))
+            {
+                had_overflow = true;
+                pg_atomic_write_u32(&ps->cas_resizing, 1);
+                overflow_tuples = lappend(overflow_tuples,
+                                          ExecCopySlotMinimalTuple(slot));
+                overflow_hashes = lappend_int(overflow_hashes, (int) hashval);
+                continue;
+            }
             local_count++;
         }
 
@@ -306,6 +327,110 @@ vjoin_hash_build(VectorHashJoinState *state)
 
         /* Barrier: all participants done building */
         BarrierArriveAndWait(&ps->barrier, 0);
+
+        /*
+         * If any participant overflowed, leader resizes the shared HT
+         * single-threaded (safe after barrier — all writes are visible),
+         * then all participants re-insert their overflow tuples.
+         */
+        if (pg_atomic_read_u32(&ps->cas_resizing) != 0)
+        {
+            if (state->is_leader)
+            {
+                /* Leader: rehash into doubled DSA arrays */
+                int old_cap = ps->capacity;
+                int new_cap = old_cap * 2;
+                int na = ps->num_all_attrs;
+                int new_mask = new_cap - 1;
+
+                uint32 *old_hv = (uint32 *) dsa_get_address(dsa, ps->hashvals_dp);
+                Datum  *old_val = (Datum *)  dsa_get_address(dsa, ps->all_values_dp);
+                bool   *old_null = (bool *)  dsa_get_address(dsa, ps->all_isnull_dp);
+
+                dsa_pointer new_hv_dp   = dsa_allocate0(dsa, sizeof(uint32) * new_cap);
+                dsa_pointer new_val_dp  = dsa_allocate0(dsa, sizeof(Datum) * new_cap * na);
+                dsa_pointer new_null_dp = dsa_allocate0(dsa, sizeof(bool) * new_cap * na);
+
+                uint32 *new_hv   = (uint32 *) dsa_get_address(dsa, new_hv_dp);
+                Datum  *new_val  = (Datum *)  dsa_get_address(dsa, new_val_dp);
+                bool   *new_null = (bool *)   dsa_get_address(dsa, new_null_dp);
+
+                int j;
+                for (j = 0; j < old_cap; j++)
+                {
+                    if (old_hv[j] != 0)
+                    {
+                        int p = old_hv[j] & new_mask;
+                        while (new_hv[p] != 0)
+                            p = (p + 1) & new_mask;
+                        new_hv[p] = old_hv[j];
+                        memcpy(&new_val[p * na], &old_val[j * na], sizeof(Datum) * na);
+                        memcpy(&new_null[p * na], &old_null[j * na], sizeof(bool) * na);
+                    }
+                }
+
+                ps->hashvals_dp   = new_hv_dp;
+                ps->all_values_dp = new_val_dp;
+                ps->all_isnull_dp = new_null_dp;
+                ps->capacity      = new_cap;
+                ps->mask          = new_mask;
+
+                pg_write_barrier();
+                pg_atomic_write_u32(&ps->cas_resizing, 0);
+            }
+            else
+            {
+                /* Workers: wait for leader to finish resize */
+                while (pg_atomic_read_u32(&ps->cas_resizing) != 0)
+                    pg_spin_delay();
+                pg_read_barrier();
+            }
+
+            /* All participants: refresh local HT wrapper */
+            state->hashtable->hashvals   = (uint32 *) dsa_get_address(dsa, ps->hashvals_dp);
+            state->hashtable->all_values = (Datum *)  dsa_get_address(dsa, ps->all_values_dp);
+            state->hashtable->all_isnull = (bool *)   dsa_get_address(dsa, ps->all_isnull_dp);
+            state->hashtable->capacity   = ps->capacity;
+            state->hashtable->mask       = ps->mask;
+
+            /* Re-insert overflow tuples via CAS */
+            if (overflow_tuples != NIL)
+            {
+                TupleTableSlot *tmpslot;
+                ListCell *lc_tup, *lc_hash;
+                int extra = 0;
+
+                tmpslot = MakeSingleTupleTableSlot(
+                    state->inner_ps->ps_ResultTupleDesc,
+                    &TTSOpsMinimalTuple);
+
+                forboth(lc_tup, overflow_tuples, lc_hash, overflow_hashes)
+                {
+                    MinimalTuple mt = (MinimalTuple) lfirst(lc_tup);
+                    uint32 hv = (uint32) lfirst_int(lc_hash);
+
+                    ExecStoreMinimalTuple(mt, tmpslot, false);
+                    slot_getallattrs(tmpslot);
+
+                    if (!vjoin_ht_insert_cas(state->hashtable, hv,
+                                             tmpslot->tts_values,
+                                             tmpslot->tts_isnull))
+                        ereport(ERROR,
+                                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                                 errmsg("parallel vector hash table capacity "
+                                        "exceeded after resize")));
+                    extra++;
+                }
+                pg_atomic_fetch_add_u32(&ps->num_entries_atomic, extra);
+
+                ExecDropSingleTupleTableSlot(tmpslot);
+                list_free_deep(overflow_tuples);
+                list_free(overflow_hashes);
+            }
+
+            /* Second barrier: all overflow inserts done */
+            BarrierArriveAndWait(&ps->barrier, 0);
+        }
 
         /* Read final entry count from atomic counter */
         {
@@ -1126,6 +1251,7 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     pstate->built_in_dsa = false;
     pstate->parallel_build = false;
     pg_atomic_init_u32(&pstate->num_entries_atomic, 0);
+    pg_atomic_init_u32(&pstate->cas_resizing, 0);
 
     /*
      * Pre-allocate DSA arrays based on estimated inner rows.
@@ -1137,7 +1263,7 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     inner_rows = state->inner_ps->plan->plan_rows;
     if (inner_rows < 64)
         inner_rows = 64;
-    est_capacity = next_power_of_2((int)(inner_rows * VJOIN_HT_LOAD_FACTOR));
+    est_capacity = next_power_of_2((int)(inner_rows * VJOIN_HT_LOAD_FACTOR * 2));
     pstate->est_inner_rows = (int) inner_rows;
     pstate->num_all_attrs = state->num_inner_attrs;
     pstate->num_keys = state->num_keys;

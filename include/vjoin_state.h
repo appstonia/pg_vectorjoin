@@ -44,6 +44,7 @@ typedef struct VJoinParallelState
     bool        parallel_build;  /* true if all participants build concurrently */
 
     pg_atomic_uint32  num_entries_atomic;  /* CAS counter for parallel build */
+    pg_atomic_uint32  cas_resizing;        /* 1 = CAS resize in progress */
 
     /* DSA pointers to the flat arrays */
     dsa_pointer hashvals_dp;    /* uint32[capacity] */

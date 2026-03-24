@@ -275,7 +275,7 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
  * Uses CAS on hashvals[pos] to claim an empty slot.
  * No rehash — caller must ensure sufficient pre-allocated capacity.
  */
-void
+bool
 vjoin_ht_insert_cas(VJoinHashTable *ht,
                      uint32 hashval,
                      Datum *all_values, bool *all_isnull)
@@ -304,15 +304,13 @@ vjoin_ht_insert_cas(VJoinHashTable *ht,
             base = pos * na;
             memcpy(&ht->all_values[base], all_values, sizeof(Datum) * na);
             memcpy(&ht->all_isnull[base], all_isnull, sizeof(bool) * na);
-            return;
+            return true;
         }
 
         /* Slot taken — linear probe */
         pos = (pos + 1) & ht->mask;
         if (pos == start_pos)
-            ereport(ERROR,
-                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                     errmsg("parallel vector hash table capacity exceeded")));
+            return false;  /* table full — caller coordinates resize */
     }
 }
 
