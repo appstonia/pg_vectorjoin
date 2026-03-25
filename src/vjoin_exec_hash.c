@@ -21,8 +21,6 @@
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
 
-/* vjoin_deserialize_keys now lives in vjoin_plan.c */
-
 /*
  * Form result with outer values and NULL-filled inner (for LEFT/FULL).
  */

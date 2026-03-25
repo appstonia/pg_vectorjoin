@@ -317,7 +317,7 @@ typedef struct VectorMergeJoinState
 
     VMJPhase    phase;
 
-    /* Key info (single-key for v1) */
+    /* Key info */
     int         num_keys;
     AttrNumber  outer_keynos[VJOIN_MAX_KEYS];
     AttrNumber  inner_keynos[VJOIN_MAX_KEYS];

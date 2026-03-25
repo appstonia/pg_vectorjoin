@@ -19,8 +19,6 @@
 
 #define VMJ_INITIAL_GROUP_CAPACITY 64
 
-/* vjoin_deserialize_keys now lives in vjoin_plan.c */
-
 /*
  * Compare keys: returns -1, 0, or +1.
  * NULLs are treated as greater than any non-NULL (sorted to end).
@@ -683,7 +681,8 @@ vmj_fill_inner(VectorMergeJoinState *state)
 }
 
 /*
- * Inline key comparison for batch merge (single key).
+ * Inline comparison for a single key pair.
+ * Called per-key in multi-key merge loops.
  */
 static inline __attribute__((always_inline)) int
 vmj_batch_compare_key(Datum a, Datum b, Oid keytype,

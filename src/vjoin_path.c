@@ -661,8 +661,8 @@ vjoin_try_nestloop(PlannerInfo *root,
 
 /*
  * Try to create a VectorMergeJoin path.
- * Only supports single-key equijoin for v1.
- * If inputs aren't already sorted, Sort nodes are added.
+ * Supports multi-key equijoin. If inputs aren't already sorted,
+ * Sort nodes are added.
  */
 static void
 vjoin_try_mergejoin(PlannerInfo *root,

@@ -18,8 +18,7 @@
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
 
-/* vjoin_deserialize_keys now lives in vjoin_plan.c.
- * Nestloop reads extra theta fields after it. */
+/* Deserialize keys and nestloop-specific theta fields from custom_private. */
 static void
 nl_deserialize_keys(List *private_data,
                      JoinType *jointype,
