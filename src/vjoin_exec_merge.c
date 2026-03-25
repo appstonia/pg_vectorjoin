@@ -352,6 +352,199 @@ vmj_form_result_right_slot(VectorMergeJoinState *state)
  *    - zero-copy result formation from pre-deformed arrays
  * ================================================================ */
 
+/* ----------------------------------------------------------------
+ * Shared inner materialization for parallel merge join.
+ *
+ * Leader scans the full sorted inner, deforms all tuples into flat
+ * Datum/isnull arrays + extracted keys, and stores them in DSA.
+ * Workers attach and get direct pointers to the shared arrays.
+ * ---------------------------------------------------------------- */
+static void
+vmj_materialize_shared_inner(VectorMergeJoinState *state)
+{
+    VJoinMergeParallelState *pstate = state->pstate;
+    dsa_area   *dsa = state->dsa;
+
+    if (state->is_leader)
+    {
+        /* Leader: scan full inner, store in DSA */
+        int         nattrs = state->num_inner_attrs;
+        int         nkeys = state->num_keys;
+        int         capacity = 4096;
+        int         count = 0;
+        Datum      *vals;
+        bool       *nulls;
+        Datum      *keys;
+        dsa_pointer vals_dp, nulls_dp, keys_dp;
+
+        /* Initial allocation in DSA */
+        vals_dp = dsa_allocate(dsa, sizeof(Datum) * capacity * nattrs);
+        nulls_dp = dsa_allocate(dsa, sizeof(bool) * capacity * nattrs);
+        keys_dp = dsa_allocate(dsa, sizeof(Datum) * capacity * nkeys);
+        vals = (Datum *) dsa_get_address(dsa, vals_dp);
+        nulls = (bool *) dsa_get_address(dsa, nulls_dp);
+        keys = (Datum *) dsa_get_address(dsa, keys_dp);
+
+        for (;;)
+        {
+            TupleTableSlot *slot = ExecProcNode(state->inner_ps);
+            int k;
+            bool key_null = false;
+
+            if (TupIsNull(slot))
+                break;
+
+            /* Grow if needed */
+            if (count >= capacity)
+            {
+                int new_cap = capacity * 2;
+                dsa_pointer nv, nn, nk;
+
+                nv = dsa_allocate(dsa, sizeof(Datum) * new_cap * nattrs);
+                nn = dsa_allocate(dsa, sizeof(bool) * new_cap * nattrs);
+                nk = dsa_allocate(dsa, sizeof(Datum) * new_cap * nkeys);
+
+                memcpy(dsa_get_address(dsa, nv), vals,
+                       sizeof(Datum) * count * nattrs);
+                memcpy(dsa_get_address(dsa, nn), nulls,
+                       sizeof(bool) * count * nattrs);
+                memcpy(dsa_get_address(dsa, nk), keys,
+                       sizeof(Datum) * count * nkeys);
+
+                dsa_free(dsa, vals_dp);
+                dsa_free(dsa, nulls_dp);
+                dsa_free(dsa, keys_dp);
+
+                vals_dp = nv;
+                nulls_dp = nn;
+                keys_dp = nk;
+                vals = (Datum *) dsa_get_address(dsa, nv);
+                nulls = (bool *) dsa_get_address(dsa, nn);
+                keys = (Datum *) dsa_get_address(dsa, nk);
+                capacity = new_cap;
+            }
+
+            /* Extract keys, skip NULLs */
+            for (k = 0; k < nkeys; k++)
+            {
+                bool isnl;
+                keys[count * nkeys + k] = slot_getattr(slot,
+                                                       state->inner_keynos[k],
+                                                       &isnl);
+                if (isnl)
+                {
+                    key_null = true;
+                    break;
+                }
+            }
+            if (key_null)
+                continue;
+
+            /* Deform all attributes */
+            slot_getallattrs(slot);
+            memcpy(&vals[count * nattrs], slot->tts_values,
+                   nattrs * sizeof(Datum));
+            memcpy(&nulls[count * nattrs], slot->tts_isnull,
+                   nattrs * sizeof(bool));
+            count++;
+        }
+
+        /* Publish to shared state */
+        pstate->inner_values_dp = vals_dp;
+        pstate->inner_isnull_dp = nulls_dp;
+        pstate->inner_keys_dp = keys_dp;
+        pg_write_barrier();
+        pstate->inner_count = count;
+    }
+
+    /* All participants wait here */
+    BarrierArriveAndWait(&pstate->barrier, 0);
+
+    /* Everyone attaches to the shared inner arrays */
+    pg_read_barrier();
+    state->shared_inner_count = pstate->inner_count;
+    state->shared_inner_pos = 0;
+    if (pstate->inner_count > 0)
+    {
+        state->shared_inner_values = (Datum *) dsa_get_address(
+            dsa, pstate->inner_values_dp);
+        state->shared_inner_isnull = (bool *) dsa_get_address(
+            dsa, pstate->inner_isnull_dp);
+        state->shared_inner_keys = (Datum *) dsa_get_address(
+            dsa, pstate->inner_keys_dp);
+    }
+    else
+    {
+        state->shared_inner_values = NULL;
+        state->shared_inner_isnull = NULL;
+        state->shared_inner_keys = NULL;
+    }
+}
+
+/*
+ * Fill inner batch from shared materialized buffer (parallel merge).
+ * Returns true if any tuples were loaded.
+ */
+static bool
+vmj_batch_fill_inner_shared(VectorMergeJoinState *state)
+{
+    int nkeys = state->num_keys;
+    int ncols = state->num_inner_attrs;
+    int batch_size = state->batch_size;
+    int remaining, avail, tocopy, off_src, off_dst;
+
+    /* Shift remaining entries to front */
+    remaining = state->ib_count - state->ib_pos;
+    if (remaining > 0 && state->ib_pos > 0)
+    {
+        memmove(state->ib_keys, &state->ib_keys[state->ib_pos * nkeys],
+                remaining * nkeys * sizeof(Datum));
+        memmove(state->ib_values, &state->ib_values[state->ib_pos * ncols],
+                remaining * ncols * sizeof(Datum));
+        memmove(state->ib_isnull, &state->ib_isnull[state->ib_pos * ncols],
+                remaining * ncols * sizeof(bool));
+    }
+    state->ib_count = remaining;
+    state->ib_pos = 0;
+
+    /* Copy from shared buffer */
+    avail = state->shared_inner_count - state->shared_inner_pos;
+    tocopy = batch_size - remaining;
+    if (tocopy > avail)
+        tocopy = avail;
+
+    if (tocopy > 0)
+    {
+        off_src = state->shared_inner_pos;
+        off_dst = remaining;
+
+        /* Prefetch upcoming shared data */
+        if (tocopy > 8)
+        {
+            __builtin_prefetch(&state->shared_inner_keys[(off_src + 8) * nkeys], 0, 1);
+            __builtin_prefetch(&state->shared_inner_values[(off_src + 8) * ncols], 0, 1);
+        }
+
+        memcpy(&state->ib_keys[off_dst * nkeys],
+               &state->shared_inner_keys[off_src * nkeys],
+               tocopy * nkeys * sizeof(Datum));
+        memcpy(&state->ib_values[off_dst * ncols],
+               &state->shared_inner_values[off_src * ncols],
+               tocopy * ncols * sizeof(Datum));
+        memcpy(&state->ib_isnull[off_dst * ncols],
+               &state->shared_inner_isnull[off_src * ncols],
+               tocopy * ncols * sizeof(bool));
+
+        state->ib_count = remaining + tocopy;
+        state->shared_inner_pos += tocopy;
+    }
+
+    if (state->shared_inner_pos >= state->shared_inner_count)
+        state->ib_exhausted = true;
+
+    return state->ib_count > 0;
+}
+
 /*
  * Fill (or refill) a block from a child plan.
  * Shifts remaining entries (from *pos to *count) to the front,
@@ -368,7 +561,8 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
     bool       *exhausted_p;
     int         ncols;
     PlanState  *child;
-    AttrNumber  keyno;
+    AttrNumber *keynos;
+    int         nkeys = state->num_keys;
     int         batch_size = state->batch_size;
     int         remaining;
 
@@ -382,7 +576,7 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
         exhausted_p = &state->ob_exhausted;
         ncols       = state->num_outer_attrs;
         child       = state->outer_ps;
-        keyno       = state->outer_keynos[0];
+        keynos      = state->outer_keynos;
     }
     else
     {
@@ -394,15 +588,15 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
         exhausted_p = &state->ib_exhausted;
         ncols       = state->num_inner_attrs;
         child       = state->inner_ps;
-        keyno       = state->inner_keynos[0];
+        keynos      = state->inner_keynos;
     }
 
     /* Shift remaining entries to front */
     remaining = *count_p - *pos_p;
     if (remaining > 0 && *pos_p > 0)
     {
-        memmove(keys, &keys[*pos_p],
-                remaining * sizeof(Datum));
+        memmove(keys, &keys[*pos_p * nkeys],
+                remaining * nkeys * sizeof(Datum));
         memmove(values, &values[*pos_p * ncols],
                 remaining * ncols * sizeof(Datum));
         memmove(isnull, &isnull[*pos_p * ncols],
@@ -430,7 +624,7 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
     {
         TupleTableSlot *slot;
         bool            key_null;
-        int             idx, off;
+        int             idx, k;
 
         slot = ExecProcNode(child);
         if (TupIsNull(slot))
@@ -439,26 +633,51 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
             break;
         }
 
-        /* Extract primary key — skip NULL keys */
+        /* Extract all keys — skip if any key is NULL */
         idx = *count_p;
-        keys[idx] = slot_getattr(slot, keyno, &key_null);
+        key_null = false;
+        for (k = 0; k < nkeys; k++)
+        {
+            bool isnl;
+            keys[idx * nkeys + k] = slot_getattr(slot, keynos[k], &isnl);
+            if (isnl)
+            {
+                key_null = true;
+                break;
+            }
+        }
         if (key_null)
             continue;
 
         /* Deform all attributes into columnar arrays */
         slot_getallattrs(slot);
-        off = idx * ncols;
-        memcpy(&values[off], slot->tts_values, ncols * sizeof(Datum));
-        memcpy(&isnull[off], slot->tts_isnull, ncols * sizeof(bool));
+        {
+            int off = idx * ncols;
+            memcpy(&values[off], slot->tts_values, ncols * sizeof(Datum));
+            memcpy(&isnull[off], slot->tts_isnull, ncols * sizeof(bool));
+        }
 
         (*count_p)++;
     }
 }
 
 /*
+ * Wrapper: fill inner batch — uses shared buffer in parallel mode,
+ * otherwise falls back to normal child scan.
+ */
+static inline void
+vmj_fill_inner(VectorMergeJoinState *state)
+{
+    if (state->is_parallel)
+        vmj_batch_fill_inner_shared(state);
+    else
+        vmj_batch_fill_side(state, false);
+}
+
+/*
  * Inline key comparison for batch merge (single key).
  */
-static inline int
+static inline __attribute__((always_inline)) int
 vmj_batch_compare_key(Datum a, Datum b, Oid keytype,
                       FmgrInfo *cmp_finfo, Oid collation)
 {
@@ -487,9 +706,12 @@ vmj_batch_compare_key(Datum a, Datum b, Oid keytype,
 
 /*
  * INT4-specialized batch merge with binary-search advance.
- * Processes ob_keys[ob_pos..] vs ib_keys[ib_pos..],
- * fills batch_results with match pairs.
- * Stops at block boundary if a group might span it.
+ * For multi-key joins where the first key is INT4, the primary key is
+ * stored at keys[row * nkeys + 0].  Secondary keys are compared via
+ * the generic path when primary keys are equal.
+ *
+ * Pre-builds combined result rows into batch_result_values/isnull
+ * for zero-copy emit in VMJ_BATCH_EMIT.
  */
 static void
 vmj_batch_do_merge_int4(VectorMergeJoinState *state)
@@ -501,9 +723,20 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
     int     ib_count = state->ib_count;
     Datum  *ok = state->ob_keys;
     Datum  *ik = state->ib_keys;
+    int     nk = state->num_keys;
     VJoinMatch *results = state->batch_results;
     int     max_results = state->batch_result_capacity;
     bool   *ob_matched = state->ob_matched;     /* NULL for INNER */
+    /* Pre-built result arrays */
+    Datum  *rv = state->batch_result_values;
+    bool   *ri = state->batch_result_isnull;
+    Datum  *ob_vals = state->ob_values;
+    bool   *ob_nulls = state->ob_isnull;
+    Datum  *ib_vals = state->ib_values;
+    bool   *ib_nulls = state->ib_isnull;
+    int     noa = state->num_outer_attrs;
+    int     nia = state->num_inner_attrs;
+    int     total = state->total_attrs;
 
     /* Resume interrupted cross-product from previous call */
     if (state->batch_cp_oi >= 0)
@@ -516,10 +749,37 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
 
         while (o < oe && nr < max_results)
         {
+            /* Multi-key resume: check secondary keys */
+            if (nk > 1)
+            {
+                bool match = true;
+                int k;
+                for (k = 1; k < nk; k++)
+                {
+                    if (DatumGetInt32(ok[o * nk + k]) !=
+                        DatumGetInt32(ik[i * nk + k]))
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+                if (!match)
+                {
+                    if (++i >= ie) { i = ii_start; o++; }
+                    continue;
+                }
+            }
             if (ob_matched)
                 ob_matched[o] = true;
             results[nr].outer_idx = o;
             results[nr].inner_idx = i;
+            {
+                int roff = nr * total;
+                memcpy(&rv[roff], &ob_vals[o * noa], noa * sizeof(Datum));
+                memcpy(&ri[roff], &ob_nulls[o * noa], noa * sizeof(bool));
+                memcpy(&rv[roff + noa], &ib_vals[i * nia], nia * sizeof(Datum));
+                memcpy(&ri[roff + noa], &ib_nulls[i * nia], nia * sizeof(bool));
+            }
             nr++;
             if (++i >= ie)
             {
@@ -546,17 +806,17 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
 
     while (oi < ob_count && ii < ib_count && nr < max_results)
     {
-        int32   outer_val = DatumGetInt32(ok[oi]);
-        int32   inner_val = DatumGetInt32(ik[ii]);
+        int32   outer_val = DatumGetInt32(ok[oi * nk]);
+        int32   inner_val = DatumGetInt32(ik[ii * nk]);
 
         if (outer_val < inner_val)
         {
-            /* Binary search: first oi where ok[oi] >= inner_val */
+            /* Binary search: first oi where ok[oi*nk] >= inner_val */
             int lo = oi + 1, hi = ob_count;
             while (lo < hi)
             {
                 int mid = (lo + hi) >> 1;
-                if (DatumGetInt32(ok[mid]) < inner_val)
+                if (DatumGetInt32(ok[mid * nk]) < inner_val)
                     lo = mid + 1;
                 else
                     hi = mid;
@@ -565,12 +825,12 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
         }
         else if (outer_val > inner_val)
         {
-            /* Binary search: first ii where ik[ii] >= outer_val */
+            /* Binary search: first ii where ik[ii*nk] >= outer_val */
             int lo = ii + 1, hi = ib_count;
             while (lo < hi)
             {
                 int mid = (lo + hi) >> 1;
-                if (DatumGetInt32(ik[mid]) < outer_val)
+                if (DatumGetInt32(ik[mid * nk]) < outer_val)
                     lo = mid + 1;
                 else
                     hi = mid;
@@ -579,15 +839,15 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
         }
         else
         {
-            /* Keys match — find group boundaries */
+            /* Primary keys match — find group boundaries on primary key */
             int32   match_val = outer_val;
             int     oe = oi + 1;
             int     ie = ii + 1;
             int     o, i;
 
-            while (oe < ob_count && DatumGetInt32(ok[oe]) == match_val)
+            while (oe < ob_count && DatumGetInt32(ok[oe * nk]) == match_val)
                 oe++;
-            while (ie < ib_count && DatumGetInt32(ik[ie]) == match_val)
+            while (ie < ib_count && DatumGetInt32(ik[ie * nk]) == match_val)
                 ie++;
 
             /* Stop if group might span a block boundary */
@@ -595,15 +855,47 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
                 (ie == ib_count && !state->ib_exhausted))
                 break;
 
-            /* Emit cross-product with flat loop for clean save/resume */
+            /* Emit cross-product with flat loop for clean save/resume.
+             * For multi-key, only emit pairs where ALL keys match. */
             o = oi;
             i = ii;
             while (o < oe && nr < max_results)
             {
+                /* Multi-key: check secondary keys */
+                if (nk > 1)
+                {
+                    bool match = true;
+                    int k;
+                    for (k = 1; k < nk; k++)
+                    {
+                        if (DatumGetInt32(ok[o * nk + k]) !=
+                            DatumGetInt32(ik[i * nk + k]))
+                        {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (!match)
+                    {
+                        if (++i >= ie)
+                        {
+                            i = ii;
+                            o++;
+                        }
+                        continue;
+                    }
+                }
                 if (ob_matched)
                     ob_matched[o] = true;
                 results[nr].outer_idx = o;
                 results[nr].inner_idx = i;
+                {
+                    int roff = nr * total;
+                    memcpy(&rv[roff], &ob_vals[o * noa], noa * sizeof(Datum));
+                    memcpy(&ri[roff], &ob_nulls[o * noa], noa * sizeof(bool));
+                    memcpy(&rv[roff + noa], &ib_vals[i * nia], nia * sizeof(Datum));
+                    memcpy(&ri[roff + noa], &ib_nulls[i * nia], nia * sizeof(bool));
+                }
                 nr++;
                 if (++i >= ie)
                 {
@@ -640,6 +932,9 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
 
 /*
  * Generic batch merge for INT8, FLOAT8, and multi-key joins.
+ * Uses binary-search advance on primary key for O(log N) skip.
+ * Pre-builds combined result rows into batch_result_values/isnull
+ * for zero-copy emit.
  */
 static void
 vmj_batch_do_merge_generic(VectorMergeJoinState *state)
@@ -649,14 +944,26 @@ vmj_batch_do_merge_generic(VectorMergeJoinState *state)
     int     nr = 0;
     Datum  *ok = state->ob_keys;
     Datum  *ik = state->ib_keys;
-    Oid     keytype = state->key_types[0];
-    FmgrInfo *cmp_finfo = &state->cmp_finfo[0];
-    Oid     collation = state->key_collations[0];
+    int     nk = state->num_keys;
     VJoinMatch *results = state->batch_results;
     int     max_results = state->batch_result_capacity;
     bool   *ob_matched = state->ob_matched;
+    /* Primary key comparison info (for binary search) */
+    Oid     pk_type = state->key_types[0];
+    FmgrInfo *pk_cmp = &state->cmp_finfo[0];
+    Oid     pk_coll = state->key_collations[0];
+    /* Pre-built result arrays */
+    Datum  *rv = state->batch_result_values;
+    bool   *ri = state->batch_result_isnull;
+    Datum  *ob_vals = state->ob_values;
+    bool   *ob_nulls = state->ob_isnull;
+    Datum  *ib_vals = state->ib_values;
+    bool   *ib_nulls = state->ib_isnull;
+    int     noa = state->num_outer_attrs;
+    int     nia = state->num_inner_attrs;
+    int     total = state->total_attrs;
 
-    /* Resume interrupted cross-product from previous call */
+    /* Resume interrupted cross-product from previous call (generic) */
     if (state->batch_cp_oi >= 0)
     {
         int o  = state->batch_cp_oi;
@@ -667,10 +974,40 @@ vmj_batch_do_merge_generic(VectorMergeJoinState *state)
 
         while (o < oe && nr < max_results)
         {
+            /* Multi-key resume: check all keys */
+            if (nk > 1)
+            {
+                bool match = true;
+                int kk;
+                for (kk = 0; kk < nk; kk++)
+                {
+                    if (vmj_batch_compare_key(ok[o * nk + kk],
+                                              ik[i * nk + kk],
+                                              state->key_types[kk],
+                                              &state->cmp_finfo[kk],
+                                              state->key_collations[kk]) != 0)
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+                if (!match)
+                {
+                    if (++i >= ie) { i = ii_start; o++; }
+                    continue;
+                }
+            }
             if (ob_matched)
                 ob_matched[o] = true;
             results[nr].outer_idx = o;
             results[nr].inner_idx = i;
+            {
+                int roff = nr * total;
+                memcpy(&rv[roff], &ob_vals[o * noa], noa * sizeof(Datum));
+                memcpy(&ri[roff], &ob_nulls[o * noa], noa * sizeof(bool));
+                memcpy(&rv[roff + noa], &ib_vals[i * nia], nia * sizeof(Datum));
+                memcpy(&ri[roff + noa], &ib_nulls[i * nia], nia * sizeof(bool));
+            }
             nr++;
             if (++i >= ie)
             {
@@ -695,47 +1032,107 @@ vmj_batch_do_merge_generic(VectorMergeJoinState *state)
 
     while (oi < state->ob_count && ii < state->ib_count && nr < max_results)
     {
-        int cmp = vmj_batch_compare_key(ok[oi], ik[ii], keytype,
-                                         cmp_finfo, collation);
+        /* Compare primary key for advance decision */
+        int cmp_pk = vmj_batch_compare_key(ok[oi * nk], ik[ii * nk],
+                                           pk_type, pk_cmp, pk_coll);
 
-        if (cmp < 0)
+        if (cmp_pk < 0)
         {
-            oi++;
+            /* Binary search: first oi where pk >= inner pk */
+            Datum target = ik[ii * nk];
+            int lo = oi + 1, hi = state->ob_count;
+            while (lo < hi)
+            {
+                int mid = (lo + hi) >> 1;
+                if (vmj_batch_compare_key(ok[mid * nk], target,
+                                          pk_type, pk_cmp, pk_coll) < 0)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            oi = lo;
         }
-        else if (cmp > 0)
+        else if (cmp_pk > 0)
         {
-            ii++;
+            /* Binary search: first ii where pk >= outer pk */
+            Datum target = ok[oi * nk];
+            int lo = ii + 1, hi = state->ib_count;
+            while (lo < hi)
+            {
+                int mid = (lo + hi) >> 1;
+                if (vmj_batch_compare_key(ik[mid * nk], target,
+                                          pk_type, pk_cmp, pk_coll) < 0)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            ii = lo;
         }
         else
         {
-            /* Match — find group boundaries */
-            Datum   match_val = ok[oi];
+            /* Primary key match — find group boundaries on primary key */
+            Datum   match_pk = ok[oi * nk];
             int     oe = oi + 1;
             int     ie = ii + 1;
             int     o, i;
 
             while (oe < state->ob_count &&
-                   vmj_batch_compare_key(ok[oe], match_val, keytype,
-                                         cmp_finfo, collation) == 0)
+                   vmj_batch_compare_key(ok[oe * nk], match_pk, pk_type,
+                                         pk_cmp, pk_coll) == 0)
                 oe++;
             while (ie < state->ib_count &&
-                   vmj_batch_compare_key(ik[ie], match_val, keytype,
-                                         cmp_finfo, collation) == 0)
+                   vmj_batch_compare_key(ik[ie * nk], match_pk, pk_type,
+                                         pk_cmp, pk_coll) == 0)
                 ie++;
 
             if ((oe == state->ob_count && !state->ob_exhausted) ||
                 (ie == state->ib_count && !state->ib_exhausted))
                 break;
 
-            /* Flat cross-product with save/resume support */
+            /* Flat cross-product with save/resume support.
+             * For multi-key, only emit pairs where ALL keys match. */
             o = oi;
             i = ii;
             while (o < oe && nr < max_results)
             {
+                /* Multi-key: check all keys */
+                if (nk > 1)
+                {
+                    bool match = true;
+                    int kk;
+                    for (kk = 0; kk < nk; kk++)
+                    {
+                        if (vmj_batch_compare_key(ok[o * nk + kk],
+                                                  ik[i * nk + kk],
+                                                  state->key_types[kk],
+                                                  &state->cmp_finfo[kk],
+                                                  state->key_collations[kk]) != 0)
+                        {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (!match)
+                    {
+                        if (++i >= ie)
+                        {
+                            i = ii;
+                            o++;
+                        }
+                        continue;
+                    }
+                }
                 if (ob_matched)
                     ob_matched[o] = true;
                 results[nr].outer_idx = o;
                 results[nr].inner_idx = i;
+                {
+                    int roff = nr * total;
+                    memcpy(&rv[roff], &ob_vals[o * noa], noa * sizeof(Datum));
+                    memcpy(&ri[roff], &ob_nulls[o * noa], noa * sizeof(bool));
+                    memcpy(&rv[roff + noa], &ib_vals[i * nia], nia * sizeof(Datum));
+                    memcpy(&ri[roff + noa], &ib_nulls[i * nia], nia * sizeof(bool));
+                }
                 nr++;
                 if (++i >= ie)
                 {
@@ -775,41 +1172,26 @@ vmj_batch_do_merge_generic(VectorMergeJoinState *state)
 static void
 vmj_batch_do_merge(VectorMergeJoinState *state)
 {
-    if (state->num_keys == 1 && state->key_types[0] == INT4OID)
-        vmj_batch_do_merge_int4(state);
-    else
-        vmj_batch_do_merge_generic(state);
-}
-
-/*
- * Form result from pre-deformed batch arrays (zero-copy for byval).
- */
-static TupleTableSlot *
-vmj_batch_form_result(VectorMergeJoinState *state,
-                      int outer_idx, int inner_idx)
-{
-    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-    int outer_off = outer_idx * state->num_outer_attrs;
-    int inner_off = inner_idx * state->num_inner_attrs;
-
-    ExecClearTuple(scan_slot);
-
-    memcpy(scan_slot->tts_values,
-           &state->ob_values[outer_off],
-           state->num_outer_attrs * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull,
-           &state->ob_isnull[outer_off],
-           state->num_outer_attrs * sizeof(bool));
-
-    memcpy(scan_slot->tts_values + state->num_outer_attrs,
-           &state->ib_values[inner_off],
-           state->num_inner_attrs * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
-           &state->ib_isnull[inner_off],
-           state->num_inner_attrs * sizeof(bool));
-
-    ExecStoreVirtualTuple(scan_slot);
-    return scan_slot;
+    /* Use INT4 specialization when ALL keys are INT4 */
+    if (state->key_types[0] == INT4OID)
+    {
+        int k;
+        bool all_int4 = true;
+        for (k = 1; k < state->num_keys; k++)
+        {
+            if (state->key_types[k] != INT4OID)
+            {
+                all_int4 = false;
+                break;
+            }
+        }
+        if (all_int4)
+        {
+            vmj_batch_do_merge_int4(state);
+            return;
+        }
+    }
+    vmj_batch_do_merge_generic(state);
 }
 
 /*
@@ -971,14 +1353,14 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
 
         state->batch_size = bs;
 
-        state->ob_keys   = palloc(sizeof(Datum) * bs);
+        state->ob_keys   = palloc(sizeof(Datum) * bs * state->num_keys);
         state->ob_values = palloc(sizeof(Datum) * bs * state->num_outer_attrs);
         state->ob_isnull = palloc(sizeof(bool) * bs * state->num_outer_attrs);
         state->ob_count  = 0;
         state->ob_pos    = 0;
         state->ob_exhausted = false;
 
-        state->ib_keys   = palloc(sizeof(Datum) * bs);
+        state->ib_keys   = palloc(sizeof(Datum) * bs * state->num_keys);
         state->ib_values = palloc(sizeof(Datum) * bs * state->num_inner_attrs);
         state->ib_isnull = palloc(sizeof(bool) * bs * state->num_inner_attrs);
         state->ib_count  = 0;
@@ -990,6 +1372,17 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
                                       state->batch_result_capacity);
         state->batch_result_count = 0;
         state->batch_result_pos   = 0;
+        state->total_attrs = state->num_outer_attrs + state->num_inner_attrs;
+
+        /* Pre-built result arrays for zero-copy emit */
+        state->batch_result_values = palloc(sizeof(Datum) *
+                                            state->batch_result_capacity *
+                                            state->total_attrs);
+        state->batch_result_isnull = palloc(sizeof(bool) *
+                                            state->batch_result_capacity *
+                                            state->total_attrs);
+        state->saved_tts_values = NULL;
+        state->saved_tts_isnull = NULL;
 
         state->batch_cp_oi = -1;
 
@@ -1008,7 +1401,23 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
     else
     {
         state->batch_size = 0;
+        state->total_attrs = 0;
+        state->batch_result_values = NULL;
+        state->batch_result_isnull = NULL;
+        state->saved_tts_values = NULL;
+        state->saved_tts_isnull = NULL;
     }
+
+    /* Initialize parallel fields (DSM callbacks set these later if parallel) */
+    state->pstate = NULL;
+    state->dsa = NULL;
+    state->is_parallel = false;
+    state->is_leader = false;
+    state->shared_inner_values = NULL;
+    state->shared_inner_isnull = NULL;
+    state->shared_inner_keys = NULL;
+    state->shared_inner_count = 0;
+    state->shared_inner_pos = 0;
 
     state->phase = VMJ_INIT;
 }
@@ -1026,13 +1435,18 @@ vjoin_merge_exec(CustomScanState *node)
         switch (state->phase)
         {
             case VMJ_INIT:
+                /* Parallel: materialize shared inner before any fills */
+                if (state->is_parallel && state->shared_inner_values == NULL &&
+                    state->shared_inner_count == 0)
+                    vmj_materialize_shared_inner(state);
+
                 if (state->all_byval && state->batch_size > 0 &&
                     (state->jointype == JOIN_INNER ||
                      state->jointype == JOIN_LEFT))
                 {
                     /* Block merge mode: fill both blocks */
                     vmj_batch_fill_side(state, true);
-                    vmj_batch_fill_side(state, false);
+                    vmj_fill_inner(state);
                     if (state->ob_count == 0)
                     {
                         state->phase = VMJ_DONE;
@@ -1463,7 +1877,7 @@ vjoin_merge_exec(CustomScanState *node)
                 if (state->ob_pos >= state->ob_count && !state->ob_exhausted)
                     vmj_batch_fill_side(state, true);
                 if (state->ib_pos >= state->ib_count && !state->ib_exhausted)
-                    vmj_batch_fill_side(state, false);
+                    vmj_fill_inner(state);
 
                 if (state->ob_count == 0 || state->ib_count == 0)
                 {
@@ -1519,7 +1933,7 @@ vjoin_merge_exec(CustomScanState *node)
                         state->phase = VMJ_DONE;
                         return NULL;
                     }
-                    vmj_batch_fill_side(state, false);
+                    vmj_fill_inner(state);
                     if (state->ib_count == 0)
                     {
                         if (state->ob_matched)
@@ -1539,7 +1953,7 @@ vjoin_merge_exec(CustomScanState *node)
                 if (!state->ob_exhausted)
                     vmj_batch_fill_side(state, true);
                 if (!state->ib_exhausted)
-                    vmj_batch_fill_side(state, false);
+                    vmj_fill_inner(state);
                 if (state->ob_count == 0 || state->ib_count == 0)
                 {
                     if (state->ob_matched && state->ob_count > 0)
@@ -1554,31 +1968,44 @@ vjoin_merge_exec(CustomScanState *node)
 
             case VMJ_BATCH_EMIT:
             {
-                TupleTableSlot *result;
+                TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
+                int total = state->total_attrs;
 
                 if (state->batch_result_pos >= state->batch_result_count)
                 {
-                    /* Buffer exhausted — back to merge */
+                    /* Restore scan_slot pointers before leaving emit phase */
+                    if (state->saved_tts_values)
+                    {
+                        scan_slot->tts_values = state->saved_tts_values;
+                        scan_slot->tts_isnull = state->saved_tts_isnull;
+                    }
                     state->phase = VMJ_BATCH_MERGE;
                     continue;
                 }
 
+                /* Save original pointers on first entry */
+                if (state->saved_tts_values == NULL)
                 {
-                    int oi = state->batch_results[state->batch_result_pos].outer_idx;
-                    int ii = state->batch_results[state->batch_result_pos].inner_idx;
-                    state->batch_result_pos++;
+                    state->saved_tts_values = scan_slot->tts_values;
+                    state->saved_tts_isnull = scan_slot->tts_isnull;
+                }
 
-                    result = vmj_batch_form_result(state, oi, ii);
+                /* Zero-copy: redirect scan_slot to pre-built result row */
+                {
+                    int pos = state->batch_result_pos++;
+                    scan_slot->tts_values = &state->batch_result_values[pos * total];
+                    scan_slot->tts_isnull = &state->batch_result_isnull[pos * total];
+                    ExecStoreVirtualTuple(scan_slot);
 
                     ResetExprContext(econtext);
-                    econtext->ecxt_scantuple = result;
+                    econtext->ecxt_scantuple = scan_slot;
 
                     if (qual && !ExecQual(qual, econtext))
                         continue;
 
                     if (projInfo)
                         return ExecProject(projInfo);
-                    return result;
+                    return scan_slot;
                 }
             }
 
@@ -1719,6 +2146,16 @@ vjoin_merge_end(CustomScanState *node)
 {
     VectorMergeJoinState *state = (VectorMergeJoinState *) node;
 
+    /* Restore scan_slot pointers if redirected by zero-copy emit */
+    if (state->saved_tts_values)
+    {
+        TupleTableSlot *scan_slot = node->ss.ss_ScanTupleSlot;
+        scan_slot->tts_values = state->saved_tts_values;
+        scan_slot->tts_isnull = state->saved_tts_isnull;
+        state->saved_tts_values = NULL;
+        state->saved_tts_isnull = NULL;
+    }
+
     ExecEndNode(state->outer_ps);
     ExecEndNode(state->inner_ps);
 
@@ -1764,6 +2201,16 @@ vjoin_merge_rescan(CustomScanState *node)
     if (state->ob_matched)
         memset(state->ob_matched, 0, sizeof(bool) * state->batch_size);
 
+    /* Restore scan_slot pointers if redirected by zero-copy emit */
+    if (state->saved_tts_values)
+    {
+        TupleTableSlot *scan_slot = node->ss.ss_ScanTupleSlot;
+        scan_slot->tts_values = state->saved_tts_values;
+        scan_slot->tts_isnull = state->saved_tts_isnull;
+        state->saved_tts_values = NULL;
+        state->saved_tts_isnull = NULL;
+    }
+
     state->outer_matched = false;
     state->inner_matched = false;
 
@@ -1788,42 +2235,70 @@ vjoin_merge_explain(CustomScanState *node, List *ancestors, ExplainState *es)
     ExplainPropertyBool("SIMD", state->use_simd, es);
     if (state->batch_size > 0)
         ExplainPropertyInteger("Batch Size", NULL, state->batch_size, es);
+    if (state->is_parallel)
+        ExplainPropertyBool("Shared Inner", true, es);
 }
 
 /* ----------------------------------------------------------------
  *      Parallel DSM callbacks
  *
- * Each parallel worker sorts its partial outer independently and
- * merge-joins against the full sorted inner child.
+ * Leader materializes the full sorted inner into DSA shared memory.
+ * Workers attach to DSA and read the shared inner directly.
+ * Each participant merges its partial outer against the shared inner.
  * ---------------------------------------------------------------- */
 
 Size
 vjoin_merge_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 {
-    return sizeof(VJoinGenericParallelState);
+    return sizeof(VJoinMergeParallelState);
 }
 
 void
 vjoin_merge_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
                             void *coordinate)
 {
-    VJoinGenericParallelState *pstate = (VJoinGenericParallelState *) coordinate;
+    VectorMergeJoinState *state = (VectorMergeJoinState *) node;
+    VJoinMergeParallelState *pstate = (VJoinMergeParallelState *) coordinate;
 
-    pstate->initialized = 1;
+    /* Create DSA in the DSM segment */
+    state->dsa = dsa_create(LWTRANCHE_PARALLEL_HASH_JOIN);
+    dsa_pin_mapping(state->dsa);
+
+    pstate->dsa_handle = dsa_get_handle(state->dsa);
+    BarrierInit(&pstate->barrier, pcxt->nworkers_to_launch + 1);
+    pstate->inner_count = 0;
+    pstate->num_inner_attrs = state->num_inner_attrs;
+    pstate->num_keys = state->num_keys;
+    pstate->inner_values_dp = InvalidDsaPointer;
+    pstate->inner_isnull_dp = InvalidDsaPointer;
+    pstate->inner_keys_dp = InvalidDsaPointer;
+
+    state->pstate = pstate;
+    state->is_parallel = true;
+    state->is_leader = true;
 }
 
 void
 vjoin_merge_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
                               void *coordinate)
 {
-    /* Workers re-sort on rescan — nothing to reset */
+    /* Rescan not supported for parallel VMJ */
 }
 
 void
 vjoin_merge_initialize_worker(CustomScanState *node, shm_toc *toc,
                                void *coordinate)
 {
-    /* Worker processes its own sorted merge via vjoin_merge_begin/exec */
+    VectorMergeJoinState *state = (VectorMergeJoinState *) node;
+    VJoinMergeParallelState *pstate = (VJoinMergeParallelState *) coordinate;
+
+    /* Attach to the DSA area created by the leader */
+    state->dsa = dsa_attach(pstate->dsa_handle);
+    dsa_pin_mapping(state->dsa);
+
+    state->pstate = pstate;
+    state->is_parallel = true;
+    state->is_leader = false;
 }
 
 void

@@ -10,11 +10,34 @@
 #include "utils/dsa.h"
 #include "utils/tuplestore.h"
 
-/* ---------- Generic parallel state for NL / Merge (DSM-resident) ---------- */
+/* ---------- Generic parallel state for NL (DSM-resident) ---------- */
 typedef struct VJoinGenericParallelState
 {
     int     initialized;    /* set to 1 by leader */
 } VJoinGenericParallelState;
+
+/* ---------- Parallel shared state for Merge Join (DSM-resident) ---------- */
+/*
+ * Leader scans the full sorted inner and materializes pre-deformed
+ * Datum/isnull arrays + extracted keys into DSA shared memory.
+ * Workers attach to DSA and read the shared inner directly —
+ * zero redundant inner scans.
+ *
+ * Barrier phases:
+ *   0 → materialize: leader scans inner, stores in DSA
+ *   1 → merge:       all participants merge partial outer vs shared inner
+ */
+typedef struct VJoinMergeParallelState
+{
+    Barrier     barrier;            /* materialize / merge synchronization */
+    dsa_handle  dsa_handle;         /* handle for DSA area */
+    int         inner_count;        /* number of inner tuples materialized */
+    int         num_inner_attrs;    /* inner tuple descriptor width */
+    int         num_keys;           /* number of join keys */
+    dsa_pointer inner_values_dp;    /* Datum[inner_count * num_inner_attrs] */
+    dsa_pointer inner_isnull_dp;    /* bool[inner_count * num_inner_attrs] */
+    dsa_pointer inner_keys_dp;      /* Datum[inner_count * num_keys] */
+} VJoinMergeParallelState;
 
 /* ---------- Parallel shared state for Hash Join (DSM-resident) ---------- */
 /*
@@ -378,6 +401,13 @@ typedef struct VectorMergeJoinState
     int         batch_result_count;
     int         batch_result_pos;
     int         batch_result_capacity;
+    int         total_attrs;            /* num_outer_attrs + num_inner_attrs */
+
+    /* Pre-built result arrays for zero-copy emit */
+    Datum      *batch_result_values;    /* [capacity * total_attrs] */
+    bool       *batch_result_isnull;    /* [capacity * total_attrs] */
+    Datum      *saved_tts_values;       /* original scan_slot->tts_values */
+    bool       *saved_tts_isnull;       /* original scan_slot->tts_isnull */
 
     /* Cross-product tracking for multi-match groups within a batch */
     int         batch_cp_oi;            /* -1 if not in cross product */
@@ -394,6 +424,19 @@ typedef struct VectorMergeJoinState
     JoinType    jointype;
     bool        outer_matched;          /* current outer tuple has a match */
     bool        inner_matched;          /* current inner tuple has a match */
+
+    /* Parallel merge state */
+    VJoinMergeParallelState *pstate;    /* shared DSM state (NULL if non-parallel) */
+    dsa_area               *dsa;       /* DSA area (NULL if non-parallel) */
+    bool        is_parallel;
+    bool        is_leader;
+
+    /* Shared inner materialized buffer (worker-side pointers) */
+    Datum      *shared_inner_values;   /* points into DSA */
+    bool       *shared_inner_isnull;   /* points into DSA */
+    Datum      *shared_inner_keys;     /* points into DSA */
+    int         shared_inner_count;    /* total inner tuples */
+    int         shared_inner_pos;      /* current read position */
 } VectorMergeJoinState;
 
 #endif /* VJOIN_STATE_H */

@@ -76,11 +76,15 @@ SELECT COUNT(*) FROM vmj_perf_l l JOIN vmj_perf_r r ON l.id = r.id;
 -- -------------------------------------------------------
 -- 6. Parallel VectorMergeJoin
 -- -------------------------------------------------------
-SET pg_vectorjoin.enable_mergejoin = off;
+SET pg_vectorjoin.enable_mergejoin = on;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SET pg_vectorjoin.enable_nestloop = off;
 SET max_parallel_workers_per_gather = 2;
 SET min_parallel_table_scan_size = 0;
-SET parallel_tuple_cost = 0;
-SET parallel_setup_cost = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_tuple_cost = 0.0001;
+SET parallel_setup_cost = 1;
 
 EXPLAIN (ANALYZE, COSTS OFF, TIMING ON, SUMMARY ON)
 SELECT COUNT(*) FROM vmj_perf_l l JOIN vmj_perf_r r ON l.id = r.id;
@@ -88,6 +92,7 @@ SELECT COUNT(*) FROM vmj_perf_l l JOIN vmj_perf_r r ON l.id = r.id;
 -- -------------------------------------------------------
 -- 7. PG Native Parallel Merge Join (for reference)
 -- -------------------------------------------------------
+SET pg_vectorjoin.enable_mergejoin = off;
 SET enable_mergejoin = on;
 
 EXPLAIN (ANALYZE, COSTS OFF, TIMING ON, SUMMARY ON)

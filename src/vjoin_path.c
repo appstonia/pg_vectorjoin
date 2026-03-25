@@ -680,12 +680,8 @@ vjoin_try_mergejoin(PlannerInfo *root,
                     Oid *collations)
 {
     ListCell   *lc;
-    RestrictInfo *merge_rinfo = NULL;
-    Oid         opfamily;
-    PathKey    *outer_pathkey;
-    PathKey    *inner_pathkey;
-    List       *outer_pathkeys;
-    List       *inner_pathkeys;
+    List       *outer_pathkeys = NIL;
+    List       *inner_pathkeys = NIL;
     Path       *outer_path;
     Path       *inner_path;
     CustomPath *cpath;
@@ -693,18 +689,22 @@ vjoin_try_mergejoin(PlannerInfo *root,
                 run_cost;
     double      outer_rows,
                 inner_rows;
-
-    /* v1: single-key merge join only */
-    if (nkeys != 1)
-        return;
+    int         merge_keys_found = 0;
 
     /*
-     * Find a merge-joinable RestrictInfo for our single key.
-     * We need one with mergeopfamilies set.
+     * Build PathKeys for each merge-joinable key.
+     * We iterate over the restrict list and match each clause to the
+     * key arrays produced by vjoin_analyze_clauses (same iteration order).
      */
     foreach(lc, extra->restrictlist)
     {
         RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+        Oid         opfamily;
+        PathKey    *outer_pathkey;
+        PathKey    *inner_pathkey;
+
+        if (merge_keys_found >= nkeys)
+            break;
 
         if (rinfo->mergeopfamilies == NIL)
             continue;
@@ -718,41 +718,34 @@ vjoin_try_mergejoin(PlannerInfo *root,
         if (rinfo->left_ec == NULL || rinfo->right_ec == NULL)
             continue;
 
-        merge_rinfo = rinfo;
-        break;
+        opfamily = linitial_oid(rinfo->mergeopfamilies);
+
+        if (bms_is_subset(rinfo->left_relids, outerrel->relids))
+        {
+            outer_pathkey = make_canonical_pathkey(root, rinfo->left_ec,
+                                                  opfamily, BTLessStrategyNumber,
+                                                  false);
+            inner_pathkey = make_canonical_pathkey(root, rinfo->right_ec,
+                                                  opfamily, BTLessStrategyNumber,
+                                                  false);
+        }
+        else
+        {
+            outer_pathkey = make_canonical_pathkey(root, rinfo->right_ec,
+                                                  opfamily, BTLessStrategyNumber,
+                                                  false);
+            inner_pathkey = make_canonical_pathkey(root, rinfo->left_ec,
+                                                  opfamily, BTLessStrategyNumber,
+                                                  false);
+        }
+
+        outer_pathkeys = lappend(outer_pathkeys, outer_pathkey);
+        inner_pathkeys = lappend(inner_pathkeys, inner_pathkey);
+        merge_keys_found++;
     }
 
-    if (merge_rinfo == NULL)
+    if (merge_keys_found == 0)
         return;
-
-    /* Use first opfamily from the merge clause */
-    opfamily = linitial_oid(merge_rinfo->mergeopfamilies);
-
-    /*
-     * Build PathKeys for the merge key on each side.
-     * We need ascending sort order (BTLessStrategyNumber).
-     */
-    if (bms_is_subset(merge_rinfo->left_relids, outerrel->relids))
-    {
-        outer_pathkey = make_canonical_pathkey(root, merge_rinfo->left_ec,
-                                              opfamily, BTLessStrategyNumber,
-                                              false);
-        inner_pathkey = make_canonical_pathkey(root, merge_rinfo->right_ec,
-                                              opfamily, BTLessStrategyNumber,
-                                              false);
-    }
-    else
-    {
-        outer_pathkey = make_canonical_pathkey(root, merge_rinfo->right_ec,
-                                              opfamily, BTLessStrategyNumber,
-                                              false);
-        inner_pathkey = make_canonical_pathkey(root, merge_rinfo->left_ec,
-                                              opfamily, BTLessStrategyNumber,
-                                              false);
-    }
-
-    outer_pathkeys = list_make1(outer_pathkey);
-    inner_pathkeys = list_make1(inner_pathkey);
 
     /*
      * Try to find already-sorted paths; fall back to adding Sort nodes.
@@ -924,19 +917,29 @@ vjoin_try_mergejoin(PlannerInfo *root,
             }
 
             par_startup = par_outer->startup_cost + par_inner->startup_cost;
-            par_run = (par_outer->total_cost - par_outer->startup_cost) +
-                      (par_inner->total_cost - par_inner->startup_cost) +
-                      (par_outer_rows + par_inner->rows) * cpu_operator_cost * vjoin_cost_factor / 4.0;
 
-            /*
-             * Each worker re-scans the full inner independently, causing
-             * I/O contention on shared buffers.  Add a small penalty so
-             * the planner correctly prefers shared-inner approaches
-             * (e.g. parallel hash join) when inner is large.
-             */
-            if (par_is_parallel && par_workers > 1)
-                par_run += (par_inner->total_cost - par_inner->startup_cost) *
-                           0.1 * (par_workers - 1);
+            if (par_is_parallel)
+            {
+                /*
+                 * Shared inner materialization: leader scans inner once,
+                 * all workers read from DSA-shared pre-deformed arrays.
+                 * Inner cost is paid once (startup). Merge processing
+                 * is distributed across workers.
+                 * Small materialization overhead: memcpy cost per inner tuple.
+                 */
+                par_run = (par_outer->total_cost - par_outer->startup_cost) +
+                          (par_inner->total_cost - par_inner->startup_cost) +
+                          par_inner->rows * cpu_tuple_cost * 0.5 +
+                          (par_outer_rows + par_inner->rows) *
+                          cpu_operator_cost * vjoin_cost_factor / 4.0;
+            }
+            else
+            {
+                par_run = (par_outer->total_cost - par_outer->startup_cost) +
+                          (par_inner->total_cost - par_inner->startup_cost) +
+                          (par_outer_rows + par_inner->rows) *
+                          cpu_operator_cost * vjoin_cost_factor / 4.0;
+            }
 
             /* Gather tuple-queue overhead (parallel paths only) */
             if (par_is_parallel)
