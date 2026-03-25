@@ -2,6 +2,7 @@
 #define PG_VECTORJOIN_H
 
 #include "postgres.h"
+#include "catalog/pg_type_d.h"
 #include "nodes/extensible.h"
 #include "optimizer/paths.h"
 #include "utils/dsa.h"

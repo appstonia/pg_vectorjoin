@@ -2276,7 +2276,7 @@ vjoin_merge_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     dsa_pin_mapping(state->dsa);
 
     pstate->dsa_handle = dsa_get_handle(state->dsa);
-    BarrierInit(&pstate->barrier, pcxt->nworkers_to_launch + 1);
+    BarrierInit(&pstate->barrier, vjoin_pcxt_nworkers(pcxt) + 1);
     pstate->inner_count = 0;
     pstate->num_inner_attrs = state->num_inner_attrs;
     pstate->num_keys = state->num_keys;

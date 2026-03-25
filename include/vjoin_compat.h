@@ -55,6 +55,14 @@
     heap_form_minimal_tuple((desc), (vals), (nulls))
 #endif
 
+/* ParallelContext: nworkers_to_launch was added in PG17;
+ * PG12-16 use nworkers for the planned worker count */
+#if PG_VERSION_NUM >= 170000
+#define vjoin_pcxt_nworkers(pcxt)  ((pcxt)->nworkers_to_launch)
+#else
+#define vjoin_pcxt_nworkers(pcxt)  ((pcxt)->nworkers)
+#endif
+
 /* Value vs Integer API change: PG16+ uses makeInteger returning Integer*,
  * PG14-15 uses makeInteger returning Value* — but intVal() works across all */
 

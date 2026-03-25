@@ -303,7 +303,7 @@ vjoin_hash_build(VectorHashJoinState *state)
                 /* Leader: rehash into doubled DSA arrays */
                 int old_cap = ps->capacity;
                 int new_cap;
-                int na = ps->num_all_attrs;
+                int resize_na = ps->num_all_attrs;
                 int new_mask;
                 dsa_pointer old_hv_dp, old_val_dp, old_null_dp;
                 dsa_pointer new_hv_dp, new_val_dp, new_null_dp;
@@ -331,8 +331,8 @@ vjoin_hash_build(VectorHashJoinState *state)
                 old_null = (bool *)  dsa_get_address(dsa, old_null_dp);
 
                 new_hv_dp   = dsa_allocate0(dsa, (Size) sizeof(uint32) * new_cap);
-                new_val_dp  = dsa_allocate0(dsa, (Size) sizeof(Datum) * new_cap * na);
-                new_null_dp = dsa_allocate0(dsa, (Size) sizeof(bool) * new_cap * na);
+                new_val_dp  = dsa_allocate0(dsa, (Size) sizeof(Datum) * new_cap * resize_na);
+                new_null_dp = dsa_allocate0(dsa, (Size) sizeof(bool) * new_cap * resize_na);
 
                 new_hv   = (uint32 *) dsa_get_address(dsa, new_hv_dp);
                 new_val  = (Datum *)  dsa_get_address(dsa, new_val_dp);
@@ -346,8 +346,8 @@ vjoin_hash_build(VectorHashJoinState *state)
                         while (new_hv[p] != 0)
                             p = (p + 1) & new_mask;
                         new_hv[p] = old_hv[j];
-                        memcpy(&new_val[p * na], &old_val[j * na], sizeof(Datum) * na);
-                        memcpy(&new_null[p * na], &old_null[j * na], sizeof(bool) * na);
+                        memcpy(&new_val[p * resize_na], &old_val[j * resize_na], sizeof(Datum) * resize_na);
+                        memcpy(&new_null[p * resize_na], &old_null[j * resize_na], sizeof(bool) * resize_na);
                     }
                 }
 
@@ -1235,7 +1235,7 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 
     /* Initialize the shared state */
     pstate->dsa_handle = dsa_get_handle(state->dsa);
-    BarrierInit(&pstate->barrier, pcxt->nworkers_to_launch + 1);
+    BarrierInit(&pstate->barrier, vjoin_pcxt_nworkers(pcxt) + 1);
     pstate->num_entries = 0;
     pstate->built_in_dsa = false;
     pstate->parallel_build = false;

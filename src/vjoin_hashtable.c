@@ -142,7 +142,7 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
     int pos;
     int na = ht->num_all_attrs;
     int base;
-    MemoryContext old;
+    MemoryContext old = NULL;
 
     /* Ensure hash is non-zero (0 = empty marker) */
     if (hashval == 0)
