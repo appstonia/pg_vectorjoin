@@ -5,16 +5,6 @@
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 
-/* Round up to next power of 2 */
-static int
-next_power_of_2(int n)
-{
-    int p = 1;
-    while (p < n)
-        p <<= 1;
-    return p;
-}
-
 VJoinHashTable *
 vjoin_ht_create(int estimated_rows, int num_keys, int num_all_attrs,
                 MemoryContext parent, AttrNumber *inner_keynos,
@@ -60,7 +50,7 @@ vjoin_ht_create(int estimated_rows, int num_keys, int num_all_attrs,
     }
 
     /* Capacity = next power of 2 >= estimated_rows * load_factor */
-    capacity = next_power_of_2(Max(estimated_rows * VJOIN_HT_LOAD_FACTOR, 128));
+    capacity = vjoin_next_power_of_2(Max(estimated_rows * VJOIN_HT_LOAD_FACTOR, 128));
     ht->capacity = capacity;
     ht->mask = capacity - 1;
     ht->num_entries = 0;
@@ -161,13 +151,22 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
     /* Check if we need to grow (load factor > 50%) */
     if (ht->num_entries * 2 >= ht->capacity)
     {
-        /* Rehash: double capacity */
+        /* Rehash: double capacity (with overflow guard) */
         int            old_cap = ht->capacity;
         uint32        *old_hashvals = ht->hashvals;
         Datum         *old_vals = ht->all_values;
         bool          *old_inull = ht->all_isnull;
-        int            new_cap = old_cap * 2;
+        int            new_cap;
         int            i;
+        dsa_pointer    old_hv_dp = InvalidDsaPointer;
+        dsa_pointer    old_val_dp = InvalidDsaPointer;
+        dsa_pointer    old_null_dp = InvalidDsaPointer;
+
+        if (old_cap > INT_MAX / 2)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("pg_vectorjoin: hash table capacity overflow")));
+        new_cap = old_cap * 2;
 
         ht->capacity = new_cap;
         ht->mask = new_cap - 1;
@@ -177,10 +176,13 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
             /* DSA-backed: allocate new arrays in shared memory */
             dsa_area   *dsa = ht->dsa;
             VJoinParallelState *ps = ht->pstate;
+            old_hv_dp  = ps->hashvals_dp;
+            old_val_dp = ps->all_values_dp;
+            old_null_dp = ps->all_isnull_dp;
 
-            ps->hashvals_dp = dsa_allocate0(dsa, sizeof(uint32) * new_cap);
-            ps->all_values_dp = dsa_allocate0(dsa, sizeof(Datum) * new_cap * na);
-            ps->all_isnull_dp = dsa_allocate0(dsa, sizeof(bool) * new_cap * na);
+            ps->hashvals_dp = dsa_allocate0(dsa, (Size) sizeof(uint32) * new_cap);
+            ps->all_values_dp = dsa_allocate0(dsa, (Size) sizeof(Datum) * new_cap * na);
+            ps->all_isnull_dp = dsa_allocate0(dsa, (Size) sizeof(bool) * new_cap * na);
 
             ht->hashvals   = (uint32 *) dsa_get_address(dsa, ps->hashvals_dp);
             ht->all_values = (Datum *)  dsa_get_address(dsa, ps->all_values_dp);
@@ -219,12 +221,10 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
 
         if (ht->is_shared)
         {
-            /* Old arrays were DSA-allocated; free them back to DSA.
-             * We saved the old dsa_pointers as local C pointers, but
-             * dsa_free needs the dsa_pointer.  Since we just replaced
-             * pstate->{dp} fields with the new pointers, the old
-             * DSA blocks are unreferenced — DSA will reclaim them
-             * when the area is destroyed.  No explicit free needed. */
+            /* Free old DSA arrays now that rehash is complete */
+            dsa_free(ht->dsa, old_hv_dp);
+            dsa_free(ht->dsa, old_val_dp);
+            dsa_free(ht->dsa, old_null_dp);
         }
         else
         {

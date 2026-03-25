@@ -16,19 +16,10 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
-
-/* Round up to next power of 2 (duplicated from vjoin_hashtable.c) */
-static inline int
-next_power_of_2(int n)
-{
-    int p = 1;
-    while (p < n)
-        p <<= 1;
-    return p;
-}
 
 /* vjoin_deserialize_keys now lives in vjoin_plan.c */
 
@@ -239,6 +230,8 @@ vjoin_hash_build(VectorHashJoinState *state)
             uint32  hashval;
             int     i;
 
+            CHECK_FOR_INTERRUPTS();
+
             slot = ExecProcNode(state->inner_ps);
             if (TupIsNull(slot))
                 break;
@@ -311,23 +304,42 @@ vjoin_hash_build(VectorHashJoinState *state)
             {
                 /* Leader: rehash into doubled DSA arrays */
                 int old_cap = ps->capacity;
-                int new_cap = old_cap * 2;
+                int new_cap;
                 int na = ps->num_all_attrs;
-                int new_mask = new_cap - 1;
-
-                uint32 *old_hv = (uint32 *) dsa_get_address(dsa, ps->hashvals_dp);
-                Datum  *old_val = (Datum *)  dsa_get_address(dsa, ps->all_values_dp);
-                bool   *old_null = (bool *)  dsa_get_address(dsa, ps->all_isnull_dp);
-
-                dsa_pointer new_hv_dp   = dsa_allocate0(dsa, sizeof(uint32) * new_cap);
-                dsa_pointer new_val_dp  = dsa_allocate0(dsa, sizeof(Datum) * new_cap * na);
-                dsa_pointer new_null_dp = dsa_allocate0(dsa, sizeof(bool) * new_cap * na);
-
-                uint32 *new_hv   = (uint32 *) dsa_get_address(dsa, new_hv_dp);
-                Datum  *new_val  = (Datum *)  dsa_get_address(dsa, new_val_dp);
-                bool   *new_null = (bool *)   dsa_get_address(dsa, new_null_dp);
-
+                int new_mask;
+                dsa_pointer old_hv_dp, old_val_dp, old_null_dp;
+                dsa_pointer new_hv_dp, new_val_dp, new_null_dp;
+                uint32 *old_hv;
+                Datum  *old_val;
+                bool   *old_null;
+                uint32 *new_hv;
+                Datum  *new_val;
+                bool   *new_null;
                 int j;
+
+                if (old_cap > INT_MAX / 2)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                             errmsg("pg_vectorjoin: hash table capacity overflow")));
+                new_cap = old_cap * 2;
+                new_mask = new_cap - 1;
+
+                old_hv_dp   = ps->hashvals_dp;
+                old_val_dp  = ps->all_values_dp;
+                old_null_dp = ps->all_isnull_dp;
+
+                old_hv = (uint32 *) dsa_get_address(dsa, old_hv_dp);
+                old_val = (Datum *)  dsa_get_address(dsa, old_val_dp);
+                old_null = (bool *)  dsa_get_address(dsa, old_null_dp);
+
+                new_hv_dp   = dsa_allocate0(dsa, (Size) sizeof(uint32) * new_cap);
+                new_val_dp  = dsa_allocate0(dsa, (Size) sizeof(Datum) * new_cap * na);
+                new_null_dp = dsa_allocate0(dsa, (Size) sizeof(bool) * new_cap * na);
+
+                new_hv   = (uint32 *) dsa_get_address(dsa, new_hv_dp);
+                new_val  = (Datum *)  dsa_get_address(dsa, new_val_dp);
+                new_null = (bool *)   dsa_get_address(dsa, new_null_dp);
+
                 for (j = 0; j < old_cap; j++)
                 {
                     if (old_hv[j] != 0)
@@ -346,6 +358,11 @@ vjoin_hash_build(VectorHashJoinState *state)
                 ps->all_isnull_dp = new_null_dp;
                 ps->capacity      = new_cap;
                 ps->mask          = new_mask;
+
+                /* Free old DSA arrays now that rehash is complete */
+                dsa_free(dsa, old_hv_dp);
+                dsa_free(dsa, old_val_dp);
+                dsa_free(dsa, old_null_dp);
 
                 pg_write_barrier();
                 pg_atomic_write_u32(&ps->cas_resizing, 0);
@@ -528,6 +545,8 @@ vjoin_hash_build(VectorHashJoinState *state)
         bool    has_null = false;
         uint32  hashval;
         int     i;
+
+        CHECK_FOR_INTERRUPTS();
 
         /* Pull inner tuple in parent context */
         MemoryContextSwitchTo(oldctx);
@@ -1235,7 +1254,7 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     inner_rows = state->inner_ps->plan->plan_rows;
     if (inner_rows < 64)
         inner_rows = 64;
-    est_capacity = next_power_of_2((int)(inner_rows * VJOIN_HT_LOAD_FACTOR * 2));
+    est_capacity = vjoin_next_power_of_2((int)(inner_rows * VJOIN_HT_LOAD_FACTOR * 2));
     pstate->est_inner_rows = (int) inner_rows;
     pstate->num_all_attrs = state->num_inner_attrs;
     pstate->num_keys = state->num_keys;

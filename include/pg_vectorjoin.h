@@ -212,4 +212,18 @@ vjoin_combine_hashes(uint32 h1, uint32 h2)
     return h1 ^ h2;
 }
 
+/* Round up to next power of 2 (with overflow guard) */
+static inline int
+vjoin_next_power_of_2(int n)
+{
+    int p = 1;
+    while (p < n)
+    {
+        if (p > INT_MAX / 2)
+            return INT_MAX / 2 + 1;
+        p <<= 1;
+    }
+    return p;
+}
+
 #endif /* PG_VECTORJOIN_H */

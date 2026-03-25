@@ -442,6 +442,8 @@ nl_scan_inner(VJoinNestLoopState *state)
 
         MemoryContextSwitchTo(oldctx);
 
+        CHECK_FOR_INTERRUPTS();
+
         if (state->inner_stored)
         {
             /* Read from tuplestore */

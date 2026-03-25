@@ -11,8 +11,8 @@
 #include "utils/datum.h"
 #include "utils/typcache.h"
 #include "utils/lsyscache.h"
-#include "vjoin_compat.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
@@ -397,8 +397,14 @@ vmj_materialize_shared_inner(VectorMergeJoinState *state)
             /* Grow if needed */
             if (count >= capacity)
             {
-                int new_cap = capacity * 2;
+                int new_cap;
                 dsa_pointer nv, nn, nk;
+
+                if (capacity > INT_MAX / 2)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                             errmsg("pg_vectorjoin: merge inner materialization capacity overflow")));
+                new_cap = capacity * 2;
 
                 nv = dsa_allocate(dsa, sizeof(Datum) * new_cap * nattrs);
                 nn = dsa_allocate(dsa, sizeof(bool) * new_cap * nattrs);
@@ -626,6 +632,8 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
         bool            key_null;
         int             idx, k;
 
+        CHECK_FOR_INTERRUPTS();
+
         slot = ExecProcNode(child);
         if (TupIsNull(slot))
         {
@@ -808,6 +816,8 @@ vmj_batch_do_merge_int4(VectorMergeJoinState *state)
     {
         int32   outer_val = DatumGetInt32(ok[oi * nk]);
         int32   inner_val = DatumGetInt32(ik[ii * nk]);
+
+        CHECK_FOR_INTERRUPTS();
 
         if (outer_val < inner_val)
         {
@@ -1035,6 +1045,8 @@ vmj_batch_do_merge_generic(VectorMergeJoinState *state)
         /* Compare primary key for advance decision */
         int cmp_pk = vmj_batch_compare_key(ok[oi * nk], ik[ii * nk],
                                            pk_type, pk_cmp, pk_coll);
+
+        CHECK_FOR_INTERRUPTS();
 
         if (cmp_pk < 0)
         {
