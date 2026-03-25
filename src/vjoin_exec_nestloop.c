@@ -60,30 +60,30 @@ nl_deserialize_keys(List *private_data,
  * Fill the scan slot from matched outer + inner tuple.
  */
 static TupleTableSlot *
-nl_form_result(VJoinNestLoopState *state, MinimalTuple outer_mt,
+nl_form_result(VJoinNestLoopState *state, int outer_idx,
                 MinimalTuple inner_mt)
 {
     TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-
-    ExecStoreMinimalTuple(outer_mt, state->outer_slot, false);
-    slot_getallattrs(state->outer_slot);
-
-    ExecStoreMinimalTuple(inner_mt, state->inner_slot, false);
-    slot_getallattrs(state->inner_slot);
+    int n_outer = state->num_outer_attrs;
 
     ExecClearTuple(scan_slot);
 
+    /* Outer: use pre-deformed block arrays (no MinimalTuple decode) */
     memcpy(scan_slot->tts_values,
-           state->outer_slot->tts_values,
-           state->num_outer_attrs * sizeof(Datum));
+           &state->block_values[outer_idx * n_outer],
+           n_outer * sizeof(Datum));
     memcpy(scan_slot->tts_isnull,
-           state->outer_slot->tts_isnull,
-           state->num_outer_attrs * sizeof(bool));
+           &state->block_isnull[outer_idx * n_outer],
+           n_outer * sizeof(bool));
 
-    memcpy(scan_slot->tts_values + state->num_outer_attrs,
+    /* Inner: deform from MinimalTuple */
+    ExecStoreMinimalTuple(inner_mt, state->inner_slot, false);
+    slot_getallattrs(state->inner_slot);
+
+    memcpy(scan_slot->tts_values + n_outer,
            state->inner_slot->tts_values,
            state->num_inner_attrs * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
+    memcpy(scan_slot->tts_isnull + n_outer,
            state->inner_slot->tts_isnull,
            state->num_inner_attrs * sizeof(bool));
 
@@ -95,25 +95,23 @@ nl_form_result(VJoinNestLoopState *state, MinimalTuple outer_mt,
  * Form result with outer values and NULL-filled inner (for LEFT/FULL).
  */
 static TupleTableSlot *
-nl_form_result_left(VJoinNestLoopState *state, MinimalTuple outer_mt)
+nl_form_result_left(VJoinNestLoopState *state, int outer_idx)
 {
     TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-
-    ExecStoreMinimalTuple(outer_mt, state->outer_slot, false);
-    slot_getallattrs(state->outer_slot);
+    int n_outer = state->num_outer_attrs;
 
     ExecClearTuple(scan_slot);
 
     memcpy(scan_slot->tts_values,
-           state->outer_slot->tts_values,
-           state->num_outer_attrs * sizeof(Datum));
+           &state->block_values[outer_idx * n_outer],
+           n_outer * sizeof(Datum));
     memcpy(scan_slot->tts_isnull,
-           state->outer_slot->tts_isnull,
-           state->num_outer_attrs * sizeof(bool));
+           &state->block_isnull[outer_idx * n_outer],
+           n_outer * sizeof(bool));
 
-    memset(scan_slot->tts_values + state->num_outer_attrs,
+    memset(scan_slot->tts_values + n_outer,
            0, state->num_inner_attrs * sizeof(Datum));
-    memset(scan_slot->tts_isnull + state->num_outer_attrs,
+    memset(scan_slot->tts_isnull + n_outer,
            1, state->num_inner_attrs * sizeof(bool));
 
     ExecStoreVirtualTuple(scan_slot);
@@ -180,19 +178,16 @@ nl_load_outer_block(VJoinNestLoopState *state)
 
         state->block_tuples[loaded] = ExecCopySlotMinimalTuple(slot);
 
-        /* Pre-deform outer into columnar arrays for theta scan */
-        if (state->block_values != NULL)
-        {
-            ExecStoreMinimalTuple(state->block_tuples[loaded],
-                                  state->outer_slot, false);
-            slot_getallattrs(state->outer_slot);
-            memcpy(&state->block_values[loaded * state->num_outer_attrs],
-                   state->outer_slot->tts_values,
-                   state->num_outer_attrs * sizeof(Datum));
-            memcpy(&state->block_isnull[loaded * state->num_outer_attrs],
-                   state->outer_slot->tts_isnull,
-                   state->num_outer_attrs * sizeof(bool));
-        }
+        /* Pre-deform outer into columnar arrays */
+        ExecStoreMinimalTuple(state->block_tuples[loaded],
+                              state->outer_slot, false);
+        slot_getallattrs(state->outer_slot);
+        memcpy(&state->block_values[loaded * state->num_outer_attrs],
+               state->outer_slot->tts_values,
+               state->num_outer_attrs * sizeof(Datum));
+        memcpy(&state->block_isnull[loaded * state->num_outer_attrs],
+               state->outer_slot->tts_isnull,
+               state->num_outer_attrs * sizeof(bool));
 
         /* Extract keys into columnar arrays */
         for (k = 0; k < state->num_keys; k++)
@@ -203,6 +198,28 @@ nl_load_outer_block(VJoinNestLoopState *state)
                 d = datumCopy(d, false, state->key_typlen[k]);
             state->block_keys[loaded * state->num_keys + k] = d;
             state->block_nulls[loaded * state->num_keys + k] = isnull;
+        }
+
+        /* Extract typed key for SIMD equi-join comparison */
+        if (state->simd_typed_keys != NULL)
+        {
+            bool isnull = state->block_nulls[loaded * state->num_keys];
+            Datum d = state->block_keys[loaded * state->num_keys];
+            switch (state->simd_key_type)
+            {
+                case INT4OID:
+                    ((int32 *)state->simd_typed_keys)[loaded] =
+                        isnull ? 0 : DatumGetInt32(d);
+                    break;
+                case INT8OID:
+                    ((int64 *)state->simd_typed_keys)[loaded] =
+                        isnull ? 0 : DatumGetInt64(d);
+                    break;
+                case FLOAT8OID:
+                    ((double *)state->simd_typed_keys)[loaded] =
+                        isnull ? 0.0 : DatumGetFloat8(d);
+                    break;
+            }
         }
 
         /* Extract theta key into typed array for SIMD comparison */
@@ -256,8 +273,53 @@ nl_load_outer_block(VJoinNestLoopState *state)
 }
 
 /*
- * Compare one inner tuple against the entire outer block using SIMD
- * for single int4/int8/float8 key, scalar fallback otherwise.
+ * Push a match into the result buffer, growing if needed.
+ */
+static inline void
+nl_push_match(VJoinNestLoopState *state, int outer_idx, MinimalTuple inner_mt)
+{
+    if (state->result_count >= state->result_capacity)
+    {
+        state->result_capacity *= 2;
+        state->results = repalloc(state->results,
+            sizeof(VJoinMatch) * state->result_capacity);
+        state->result_inner_tuples = repalloc(state->result_inner_tuples,
+            sizeof(MinimalTuple) * state->result_capacity);
+    }
+    state->results[state->result_count].outer_idx = outer_idx;
+    state->results[state->result_count].inner_idx = 0;
+    state->result_inner_tuples[state->result_count] = inner_mt;
+    state->result_count++;
+
+    if (state->block_matched)
+        state->block_matched[outer_idx] = true;
+}
+
+/*
+ * Ensure inner_matched array covers idx, growing if needed; mark matched.
+ */
+static inline void
+nl_ensure_inner_matched(VJoinNestLoopState *state, int idx)
+{
+    if (idx >= state->inner_match_count)
+    {
+        int new_cap = state->inner_match_count == 0
+                      ? 256 : state->inner_match_count * 2;
+        while (new_cap <= idx)
+            new_cap *= 2;
+        state->inner_matched = repalloc(state->inner_matched,
+                                        sizeof(bool) * new_cap);
+        memset(state->inner_matched + state->inner_match_count, 0,
+               sizeof(bool) * (new_cap - state->inner_match_count));
+        state->inner_match_count = new_cap;
+    }
+    state->inner_matched[idx] = true;
+}
+
+/*
+ * Compare one inner tuple against the entire outer block.
+ * Uses pre-extracted typed arrays for single-key SIMD fast path,
+ * scalar fallback for multi-key or unsupported types.
  */
 static void
 nl_compare_block(VJoinNestLoopState *state,
@@ -266,147 +328,45 @@ nl_compare_block(VJoinNestLoopState *state,
 {
     int k, i;
 
-    /* Single int4 key with SIMD */
-    if (state->num_keys == 1 && state->key_types[0] == INT4OID &&
-        !inner_nulls[0] && state->use_simd)
+    /* Single-key SIMD fast path using pre-extracted typed arrays */
+    if (state->simd_typed_keys != NULL && !inner_nulls[0])
     {
-        int32  inner_val = DatumGetInt32(inner_keys[0]);
-        int   *match_indices;
-        int    nmatches;
-        int32 *key_array;
+        int  raw_matches, nmatches;
+        int *match_indices = state->simd_match_indices;
 
-        key_array = (int32 *) palloc(sizeof(int32) * state->block_count);
-        match_indices = (int *) palloc(sizeof(int) * state->block_count);
-
-        for (i = 0; i < state->block_count; i++)
+        switch (state->simd_key_type)
         {
-            if (state->block_nulls[i * state->num_keys])
-                key_array[i] = inner_val + 1;  /* ensure no match for null */
-            else
-                key_array[i] = DatumGetInt32(
-                    state->block_keys[i * state->num_keys]);
+            case INT4OID:
+                raw_matches = vjoin_compare_int4_block(
+                    (int32 *) state->simd_typed_keys, state->block_count,
+                    DatumGetInt32(inner_keys[0]), match_indices);
+                break;
+            case INT8OID:
+                raw_matches = vjoin_compare_int8_block(
+                    (int64 *) state->simd_typed_keys, state->block_count,
+                    DatumGetInt64(inner_keys[0]), match_indices);
+                break;
+            case FLOAT8OID:
+                raw_matches = vjoin_compare_float8_block(
+                    (double *) state->simd_typed_keys, state->block_count,
+                    DatumGetFloat8(inner_keys[0]), match_indices);
+                break;
+            default:
+                raw_matches = 0;
+                break;
         }
 
-        nmatches = vjoin_compare_int4_block(key_array, state->block_count,
-                                            inner_val, match_indices);
+        /* Post-filter NULL outer keys */
+        nmatches = 0;
+        for (i = 0; i < raw_matches; i++)
+        {
+            if (!state->block_nulls[match_indices[i] * state->num_keys])
+                match_indices[nmatches++] = match_indices[i];
+        }
 
         for (i = 0; i < nmatches; i++)
-        {
-            if (state->result_count >= state->result_capacity)
-            {
-                state->result_capacity *= 2;
-                state->results = repalloc(state->results,
-                    sizeof(VJoinMatch) * state->result_capacity);
-                state->result_inner_tuples = repalloc(state->result_inner_tuples,
-                    sizeof(MinimalTuple) * state->result_capacity);
-            }
-            state->results[state->result_count].outer_idx = match_indices[i];
-            state->results[state->result_count].inner_idx = 0;
-            state->result_inner_tuples[state->result_count] = inner_mt;
-            state->result_count++;
+            nl_push_match(state, match_indices[i], inner_mt);
 
-            if (state->block_matched)
-                state->block_matched[match_indices[i]] = true;
-        }
-
-        pfree(key_array);
-        pfree(match_indices);
-        return;
-    }
-
-    /* Single int8 key with SIMD */
-    if (state->num_keys == 1 && state->key_types[0] == INT8OID &&
-        !inner_nulls[0] && state->use_simd)
-    {
-        int64  inner_val = DatumGetInt64(inner_keys[0]);
-        int   *match_indices;
-        int    nmatches;
-        int64 *key_array;
-
-        key_array = (int64 *) palloc(sizeof(int64) * state->block_count);
-        match_indices = (int *) palloc(sizeof(int) * state->block_count);
-
-        for (i = 0; i < state->block_count; i++)
-        {
-            if (state->block_nulls[i * state->num_keys])
-                key_array[i] = inner_val + 1;
-            else
-                key_array[i] = DatumGetInt64(
-                    state->block_keys[i * state->num_keys]);
-        }
-
-        nmatches = vjoin_compare_int8_block(key_array, state->block_count,
-                                            inner_val, match_indices);
-
-        for (i = 0; i < nmatches; i++)
-        {
-            if (state->result_count >= state->result_capacity)
-            {
-                state->result_capacity *= 2;
-                state->results = repalloc(state->results,
-                    sizeof(VJoinMatch) * state->result_capacity);
-                state->result_inner_tuples = repalloc(state->result_inner_tuples,
-                    sizeof(MinimalTuple) * state->result_capacity);
-            }
-            state->results[state->result_count].outer_idx = match_indices[i];
-            state->results[state->result_count].inner_idx = 0;
-            state->result_inner_tuples[state->result_count] = inner_mt;
-            state->result_count++;
-
-            if (state->block_matched)
-                state->block_matched[match_indices[i]] = true;
-        }
-
-        pfree(key_array);
-        pfree(match_indices);
-        return;
-    }
-
-    /* Single float8 key with SIMD */
-    if (state->num_keys == 1 && state->key_types[0] == FLOAT8OID &&
-        !inner_nulls[0] && state->use_simd)
-    {
-        double  inner_val = DatumGetFloat8(inner_keys[0]);
-        int    *match_indices;
-        int     nmatches;
-        double *key_array;
-
-        key_array = (double *) palloc(sizeof(double) * state->block_count);
-        match_indices = (int *) palloc(sizeof(int) * state->block_count);
-
-        for (i = 0; i < state->block_count; i++)
-        {
-            if (state->block_nulls[i * state->num_keys])
-                key_array[i] = inner_val + 1.0;
-            else
-                key_array[i] = DatumGetFloat8(
-                    state->block_keys[i * state->num_keys]);
-        }
-
-        nmatches = vjoin_compare_float8_block(key_array, state->block_count,
-                                              inner_val, match_indices);
-
-        for (i = 0; i < nmatches; i++)
-        {
-            if (state->result_count >= state->result_capacity)
-            {
-                state->result_capacity *= 2;
-                state->results = repalloc(state->results,
-                    sizeof(VJoinMatch) * state->result_capacity);
-                state->result_inner_tuples = repalloc(state->result_inner_tuples,
-                    sizeof(MinimalTuple) * state->result_capacity);
-            }
-            state->results[state->result_count].outer_idx = match_indices[i];
-            state->results[state->result_count].inner_idx = 0;
-            state->result_inner_tuples[state->result_count] = inner_mt;
-            state->result_count++;
-
-            if (state->block_matched)
-                state->block_matched[match_indices[i]] = true;
-        }
-
-        pfree(key_array);
-        pfree(match_indices);
         return;
     }
 
@@ -457,24 +417,7 @@ nl_compare_block(VJoinNestLoopState *state,
         }
 
         if (match)
-        {
-            if (state->result_count >= state->result_capacity)
-            {
-                state->result_capacity *= 2;
-                state->results = repalloc(state->results,
-                    sizeof(VJoinMatch) * state->result_capacity);
-                state->result_inner_tuples = repalloc(state->result_inner_tuples,
-                    sizeof(MinimalTuple) * state->result_capacity);
-            }
-            state->results[state->result_count].outer_idx = i;
-            state->results[state->result_count].inner_idx = 0;
-            state->result_inner_tuples[state->result_count] = inner_mt;
-            state->result_count++;
-
-            /* Mark outer matched for LEFT/FULL */
-            if (state->block_matched)
-                state->block_matched[i] = true;
-        }
+            nl_push_match(state, i, inner_mt);
     }
 }
 
@@ -496,7 +439,6 @@ nl_scan_inner(VJoinNestLoopState *state)
         Datum  inner_keys[VJOIN_MAX_KEYS];
         bool   inner_nulls[VJOIN_MAX_KEYS];
         int    k;
-        MinimalTuple inner_mt;
 
         MemoryContextSwitchTo(oldctx);
 
@@ -552,36 +494,23 @@ nl_scan_inner(VJoinNestLoopState *state)
                 continue;
         }
 
-        /* Copy inner tuple for result construction */
-        inner_mt = ExecCopySlotMinimalTuple(slot);
-
-        /* Track inner scan position for outer join */
+        /* Compare against outer block; defer inner MT copy until matched */
         {
             int cur_inner_idx = state->inner_scan_idx++;
+            int before = state->result_count;
 
-            /* Compare against outer block */
+            nl_compare_block(state, inner_keys, inner_nulls, NULL);
+
+            if (state->result_count > before)
             {
-                int before = state->result_count;
-                nl_compare_block(state, inner_keys, inner_nulls, inner_mt);
+                MinimalTuple inner_mt = ExecCopySlotMinimalTuple(slot);
+                int j;
+                for (j = before; j < state->result_count; j++)
+                    state->result_inner_tuples[j] = inner_mt;
 
                 /* Mark inner matched for RIGHT/FULL */
-                if (state->inner_matched && state->result_count > before)
-                {
-                    /* Grow inner_matched if needed */
-                    if (cur_inner_idx >= state->inner_match_count)
-                    {
-                        int new_cap = state->inner_match_count == 0 ?
-                                      256 : state->inner_match_count * 2;
-                        while (new_cap <= cur_inner_idx)
-                            new_cap *= 2;
-                        state->inner_matched = repalloc(state->inner_matched,
-                                                        sizeof(bool) * new_cap);
-                        memset(state->inner_matched + state->inner_match_count,
-                               0, sizeof(bool) * (new_cap - state->inner_match_count));
-                        state->inner_match_count = new_cap;
-                    }
-                    state->inner_matched[cur_inner_idx] = true;
-                }
+                if (state->inner_matched)
+                    nl_ensure_inner_matched(state, cur_inner_idx);
             }
         }
 
@@ -664,19 +593,11 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
     }
     state->block_tuples = palloc(sizeof(MinimalTuple) * state->block_size);
 
-    /* Pre-deformed outer values for theta scan */
-    if (state->num_keys == 0)
-    {
-        state->block_values = palloc(sizeof(Datum) * state->block_size *
-                                     state->num_outer_attrs);
-        state->block_isnull = palloc(sizeof(bool) * state->block_size *
-                                     state->num_outer_attrs);
-    }
-    else
-    {
-        state->block_values = NULL;
-        state->block_isnull = NULL;
-    }
+    /* Pre-deformed outer values (used for result formation and theta scan) */
+    state->block_values = palloc(sizeof(Datum) * state->block_size *
+                                 state->num_outer_attrs);
+    state->block_isnull = palloc(sizeof(bool) * state->block_size *
+                                 state->num_outer_attrs);
 
     /* Result buffer (only needed for equi-join key matching) */
     if (state->num_keys > 0)
@@ -709,6 +630,38 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
     state->use_simd = ((state->num_keys > 0) || (state->theta_strategy != 0)) &&
                        (vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
                         vjoin_simd_caps.has_neon);
+
+    /* Pre-allocated SIMD scratch for single-key equi-join comparison */
+    if (state->num_keys == 1 && state->use_simd)
+    {
+        size_t elem_size = 0;
+        Oid    ktype = state->key_types[0];
+
+        switch (ktype)
+        {
+            case INT4OID:  elem_size = sizeof(int32);  break;
+            case INT8OID:  elem_size = sizeof(int64);  break;
+            case FLOAT8OID: elem_size = sizeof(double); break;
+        }
+        if (elem_size > 0)
+        {
+            state->simd_typed_keys = palloc(elem_size * state->block_size);
+            state->simd_match_indices = palloc(sizeof(int) * state->block_size);
+            state->simd_key_type = ktype;
+        }
+        else
+        {
+            state->simd_typed_keys = NULL;
+            state->simd_match_indices = NULL;
+            state->simd_key_type = InvalidOid;
+        }
+    }
+    else
+    {
+        state->simd_typed_keys = NULL;
+        state->simd_match_indices = NULL;
+        state->simd_key_type = InvalidOid;
+    }
 
     /* Theta SIMD arrays */
     if (state->theta_strategy != 0)
@@ -903,9 +856,7 @@ vjoin_nestloop_exec(CustomScanState *node)
                         state->result_inner_tuples[state->result_pos];
                     state->result_pos++;
 
-                    result = nl_form_result(state,
-                                            state->block_tuples[oi],
-                                            inner_mt);
+                    result = nl_form_result(state, oi, inner_mt);
 
                     ResetExprContext(econtext);
                     econtext->ecxt_scantuple = result;
@@ -928,8 +879,7 @@ vjoin_nestloop_exec(CustomScanState *node)
                     int idx = state->right_emit_pos++;
                     if (!state->block_matched[idx])
                     {
-                        result = nl_form_result_left(state,
-                                                    state->block_tuples[idx]);
+                        result = nl_form_result_left(state, idx);
                         ResetExprContext(econtext);
                         econtext->ecxt_scantuple = result;
                         if (projInfo)
@@ -1027,26 +977,7 @@ vjoin_nestloop_exec(CustomScanState *node)
                         /* Mark inner matched for RIGHT/FULL if any matches */
                         if (state->inner_matched &&
                             state->theta_match_count > 0)
-                        {
-                            int ci = state->inner_scan_idx;
-                            if (ci >= state->inner_match_count)
-                            {
-                                int new_cap = state->inner_match_count == 0 ?
-                                              256 : state->inner_match_count * 2;
-                                while (new_cap <= ci)
-                                    new_cap *= 2;
-                                state->inner_matched = repalloc(
-                                    state->inner_matched,
-                                    sizeof(bool) * new_cap);
-                                memset(state->inner_matched +
-                                       state->inner_match_count,
-                                       0,
-                                       sizeof(bool) * (new_cap -
-                                           state->inner_match_count));
-                                state->inner_match_count = new_cap;
-                            }
-                            state->inner_matched[ci] = true;
-                        }
+                            nl_ensure_inner_matched(state, state->inner_scan_idx);
                         state->inner_scan_idx++;
                         /* All matches emitted, move to next inner */
                         state->theta_has_inner = false;
@@ -1200,24 +1131,7 @@ vjoin_nestloop_exec(CustomScanState *node)
 
                             /* Mark inner matched for RIGHT/FULL */
                             if (state->inner_matched)
-                            {
-                                int ci = state->inner_scan_idx;
-                                if (ci >= state->inner_match_count)
-                                {
-                                    int nc = state->inner_match_count == 0 ?
-                                             256 : state->inner_match_count * 2;
-                                    while (nc <= ci) nc *= 2;
-                                    state->inner_matched = repalloc(
-                                        state->inner_matched,
-                                        sizeof(bool) * nc);
-                                    memset(state->inner_matched +
-                                           state->inner_match_count, 0,
-                                           sizeof(bool) * (nc -
-                                               state->inner_match_count));
-                                    state->inner_match_count = nc;
-                                }
-                                state->inner_matched[ci] = true;
-                            }
+                                nl_ensure_inner_matched(state, state->inner_scan_idx);
 
                             if (projInfo)
                                 return ExecProject(projInfo);

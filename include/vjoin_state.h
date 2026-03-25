@@ -280,6 +280,11 @@ typedef struct VJoinNestLoopState
     int         theta_match_count;
     int         theta_match_pos;
 
+    /* Pre-allocated SIMD scratch for equi-join comparison */
+    void       *simd_typed_keys;     /* [block_size] typed outer key array */
+    int        *simd_match_indices;  /* [block_size] SIMD match scratch */
+    Oid         simd_key_type;       /* INT4/INT8/FLOAT8 or InvalidOid */
+
     /* Outer join support */
     JoinType    jointype;
     bool       *block_matched;      /* [block_size] — outer tuple matched? */
