@@ -1121,6 +1121,12 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     if (inner_rows < 64)
         inner_rows = 64;
     est_capacity = vjoin_next_power_of_2((int)(inner_rows * VJOIN_HT_LOAD_FACTOR * 2));
+    if ((Size) est_capacity > MaxAllocSize / sizeof(uint32) ||
+        (Size) est_capacity > MaxAllocSize / ((Size) sizeof(Datum) * state->num_inner_attrs) ||
+        (Size) est_capacity > MaxAllocSize / ((Size) sizeof(bool) * state->num_inner_attrs))
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("pg_vectorjoin: parallel vector hash table exceeds allocation limit")));
     pstate->est_inner_rows = (int) inner_rows;
     pstate->num_all_attrs = state->num_inner_attrs;
     pstate->num_keys = state->num_keys;

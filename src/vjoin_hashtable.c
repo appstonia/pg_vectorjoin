@@ -5,6 +5,22 @@
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 
+static void
+vjoin_hash_check_array_sizes(int capacity, int num_all_attrs)
+{
+    if (capacity <= 0 || num_all_attrs <= 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("pg_vectorjoin: invalid hash table dimensions")));
+
+    if ((Size) capacity > MaxAllocSize / sizeof(uint32) ||
+        (Size) capacity > MaxAllocSize / ((Size) sizeof(Datum) * num_all_attrs) ||
+        (Size) capacity > MaxAllocSize / ((Size) sizeof(bool) * num_all_attrs))
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("pg_vectorjoin: vector hash table exceeds allocation limit")));
+}
+
 VJoinHashTable *
 vjoin_ht_create(int estimated_rows, int num_keys, int num_all_attrs,
                 MemoryContext parent, AttrNumber *inner_keynos,
@@ -51,6 +67,7 @@ vjoin_ht_create(int estimated_rows, int num_keys, int num_all_attrs,
 
     /* Capacity = next power of 2 >= estimated_rows * load_factor */
     capacity = vjoin_next_power_of_2(Max(estimated_rows * VJOIN_HT_LOAD_FACTOR, 128));
+    vjoin_hash_check_array_sizes(capacity, num_all_attrs);
     ht->capacity = capacity;
     ht->mask = capacity - 1;
     ht->num_entries = 0;
@@ -167,6 +184,7 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                      errmsg("pg_vectorjoin: hash table capacity overflow")));
         new_cap = old_cap * 2;
+        vjoin_hash_check_array_sizes(new_cap, na);
 
         ht->capacity = new_cap;
         ht->mask = new_cap - 1;

@@ -11,11 +11,134 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/typcache.h"
 #include "vjoin_compat.h"
 #include "pg_vectorjoin.h"
 
 #include <math.h>
+
+#define VJOIN_HASH_PATH_BIAS       0.35
+#define VJOIN_MERGE_PATH_BIAS      0.40
+#define VJOIN_NESTLOOP_EQUI_BIAS   0.70
+#define VJOIN_NESTLOOP_THETA_BIAS  0.95
+#define VJOIN_NESTLOOP_EQUI_MAX_WORK 250000.0
+
+static void
+vjoin_apply_path_bias(CustomPath *cpath, double bias)
+{
+    cpath->path.startup_cost *= bias;
+    cpath->path.total_cost *= bias;
+
+    if (cpath->path.total_cost < cpath->path.startup_cost)
+        cpath->path.total_cost = cpath->path.startup_cost;
+}
+
+static double
+vjoin_nestloop_path_bias(int nkeys, int theta_strategy,
+                         double outer_rows, double inner_rows)
+{
+    if (nkeys == 0 || theta_strategy != 0)
+    {
+        if (outer_rows <= vjoin_batch_size &&
+            inner_rows <= vjoin_batch_size * 4)
+            return 0.75;
+
+        return VJOIN_NESTLOOP_THETA_BIAS;
+    }
+
+    if (outer_rows <= vjoin_batch_size || inner_rows <= vjoin_batch_size)
+        return 0.55;
+
+    return VJOIN_NESTLOOP_EQUI_BIAS;
+}
+
+static int
+vjoin_path_next_power_of_2(uint64 n)
+{
+    uint64 p = 1;
+
+    while (p < n)
+    {
+        if (p > (uint64) (INT_MAX / 2))
+            return 0;
+        p <<= 1;
+    }
+
+    return (int) p;
+}
+
+static bool
+vjoin_hash_allocation_fits(double inner_rows, int num_inner_attrs,
+                           bool parallel_build)
+{
+    uint64 target_rows;
+    int    capacity;
+
+    if (num_inner_attrs <= 0)
+        return false;
+
+    if (inner_rows < 64.0)
+        inner_rows = 64.0;
+
+    target_rows = (uint64) ceil(inner_rows) * VJOIN_HT_LOAD_FACTOR;
+    if (parallel_build)
+        target_rows *= 2;
+    if (target_rows < 128)
+        target_rows = 128;
+
+    capacity = vjoin_path_next_power_of_2(target_rows);
+    if (capacity <= 0)
+        return false;
+
+    if ((uint64) capacity > (uint64) MaxAllocSize / sizeof(uint32))
+        return false;
+    if ((uint64) capacity >
+        (uint64) MaxAllocSize / ((uint64) sizeof(Datum) * num_inner_attrs))
+        return false;
+    if ((uint64) capacity >
+        (uint64) MaxAllocSize / ((uint64) sizeof(bool) * num_inner_attrs))
+        return false;
+
+    return true;
+}
+
+static Node *
+vjoin_strip_key_expr(Node *node)
+{
+    node = strip_implicit_coercions(node);
+
+    for (;;)
+    {
+        if (node == NULL)
+            return NULL;
+
+        if (IsA(node, RelabelType))
+            node = (Node *) ((RelabelType *) node)->arg;
+        else if (IsA(node, CoerceViaIO))
+            node = (Node *) ((CoerceViaIO *) node)->arg;
+        else if (IsA(node, CollateExpr))
+            node = (Node *) ((CollateExpr *) node)->arg;
+        else
+            break;
+    }
+
+    return strip_implicit_coercions(node);
+}
+
+static bool
+vjoin_should_add_nestloop_path(int nkeys,
+                               int theta_strategy,
+                               double outer_rows,
+                               double inner_rows)
+{
+    if (nkeys > 0 && theta_strategy == 0 &&
+        (vjoin_enable_hashjoin || vjoin_enable_mergejoin) &&
+        outer_rows * inner_rows > VJOIN_NESTLOOP_EQUI_MAX_WORK)
+        return false;
+
+    return true;
+}
 
 /*
  * Check if a type is usable for vectorized hash join.
@@ -74,7 +197,9 @@ vjoin_analyze_clauses(List *restrictlist,
         RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
         OpExpr     *opexpr;
         Node       *left,
-                   *right;
+                   *right,
+                   *left_key,
+                   *right_key;
         Oid         keytype;
         Oid         hp, eo;
         TargetEntry *outer_tle,
@@ -96,12 +221,14 @@ vjoin_analyze_clauses(List *restrictlist,
 
         left = (Node *) linitial(opexpr->args);
         right = (Node *) lsecond(opexpr->args);
+        left_key = vjoin_strip_key_expr(left);
+        right_key = vjoin_strip_key_expr(right);
 
         /* Determine which side is outer vs inner */
-        if (!IsA(left, Var) || !IsA(right, Var))
+        if (!IsA(left_key, Var) || !IsA(right_key, Var))
             continue;
 
-        keytype = exprType(left);
+        keytype = exprType(left_key);
         if (!vjoin_type_has_hash_support(keytype, &hp, &eo))
             continue;
 
@@ -109,14 +236,14 @@ vjoin_analyze_clauses(List *restrictlist,
         if (bms_is_subset(rinfo->left_relids, outerrel->relids) &&
             bms_is_subset(rinfo->right_relids, innerrel->relids))
         {
-            outer_tle = tlist_member((Expr *) left, outer_tlist);
-            inner_tle = tlist_member((Expr *) right, inner_tlist);
+            outer_tle = tlist_member((Expr *) left_key, outer_tlist);
+            inner_tle = tlist_member((Expr *) right_key, inner_tlist);
         }
         else if (bms_is_subset(rinfo->right_relids, outerrel->relids) &&
                  bms_is_subset(rinfo->left_relids, innerrel->relids))
         {
-            outer_tle = tlist_member((Expr *) right, outer_tlist);
-            inner_tle = tlist_member((Expr *) left, inner_tlist);
+            outer_tle = tlist_member((Expr *) right_key, outer_tlist);
+            inner_tle = tlist_member((Expr *) left_key, inner_tlist);
         }
         else
             continue;
@@ -267,7 +394,7 @@ vjoin_analyze_theta_clause(List *restrictlist,
     {
         RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
         OpExpr       *opexpr;
-        Node         *left, *right;
+        Node         *left, *right, *left_key, *right_key;
         Oid           keytype;
         TargetEntry  *outer_tle, *inner_tle;
         TypeCacheEntry *typentry;
@@ -283,14 +410,16 @@ vjoin_analyze_theta_clause(List *restrictlist,
 
         left = (Node *) linitial(opexpr->args);
         right = (Node *) lsecond(opexpr->args);
-        if (!IsA(left, Var) || !IsA(right, Var))
+        left_key = vjoin_strip_key_expr(left);
+        right_key = vjoin_strip_key_expr(right);
+        if (!IsA(left_key, Var) || !IsA(right_key, Var))
             return 0;
 
         ntheta++;
         if (ntheta > 1)
             return 0;   /* multiple clauses — can't SIMD optimize */
 
-        keytype = exprType(left);
+        keytype = exprType(left_key);
         if (keytype != INT4OID && keytype != INT8OID && keytype != FLOAT8OID)
             return 0;
 
@@ -320,15 +449,15 @@ vjoin_analyze_theta_clause(List *restrictlist,
         if (bms_is_subset(rinfo->left_relids, outerrel->relids) &&
             bms_is_subset(rinfo->right_relids, innerrel->relids))
         {
-            outer_tle = tlist_member((Expr *) left, outer_tlist);
-            inner_tle = tlist_member((Expr *) right, inner_tlist);
+            outer_tle = tlist_member((Expr *) left_key, outer_tlist);
+            inner_tle = tlist_member((Expr *) right_key, inner_tlist);
             swapped = false;
         }
         else if (bms_is_subset(rinfo->right_relids, outerrel->relids) &&
                  bms_is_subset(rinfo->left_relids, innerrel->relids))
         {
-            outer_tle = tlist_member((Expr *) right, outer_tlist);
-            inner_tle = tlist_member((Expr *) left, inner_tlist);
+            outer_tle = tlist_member((Expr *) right_key, outer_tlist);
+            inner_tle = tlist_member((Expr *) left_key, inner_tlist);
             swapped = true;
         }
         else
@@ -388,12 +517,16 @@ vjoin_try_hashjoin(PlannerInfo *root,
                 run_cost;
     double      outer_rows,
                 inner_rows;
+    int         num_inner_attrs = list_length(innerrel->reltarget->exprs);
 
     /* --- Non-parallel path --- */
     if (outer_path != NULL && inner_path != NULL)
     {
         outer_rows = outer_path->rows;
         inner_rows = inner_path->rows;
+
+        if (!vjoin_hash_allocation_fits(inner_rows, num_inner_attrs, false))
+            return;
 
         startup_cost = inner_path->total_cost +
                        inner_rows * cpu_operator_cost * 2.0;
@@ -424,6 +557,7 @@ vjoin_try_hashjoin(PlannerInfo *root,
                                                     hash_procs, eq_oprs,
                                                     collations);
         cpath->methods = &vjoin_hash_path_methods;
+        vjoin_apply_path_bias(cpath, VJOIN_HASH_PATH_BIAS);
 
         add_path(joinrel, &cpath->path);
     }
@@ -489,6 +623,11 @@ vjoin_try_hashjoin(PlannerInfo *root,
             {
                 outer_rows = par_outer->rows;
 
+                if (!vjoin_hash_allocation_fits(par_inner->rows,
+                                                num_inner_attrs,
+                                                parallel_build))
+                    return;
+
                 if (parallel_build)
                 {
                     double nprocs = parallel_workers + 1.0;
@@ -540,6 +679,7 @@ vjoin_try_hashjoin(PlannerInfo *root,
                                                             hash_procs, eq_oprs,
                                                             collations);
                 cpath->methods = &vjoin_hash_path_methods;
+                vjoin_apply_path_bias(cpath, VJOIN_HASH_PATH_BIAS);
 
                 add_partial_path(joinrel, &cpath->path);
             }
@@ -576,7 +716,8 @@ vjoin_try_nestloop(PlannerInfo *root,
                 run_cost;
     double      outer_rows,
                 inner_rows,
-                num_blocks;
+                num_blocks,
+                bias;
     int         simd_width = (nkeys > 0 || theta_strategy != 0) ? 4 : 1;
 
     /* --- Non-parallel path --- */
@@ -585,6 +726,10 @@ vjoin_try_nestloop(PlannerInfo *root,
         outer_rows = outer_path->rows;
         inner_rows = inner_path->rows;
         num_blocks = ceil(outer_rows / vjoin_batch_size);
+
+        if (!vjoin_should_add_nestloop_path(nkeys, theta_strategy,
+                            outer_rows, inner_rows))
+            return;
 
         startup_cost = outer_path->startup_cost;
         run_cost = outer_path->total_cost - outer_path->startup_cost +
@@ -639,6 +784,9 @@ vjoin_try_nestloop(PlannerInfo *root,
             cpath->custom_private = lappend(cpath->custom_private, join_clauses);
         }
         cpath->methods = &vjoin_nestloop_path_methods;
+            bias = vjoin_nestloop_path_bias(nkeys, theta_strategy,
+                            outer_rows, inner_rows);
+            vjoin_apply_path_bias(cpath, bias);
 
         add_path(joinrel, &cpath->path);
     }
@@ -668,6 +816,10 @@ vjoin_try_nestloop(PlannerInfo *root,
         {
             outer_rows = par_outer->rows;
             inner_rows = par_inner->rows;
+
+            if (!vjoin_should_add_nestloop_path(nkeys, theta_strategy,
+                                                outer_rows, inner_rows))
+                return;
 
             num_blocks = ceil(outer_rows / vjoin_batch_size);
             parallel_workers = par_outer->parallel_workers;
@@ -730,6 +882,9 @@ vjoin_try_nestloop(PlannerInfo *root,
                 cpath->custom_private = lappend(cpath->custom_private, join_clauses);
             }
             cpath->methods = &vjoin_nestloop_path_methods;
+            bias = vjoin_nestloop_path_bias(nkeys, theta_strategy,
+                                            outer_rows, inner_rows);
+            vjoin_apply_path_bias(cpath, bias);
 
             add_partial_path(joinrel, &cpath->path);
         }
@@ -894,6 +1049,7 @@ vjoin_try_mergejoin(PlannerInfo *root,
                                                 hash_procs, eq_oprs,
                                                 collations);
     cpath->methods = &vjoin_merge_path_methods;
+    vjoin_apply_path_bias(cpath, VJOIN_MERGE_PATH_BIAS);
 
     add_path(joinrel, &cpath->path);
 
@@ -1058,6 +1214,7 @@ vjoin_try_mergejoin(PlannerInfo *root,
                                                          hash_procs, eq_oprs,
                                                          collations);
             pcpath->methods = &vjoin_merge_path_methods;
+            vjoin_apply_path_bias(pcpath, VJOIN_MERGE_PATH_BIAS);
 
             if (par_is_parallel)
                 add_partial_path(joinrel, &pcpath->path);
