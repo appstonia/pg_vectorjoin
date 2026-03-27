@@ -117,8 +117,6 @@ typedef enum VHJPhase
     VHJ_BUILD,
     VHJ_PROBE,
     VHJ_EMIT,
-    VHJ_LEFT_EMIT,
-    VHJ_RIGHT_EMIT,
     VHJ_DONE
 } VHJPhase;
 
@@ -202,8 +200,6 @@ typedef enum NLPhase
     NL_SCAN_INNER,
     NL_EMIT,
     NL_THETA_SCAN,
-    NL_LEFT_EMIT,
-    NL_RIGHT_EMIT,
     NL_DONE
 } NLPhase;
 
@@ -305,9 +301,6 @@ typedef enum VMJPhase
     VMJ_BATCH_FILL,
     VMJ_BATCH_MERGE,
     VMJ_BATCH_EMIT,
-    VMJ_BATCH_LEFT,
-    VMJ_LEFT_EMIT,
-    VMJ_RIGHT_EMIT,
     VMJ_DONE
 } VMJPhase;
 

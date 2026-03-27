@@ -1,70 +1,68 @@
--- Test outer joins across all strategies
--- Setup
-CREATE TEMP TABLE tn1(id int, val text);
-CREATE TEMP TABLE tn2(id int, val text);
-INSERT INTO tn1 VALUES (1,'a'),(NULL,'b'),(3,'c');
-INSERT INTO tn2 VALUES (1,'x'),(2,'y'),(NULL,'z');
-ANALYZE tn1; ANALYZE tn2;
+CREATE EXTENSION IF NOT EXISTS pg_vectorjoin;
 
--- Expected FULL JOIN result (5 rows):
--- (1,a,1,x)       -- match
--- (NULL,b,NULL,NULL) -- left unmatched (NULL key)
--- (3,c,NULL,NULL)  -- left unmatched
--- (NULL,NULL,2,y)  -- right unmatched
--- (NULL,NULL,NULL,z) -- right unmatched (NULL key)
+CREATE TEMP TABLE lj_outer(id int, payload text);
+CREATE TEMP TABLE lj_inner(id int, note text);
 
--- FULL JOIN via NL
-SET pg_vectorjoin.enable_hashjoin = off;
-SET pg_vectorjoin.enable_mergejoin = off;
-SET pg_vectorjoin.enable_nestloop = on;
-SELECT 'NL' as s, tn1.id t1, tn1.val v1, tn2.id t2, tn2.val v2
-FROM tn1 FULL JOIN tn2 ON tn1.id = tn2.id
-ORDER BY coalesce(tn1.id, tn2.id) NULLS LAST, tn1.val NULLS LAST, tn2.val NULLS LAST;
-RESET ALL;
+INSERT INTO lj_outer VALUES (1,'a'),(2,'b'),(3,'c'),(NULL,'n');
+INSERT INTO lj_inner VALUES (1,'x'),(4,'z'),(NULL,'skip');
 
--- FULL JOIN via Hash
+ANALYZE lj_outer;
+ANALYZE lj_inner;
+
+SET pg_vectorjoin.enable = on;
 SET pg_vectorjoin.enable_hashjoin = on;
 SET pg_vectorjoin.enable_mergejoin = off;
 SET pg_vectorjoin.enable_nestloop = off;
-SELECT 'Hash' as s, tn1.id t1, tn1.val v1, tn2.id t2, tn2.val v2
-FROM tn1 FULL JOIN tn2 ON tn1.id = tn2.id
-ORDER BY coalesce(tn1.id, tn2.id) NULLS LAST, tn1.val NULLS LAST, tn2.val NULLS LAST;
+SET pg_vectorjoin.cost_factor = 0.01;
+SET enable_hashjoin = on;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+
+-- Safe subset: project only outer columns, no anti-join filter.
+EXPLAIN (COSTS OFF)
+SELECT o.id, o.payload
+FROM lj_outer o
+LEFT JOIN lj_inner i ON o.id = i.id
+ORDER BY o.id NULLS LAST, o.payload;
+
+SELECT o.id, o.payload
+FROM lj_outer o
+LEFT JOIN lj_inner i ON o.id = i.id
+ORDER BY o.id NULLS LAST, o.payload;
+
+-- Anti-join pattern must still fall back to core PostgreSQL.
+EXPLAIN (COSTS OFF)
+SELECT o.id
+FROM lj_outer o
+LEFT JOIN lj_inner i ON o.id = i.id
+WHERE i.id IS NULL
+ORDER BY o.id NULLS LAST;
+
+SELECT o.id
+FROM lj_outer o
+LEFT JOIN lj_inner i ON o.id = i.id
+WHERE i.id IS NULL
+ORDER BY o.id NULLS LAST;
+
+-- Projecting nullable inner Vars must still fall back.
+EXPLAIN (COSTS OFF)
+SELECT o.id, i.note
+FROM lj_outer o
+LEFT JOIN lj_inner i ON o.id = i.id
+ORDER BY o.id NULLS LAST, i.note NULLS LAST;
+
+SELECT o.id, i.note
+FROM lj_outer o
+LEFT JOIN lj_inner i ON o.id = i.id
+ORDER BY o.id NULLS LAST, i.note NULLS LAST;
+
+-- FULL JOIN remains a core PostgreSQL plan.
+EXPLAIN (COSTS OFF)
+SELECT o.id, i.note
+FROM lj_outer o
+FULL JOIN lj_inner i ON o.id = i.id
+ORDER BY o.id NULLS LAST, i.note NULLS LAST;
+
 RESET ALL;
 
--- FULL JOIN via Merge
-SET pg_vectorjoin.enable_hashjoin = off;
-SET pg_vectorjoin.enable_mergejoin = on;
-SET pg_vectorjoin.enable_nestloop = off;
-SELECT 'Merge' as s, tn1.id t1, tn1.val v1, tn2.id t2, tn2.val v2
-FROM tn1 FULL JOIN tn2 ON tn1.id = tn2.id
-ORDER BY coalesce(tn1.id, tn2.id) NULLS LAST, tn1.val NULLS LAST, tn2.val NULLS LAST;
-RESET ALL;
-
--- Reference: PG native
-SET pg_vectorjoin.enable = off;
-SELECT 'PG' as s, tn1.id t1, tn1.val v1, tn2.id t2, tn2.val v2
-FROM tn1 FULL JOIN tn2 ON tn1.id = tn2.id
-ORDER BY coalesce(tn1.id, tn2.id) NULLS LAST, tn1.val NULLS LAST, tn2.val NULLS LAST;
-RESET ALL;
-
--- Test with duplicates
-CREATE TEMP TABLE td1(id int, val text);
-CREATE TEMP TABLE td2(id int, val text);
-INSERT INTO td1 VALUES (1,'a'),(1,'b'),(2,'c');
-INSERT INTO td2 VALUES (1,'x'),(1,'y'),(3,'z');
-ANALYZE td1; ANALYZE td2;
-
--- FULL JOIN with dups via NL
-SET pg_vectorjoin.enable_hashjoin = off;
-SET pg_vectorjoin.enable_mergejoin = off;
-SELECT 'NL-dup' as s, td1.id t1, td1.val v1, td2.id t2, td2.val v2
-FROM td1 FULL JOIN td2 ON td1.id = td2.id
-ORDER BY coalesce(td1.id, td2.id), td1.val, td2.val;
-RESET ALL;
-
--- Reference
-SET pg_vectorjoin.enable = off;
-SELECT 'PG-dup' as s, td1.id t1, td1.val v1, td2.id t2, td2.val v2
-FROM td1 FULL JOIN td2 ON td1.id = td2.id
-ORDER BY coalesce(td1.id, td2.id), td1.val, td2.val;
-RESET ALL;
+DROP EXTENSION pg_vectorjoin;

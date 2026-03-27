@@ -91,62 +91,6 @@ nl_form_result(VJoinNestLoopState *state, int outer_idx,
 }
 
 /*
- * Form result with outer values and NULL-filled inner (for LEFT/FULL).
- */
-static TupleTableSlot *
-nl_form_result_left(VJoinNestLoopState *state, int outer_idx)
-{
-    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-    int n_outer = state->num_outer_attrs;
-
-    ExecClearTuple(scan_slot);
-
-    memcpy(scan_slot->tts_values,
-           &state->block_values[outer_idx * n_outer],
-           n_outer * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull,
-           &state->block_isnull[outer_idx * n_outer],
-           n_outer * sizeof(bool));
-
-    memset(scan_slot->tts_values + n_outer,
-           0, state->num_inner_attrs * sizeof(Datum));
-    memset(scan_slot->tts_isnull + n_outer,
-           1, state->num_inner_attrs * sizeof(bool));
-
-    ExecStoreVirtualTuple(scan_slot);
-    return scan_slot;
-}
-
-/*
- * Form result with NULL-filled outer and inner values (for RIGHT/FULL).
- */
-static TupleTableSlot *
-nl_form_result_right(VJoinNestLoopState *state, MinimalTuple inner_mt)
-{
-    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-
-    ExecStoreMinimalTuple(inner_mt, state->inner_slot, false);
-    slot_getallattrs(state->inner_slot);
-
-    ExecClearTuple(scan_slot);
-
-    memset(scan_slot->tts_values, 0,
-           state->num_outer_attrs * sizeof(Datum));
-    memset(scan_slot->tts_isnull, 1,
-           state->num_outer_attrs * sizeof(bool));
-
-    memcpy(scan_slot->tts_values + state->num_outer_attrs,
-           state->inner_slot->tts_values,
-           state->num_inner_attrs * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
-           state->inner_slot->tts_isnull,
-           state->num_inner_attrs * sizeof(bool));
-
-    ExecStoreVirtualTuple(scan_slot);
-    return scan_slot;
-}
-
-/*
  * Load a block of outer tuples into the block buffer.
  * Returns the number of tuples loaded.
  */
@@ -711,22 +655,9 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
     state->theta_outer_pos = 0;
     state->phase = NL_LOAD_BLOCK;
 
-    /* Outer join tracking */
-    if (state->jointype == JOIN_LEFT || state->jointype == JOIN_FULL)
-        state->block_matched = palloc0(sizeof(bool) * state->block_size);
-    else
-        state->block_matched = NULL;
-
-    if (state->jointype == JOIN_RIGHT || state->jointype == JOIN_FULL)
-    {
-        state->inner_matched = palloc0(sizeof(bool) * 256);
-        state->inner_match_count = 256;
-    }
-    else
-    {
-        state->inner_matched = NULL;
-        state->inner_match_count = 0;
-    }
+    state->block_matched = NULL;
+    state->inner_matched = NULL;
+    state->inner_match_count = 0;
     state->inner_scan_idx = 0;
     state->right_emit_pos = 0;
 
@@ -754,36 +685,15 @@ vjoin_nestloop_exec(CustomScanState *node)
             case NL_LOAD_BLOCK:
                 if (state->outer_exhausted)
                 {
-                    if ((state->jointype == JOIN_RIGHT ||
-                         state->jointype == JOIN_FULL) &&
-                        state->inner_matched)
-                    {
-                        state->right_emit_pos = 0;
-                        state->phase = NL_RIGHT_EMIT;
-                    }
-                    else
-                        state->phase = NL_DONE;
+                    state->phase = NL_DONE;
                     continue;
                 }
 
                 if (nl_load_outer_block(state) == 0)
                 {
-                    if ((state->jointype == JOIN_RIGHT ||
-                         state->jointype == JOIN_FULL) &&
-                        state->inner_matched)
-                    {
-                        state->right_emit_pos = 0;
-                        state->phase = NL_RIGHT_EMIT;
-                    }
-                    else
-                        state->phase = NL_DONE;
+                    state->phase = NL_DONE;
                     continue;
                 }
-
-                /* Reset per-block matched tracking */
-                if (state->block_matched)
-                    memset(state->block_matched, 0,
-                           sizeof(bool) * state->block_count);
 
                 state->inner_exhausted = false;
                 state->inner_scan_idx = 0;
@@ -811,16 +721,7 @@ vjoin_nestloop_exec(CustomScanState *node)
 
                 if (state->inner_exhausted)
                 {
-                    /* This block done — check for unmatched left emit */
-                    if (state->block_matched &&
-                        (state->jointype == JOIN_LEFT ||
-                         state->jointype == JOIN_FULL))
-                    {
-                        state->right_emit_pos = 0;  /* reuse as left_emit_pos */
-                        state->phase = NL_LEFT_EMIT;
-                    }
-                    else
-                        state->phase = NL_LOAD_BLOCK;
+                    state->phase = NL_LOAD_BLOCK;
                     continue;
                 }
 
@@ -835,17 +736,7 @@ vjoin_nestloop_exec(CustomScanState *node)
                     state->result_pos = 0;
 
                     if (state->inner_exhausted)
-                    {
-                        if (state->block_matched &&
-                            (state->jointype == JOIN_LEFT ||
-                             state->jointype == JOIN_FULL))
-                        {
-                            state->right_emit_pos = 0;
-                            state->phase = NL_LEFT_EMIT;
-                        }
-                        else
-                            state->phase = NL_LOAD_BLOCK;
-                    }
+                        state->phase = NL_LOAD_BLOCK;
                     else
                         state->phase = NL_SCAN_INNER;
                     continue;
@@ -873,71 +764,6 @@ vjoin_nestloop_exec(CustomScanState *node)
             case NL_DONE:
                 return NULL;
 
-            case NL_LEFT_EMIT:
-                /* Emit unmatched outer tuples from current block with NULL inner */
-                while (state->right_emit_pos < state->block_count)
-                {
-                    int idx = state->right_emit_pos++;
-                    if (!state->block_matched[idx])
-                    {
-                        result = nl_form_result_left(state, idx);
-                        ResetExprContext(econtext);
-                        econtext->ecxt_scantuple = result;
-                        if (projInfo)
-                            return ExecProject(projInfo);
-                        return result;
-                    }
-                }
-                state->phase = NL_LOAD_BLOCK;
-                continue;
-
-            case NL_RIGHT_EMIT:
-                /* Emit unmatched inner tuples with NULL outer. */
-                if (state->inner_stored)
-                {
-                    /* Inner was materialized — scan through tuplestore */
-                    if (state->right_emit_pos == 0)
-                        tuplestore_rescan(state->inner_store);
-
-                    while (tuplestore_gettupleslot(state->inner_store,
-                                                  true, false,
-                                                  state->store_slot))
-                    {
-                        int idx = state->right_emit_pos++;
-                        if (idx >= state->inner_match_count ||
-                            !state->inner_matched[idx])
-                        {
-                            MinimalTuple mt =
-                                ExecCopySlotMinimalTuple(state->store_slot);
-                            result = nl_form_result_right(state, mt);
-                            ResetExprContext(econtext);
-                            econtext->ecxt_scantuple = result;
-                            if (projInfo)
-                                return ExecProject(projInfo);
-                            return result;
-                        }
-                    }
-                }
-                else
-                {
-                    /* Inner was never scanned (outer was empty).
-                     * Pull directly from child — all are unmatched. */
-                    TupleTableSlot *isl;
-                    while ((isl = ExecProcNode(state->inner_ps)) != NULL &&
-                           !TupIsNull(isl))
-                    {
-                        MinimalTuple mt = ExecCopySlotMinimalTuple(isl);
-                        result = nl_form_result_right(state, mt);
-                        ResetExprContext(econtext);
-                        econtext->ecxt_scantuple = result;
-                        if (projInfo)
-                            return ExecProject(projInfo);
-                        return result;
-                    }
-                }
-                state->phase = NL_DONE;
-                continue;
-
             case NL_THETA_SCAN:
             {
                 TupleTableSlot *scan_slot = node->ss.ss_ScanTupleSlot;
@@ -955,10 +781,6 @@ vjoin_nestloop_exec(CustomScanState *node)
                         {
                             int oi = state->theta_match_buf[state->theta_match_pos++];
 
-                            /* Mark outer matched for LEFT/FULL */
-                            if (state->block_matched)
-                                state->block_matched[oi] = true;
-
                             memcpy(scan_slot->tts_values,
                                    &state->block_values[oi * n_outer],
                                    n_outer * sizeof(Datum));
@@ -975,10 +797,6 @@ vjoin_nestloop_exec(CustomScanState *node)
                             return scan_slot;
                         }
 
-                        /* Mark inner matched for RIGHT/FULL if any matches */
-                        if (state->inner_matched &&
-                            state->theta_match_count > 0)
-                            nl_ensure_inner_matched(state, state->inner_scan_idx);
                         state->inner_scan_idx++;
                         /* All matches emitted, move to next inner */
                         state->theta_has_inner = false;
@@ -996,15 +814,7 @@ vjoin_nestloop_exec(CustomScanState *node)
                                                         state->store_slot))
                             {
                                 state->inner_exhausted = true;
-                                if (state->block_matched &&
-                                    (state->jointype == JOIN_LEFT ||
-                                     state->jointype == JOIN_FULL))
-                                {
-                                    state->right_emit_pos = 0;
-                                    state->phase = NL_LEFT_EMIT;
-                                }
-                                else
-                                    state->phase = NL_LOAD_BLOCK;
+                                state->phase = NL_LOAD_BLOCK;
                                 break;
                             }
                             isl = state->store_slot;
@@ -1016,15 +826,7 @@ vjoin_nestloop_exec(CustomScanState *node)
                             {
                                 state->inner_exhausted = true;
                                 state->inner_stored = true;
-                                if (state->block_matched &&
-                                    (state->jointype == JOIN_LEFT ||
-                                     state->jointype == JOIN_FULL))
-                                {
-                                    state->right_emit_pos = 0;
-                                    state->phase = NL_LEFT_EMIT;
-                                }
-                                else
-                                    state->phase = NL_LOAD_BLOCK;
+                                state->phase = NL_LOAD_BLOCK;
                                 break;
                             }
                             tuplestore_puttupleslot(state->inner_store, isl);
@@ -1126,14 +928,6 @@ vjoin_nestloop_exec(CustomScanState *node)
 
                         if (!qual || ExecQual(qual, econtext))
                         {
-                            /* Mark outer matched for LEFT/FULL */
-                            if (state->block_matched)
-                                state->block_matched[oi] = true;
-
-                            /* Mark inner matched for RIGHT/FULL */
-                            if (state->inner_matched)
-                                nl_ensure_inner_matched(state, state->inner_scan_idx);
-
                             if (projInfo)
                                 return ExecProject(projInfo);
                             return scan_slot;
@@ -1193,26 +987,13 @@ vjoin_nestloop_rescan(CustomScanState *node)
     state->inner_scan_idx = 0;
     state->right_emit_pos = 0;
 
-    /* Reset inner matched tracking */
-    if (state->inner_matched)
-        memset(state->inner_matched, 0,
-               sizeof(bool) * state->inner_match_count);
 }
 
 void
 vjoin_nestloop_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
     VJoinNestLoopState *state = (VJoinNestLoopState *) node;
-    const char *jt;
-
-    switch (state->jointype)
-    {
-        case JOIN_LEFT:  jt = "Left";  break;
-        case JOIN_RIGHT: jt = "Right"; break;
-        case JOIN_FULL:  jt = "Full";  break;
-        default:         jt = "Inner"; break;
-    }
-    ExplainPropertyText("Join Type", jt, es);
+    ExplainPropertyText("Join Type", "Inner", es);
     ExplainPropertyInteger("Block Size", NULL, state->block_size, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);
     if (state->num_keys == 0)

@@ -136,6 +136,86 @@ vjoin_analyze_clauses(List *restrictlist,
     return nkeys;
 }
 
+static bool
+vjoin_expr_references_inner(PlannerInfo *root, Node *node, Relids inner_relids)
+{
+    Bitmapset  *varnos;
+    bool        references_inner;
+
+    if (node == NULL)
+        return false;
+
+    varnos = pull_varnos(root, node);
+    references_inner = bms_overlap(varnos, inner_relids);
+    bms_free(varnos);
+
+    return references_inner;
+}
+
+static bool
+vjoin_is_left_join_anti_pattern(PlannerInfo *root,
+                                List *restrictlist,
+                                RelOptInfo *innerrel)
+{
+    ListCell   *lc;
+
+    foreach(lc, restrictlist)
+    {
+        RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+        if (IsA(rinfo->clause, NullTest))
+        {
+            NullTest *nt = (NullTest *) rinfo->clause;
+
+            if (nt->nulltesttype == IS_NULL &&
+                vjoin_expr_references_inner(root,
+                                            (Node *) nt->arg,
+                                            innerrel->relids))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+static bool
+vjoin_is_safe_left_join_subset(PlannerInfo *root,
+                               RelOptInfo *joinrel,
+                               RelOptInfo *innerrel,
+                               JoinPathExtraData *extra,
+                               int nkeys)
+{
+    ListCell   *lc;
+
+    /* Narrow initial subset: equi-join only, no anti-join shape. */
+    if (nkeys <= 0)
+        return false;
+    if (vjoin_is_left_join_anti_pattern(root, extra->restrictlist, innerrel))
+        return false;
+
+    /* Do not project nullable inner-side Vars yet. */
+    foreach(lc, joinrel->reltarget->exprs)
+    {
+        if (vjoin_expr_references_inner(root,
+                                        (Node *) lfirst(lc),
+                                        innerrel->relids))
+            return false;
+    }
+
+    /* Keep the subset to simple equi-join clauses only for now. */
+    foreach(lc, extra->restrictlist)
+    {
+        RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+        if (!IsA(rinfo->clause, OpExpr))
+            return false;
+        if (rinfo->hashjoinoperator == InvalidOid)
+            return false;
+    }
+
+    return true;
+}
+
 /*
  * Build custom_private list for serialization into the plan.
  * Format: [jointype, num_keys, outer_keyno1, inner_keyno1, keytype1,
@@ -349,15 +429,12 @@ vjoin_try_hashjoin(PlannerInfo *root,
     }
 
     /* --- Parallel path ---
-     * If inner has partial paths, all participants build concurrently
-     * using CAS-based lock-free insert (parallel build).
-     * Otherwise fall back to leader-only build.
-     * Only INNER/LEFT are safe: RIGHT/FULL need cross-worker
-     * inner_matched coordination, so they stay non-parallel for now.
-     *
+     * Only INNER joins are supported. If inner has partial paths,
+     * all participants build concurrently using CAS-based lock-free
+     * insert (parallel build). Otherwise fall back to leader-only build.
      * Require at least 2 workers so the DSM/barrier overhead is justified. */
     if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
-        (jointype == JOIN_INNER || jointype == JOIN_LEFT))
+        jointype == JOIN_INNER)
     {
         Path *par_outer = (Path *) linitial(outerrel->partial_pathlist);
         int   parallel_workers;
@@ -567,9 +644,9 @@ vjoin_try_nestloop(PlannerInfo *root,
     }
 
     /* --- Parallel path ---
-     * Only INNER/LEFT are safe for the same reason as hash join. */
+     * Only INNER joins are supported. */
     if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
-        (jointype == JOIN_INNER || jointype == JOIN_LEFT))
+        jointype == JOIN_INNER)
     {
         Path *par_outer = (Path *) linitial(outerrel->partial_pathlist);
         Path *par_inner = NULL;
@@ -821,7 +898,7 @@ vjoin_try_mergejoin(PlannerInfo *root,
     add_path(joinrel, &cpath->path);
 
     /* --- Parallel merge path ---
-     * Only INNER/LEFT: RIGHT/FULL need cross-worker inner tracking. */
+     * Only INNER joins are supported. */
     {
         Path       *par_outer = NULL;
         Path       *par_inner = NULL;
@@ -832,7 +909,7 @@ vjoin_try_mergejoin(PlannerInfo *root,
         double      par_outer_rows;
 
         if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
-            (jointype == JOIN_INNER || jointype == JOIN_LEFT))
+            jointype == JOIN_INNER)
         {
             par_outer = get_cheapest_path_for_pathkeys(
                                 outerrel->partial_pathlist,
@@ -1014,11 +1091,12 @@ vjoin_pathlist_hook(PlannerInfo *root,
         prev_join_pathlist_hook(root, joinrel, outerrel, innerrel,
                                 jointype, extra);
 
-    /* Supported join types */
-    if (jointype != JOIN_INNER &&
-        jointype != JOIN_LEFT &&
-        jointype != JOIN_FULL &&
-        jointype != JOIN_RIGHT)
+    /*
+     * During this cleanup branch we only execute INNER joins. LEFT join
+     * analysis remains here so we can codify the future re-enable checks,
+     * while still routing all non-INNER joins to core PostgreSQL.
+     */
+    if (jointype != JOIN_INNER && jointype != JOIN_LEFT)
         return;
     
     /* Master kill switch */
@@ -1065,6 +1143,26 @@ vjoin_pathlist_hook(PlannerInfo *root,
     }
 
     /* Hash join and merge join require at least one equality key */
+    if (jointype == JOIN_LEFT)
+    {
+        /*
+         * First re-enable point for LEFT joins:
+         * 1. reject LEFT JOIN ... WHERE inner_col IS NULL anti-join shapes
+         * 2. allow only a narrow subset that doesn't project nullable inner Vars
+         */
+        if (!vjoin_is_safe_left_join_subset(root, joinrel, innerrel, extra,
+                                            nkeys))
+            return;
+
+        if (vjoin_enable_hashjoin)
+            vjoin_try_hashjoin(root, joinrel, outerrel, innerrel, extra,
+                               jointype,
+                               nkeys, outer_keynos, inner_keynos, key_types,
+                               hash_procs, eq_oprs, collations);
+
+        return;
+    }
+
     if (nkeys > 0)
     {
         if (vjoin_enable_hashjoin)

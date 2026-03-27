@@ -14,7 +14,8 @@ DATA = pg_vectorjoin--1.0.sql
 PG_CPPFLAGS = -I$(srcdir)/include
 PG_CFLAGS = -O2
 
-REGRESS = basic
+REGRESS = basic outer_join_test
+REGRESS_OPTS = --inputdir=$(srcdir)/test
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

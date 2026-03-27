@@ -290,55 +290,6 @@ vmj_form_result(VectorMergeJoinState *state,
     return scan_slot;
 }
 
-/*
- * Form result using current outer child slot + NULL inner (LEFT/FULL).
- * Used in tuple-at-a-time path to avoid MinimalTuple copy.
- */
-static TupleTableSlot *
-vmj_form_result_left_slot(VectorMergeJoinState *state)
-{
-    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-    TupleTableSlot *os = state->outer_cur_slot;
-
-    slot_getallattrs(os);
-    ExecClearTuple(scan_slot);
-    memcpy(scan_slot->tts_values, os->tts_values,
-           state->num_outer_attrs * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull, os->tts_isnull,
-           state->num_outer_attrs * sizeof(bool));
-    memset(scan_slot->tts_values + state->num_outer_attrs,
-           0, state->num_inner_attrs * sizeof(Datum));
-    memset(scan_slot->tts_isnull + state->num_outer_attrs,
-           1, state->num_inner_attrs * sizeof(bool));
-    ExecStoreVirtualTuple(scan_slot);
-    return scan_slot;
-}
-
-/*
- * Form result using current inner child slot + NULL outer (RIGHT/FULL).
- */
-static TupleTableSlot *
-vmj_form_result_right_slot(VectorMergeJoinState *state)
-{
-    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-    TupleTableSlot *is = state->inner_cur_slot;
-
-    slot_getallattrs(is);
-    ExecClearTuple(scan_slot);
-    memset(scan_slot->tts_values, 0,
-           state->num_outer_attrs * sizeof(Datum));
-    memset(scan_slot->tts_isnull, 1,
-           state->num_outer_attrs * sizeof(bool));
-    memcpy(scan_slot->tts_values + state->num_outer_attrs,
-           is->tts_values,
-           state->num_inner_attrs * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull + state->num_outer_attrs,
-           is->tts_isnull,
-           state->num_inner_attrs * sizeof(bool));
-    ExecStoreVirtualTuple(scan_slot);
-    return scan_slot;
-}
-
 /* ================================================================
  *  Block merge join functions (vectorized batch mode)
  *
@@ -1205,33 +1156,6 @@ vmj_batch_do_merge(VectorMergeJoinState *state)
     vmj_batch_do_merge_generic(state);
 }
 
-/*
- * Form result with outer from batch arrays + NULL inner (LEFT JOIN).
- */
-static TupleTableSlot *
-vmj_batch_form_result_left(VectorMergeJoinState *state, int outer_idx)
-{
-    TupleTableSlot *scan_slot = state->css.ss.ss_ScanTupleSlot;
-    int outer_off = outer_idx * state->num_outer_attrs;
-
-    ExecClearTuple(scan_slot);
-
-    memcpy(scan_slot->tts_values,
-           &state->ob_values[outer_off],
-           state->num_outer_attrs * sizeof(Datum));
-    memcpy(scan_slot->tts_isnull,
-           &state->ob_isnull[outer_off],
-           state->num_outer_attrs * sizeof(bool));
-
-    memset(scan_slot->tts_values + state->num_outer_attrs,
-           0, state->num_inner_attrs * sizeof(Datum));
-    memset(scan_slot->tts_isnull + state->num_outer_attrs,
-           1, state->num_inner_attrs * sizeof(bool));
-
-    ExecStoreVirtualTuple(scan_slot);
-    return scan_slot;
-}
-
 /* ----------------------------------------------------------------
  * Executor callbacks
  * ---------------------------------------------------------------- */
@@ -1356,9 +1280,8 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
         }
     }
 
-    /* Allocate batch buffers for block merge (all_byval, INNER/LEFT) */
-    if (state->all_byval &&
-        (state->jointype == JOIN_INNER || state->jointype == JOIN_LEFT))
+    /* Allocate batch buffers for block merge (INNER only). */
+    if (state->all_byval && state->jointype == JOIN_INNER)
     {
         int bs = vjoin_batch_size;
 
@@ -1397,17 +1320,8 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
 
         state->batch_cp_oi = -1;
 
-        /* LEFT JOIN: allocate matched-tracking array */
-        if (state->jointype == JOIN_LEFT)
-        {
-            state->ob_matched = palloc0(sizeof(bool) * bs);
-            state->batch_left_pos = 0;
-        }
-        else
-        {
-            state->ob_matched = NULL;
-            state->batch_left_pos = 0;
-        }
+        state->ob_matched = NULL;
+        state->batch_left_pos = 0;
     }
     else
     {
@@ -1452,8 +1366,7 @@ vjoin_merge_exec(CustomScanState *node)
                     vmj_materialize_shared_inner(state);
 
                 if (state->all_byval && state->batch_size > 0 &&
-                    (state->jointype == JOIN_INNER ||
-                     state->jointype == JOIN_LEFT))
+                    state->jointype == JOIN_INNER)
                 {
                     /* Block merge mode: fill both blocks */
                     vmj_batch_fill_side(state, true);
@@ -1465,12 +1378,6 @@ vjoin_merge_exec(CustomScanState *node)
                     }
                     if (state->ib_count == 0)
                     {
-                        if (state->jointype == JOIN_LEFT)
-                        {
-                            /* No inner at all — all outers are unmatched */
-                            state->phase = VMJ_BATCH_LEFT;
-                            continue;
-                        }
                         state->phase = VMJ_DONE;
                         return NULL;
                     }
@@ -1480,28 +1387,11 @@ vjoin_merge_exec(CustomScanState *node)
                 /* Tuple-at-a-time path */
                 if (!vmj_fetch_outer(state))
                 {
-                    /* No outer tuples at all */
-                    if (state->jointype == JOIN_RIGHT ||
-                        state->jointype == JOIN_FULL)
-                    {
-                        if (vmj_fetch_inner(state))
-                        {
-                            state->phase = VMJ_RIGHT_EMIT;
-                            continue;
-                        }
-                    }
                     state->phase = VMJ_DONE;
                     return NULL;
                 }
                 if (!vmj_fetch_inner(state))
                 {
-                    /* No inner tuples — outer still pending */
-                    if (state->jointype == JOIN_LEFT ||
-                        state->jointype == JOIN_FULL)
-                    {
-                        state->phase = VMJ_LEFT_EMIT;
-                        continue;
-                    }
                     state->phase = VMJ_DONE;
                     return NULL;
                 }
@@ -1514,65 +1404,20 @@ vjoin_merge_exec(CustomScanState *node)
             {
                 int cmp;
 
-                /* Skip NULLs — they can never match in equijoin.
-                 * For LEFT/FULL, emit outer NULLs with NULL inner.
-                 * For RIGHT/FULL, emit inner NULLs with NULL outer. */
+                /* Skip NULLs — they can never match in equijoin. */
                 while (!state->outer_done && state->outer_null[0])
                 {
-                    if (state->jointype == JOIN_LEFT ||
-                        state->jointype == JOIN_FULL)
-                    {
-                        TupleTableSlot *result;
-                        state->outer_matched = false;
-                        result = vmj_form_result_left_slot(state);
-                        if (!vmj_fetch_outer(state))
-                            ;
-                        ResetExprContext(econtext);
-                        econtext->ecxt_scantuple = result;
-                        if (projInfo)
-                            return ExecProject(projInfo);
-                        return result;
-                    }
                     if (!vmj_fetch_outer(state))
                         break;
                 }
                 while (!state->inner_done && state->inner_null[0])
                 {
-                    if (state->jointype == JOIN_RIGHT ||
-                        state->jointype == JOIN_FULL)
-                    {
-                        TupleTableSlot *result;
-                        state->inner_matched = false;
-                        result = vmj_form_result_right_slot(state);
-                        if (!vmj_fetch_inner(state))
-                            ;
-                        ResetExprContext(econtext);
-                        econtext->ecxt_scantuple = result;
-                        if (projInfo)
-                            return ExecProject(projInfo);
-                        return result;
-                    }
                     if (!vmj_fetch_inner(state))
                         break;
                 }
 
                 if (state->outer_done || state->inner_done)
                 {
-                    /* Drain remaining side for outer joins */
-                    if (!state->outer_done &&
-                        (state->jointype == JOIN_LEFT ||
-                         state->jointype == JOIN_FULL))
-                    {
-                        state->phase = VMJ_LEFT_EMIT;
-                        continue;
-                    }
-                    if (!state->inner_done &&
-                        (state->jointype == JOIN_RIGHT ||
-                         state->jointype == JOIN_FULL))
-                    {
-                        state->phase = VMJ_RIGHT_EMIT;
-                        continue;
-                    }
                     state->phase = VMJ_DONE;
                     return NULL;
                 }
@@ -1580,97 +1425,20 @@ vjoin_merge_exec(CustomScanState *node)
                 cmp = vmj_compare_keys(state);
                 if (cmp < 0)
                 {
-                    /* outer < inner — advance outer */
-                    if ((state->jointype == JOIN_LEFT ||
-                         state->jointype == JOIN_FULL) &&
-                        !state->outer_matched)
-                    {
-                        /* Emit unmatched outer with NULL inner */
-                        TupleTableSlot *result;
-                        result = vmj_form_result_left_slot(state);
-                        state->outer_matched = false;
-                        if (!vmj_fetch_outer(state))
-                        {
-                            if (!state->inner_done &&
-                                (state->jointype == JOIN_RIGHT ||
-                                 state->jointype == JOIN_FULL))
-                            {
-                                ResetExprContext(econtext);
-                                econtext->ecxt_scantuple = result;
-                                /* Must emit this result, then go to RIGHT_EMIT */
-                                state->phase = VMJ_RIGHT_EMIT;
-                                if (projInfo)
-                                    return ExecProject(projInfo);
-                                return result;
-                            }
-                            state->phase = VMJ_DONE;
-                        }
-                        ResetExprContext(econtext);
-                        econtext->ecxt_scantuple = result;
-                        if (projInfo)
-                            return ExecProject(projInfo);
-                        return result;
-                    }
                     state->outer_matched = false;
                     if (!vmj_fetch_outer(state))
-                    {
-                        if (!state->inner_done &&
-                            (state->jointype == JOIN_RIGHT ||
-                             state->jointype == JOIN_FULL))
-                        {
-                            state->phase = VMJ_RIGHT_EMIT;
-                            continue;
-                        }
                         state->phase = VMJ_DONE;
+                    if (state->phase == VMJ_DONE)
                         return NULL;
-                    }
                     continue;
                 }
                 else if (cmp > 0)
                 {
-                    /* outer > inner — advance inner */
-                    if ((state->jointype == JOIN_RIGHT ||
-                         state->jointype == JOIN_FULL) &&
-                        !state->inner_matched)
-                    {
-                        /* Emit unmatched inner with NULL outer */
-                        TupleTableSlot *result;
-                        result = vmj_form_result_right_slot(state);
-                        state->inner_matched = false;
-                        if (!vmj_fetch_inner(state))
-                        {
-                            if (!state->outer_done &&
-                                (state->jointype == JOIN_LEFT ||
-                                 state->jointype == JOIN_FULL))
-                            {
-                                ResetExprContext(econtext);
-                                econtext->ecxt_scantuple = result;
-                                state->phase = VMJ_LEFT_EMIT;
-                                if (projInfo)
-                                    return ExecProject(projInfo);
-                                return result;
-                            }
-                            state->phase = VMJ_DONE;
-                        }
-                        ResetExprContext(econtext);
-                        econtext->ecxt_scantuple = result;
-                        if (projInfo)
-                            return ExecProject(projInfo);
-                        return result;
-                    }
                     state->inner_matched = false;
                     if (!vmj_fetch_inner(state))
-                    {
-                        if (!state->outer_done &&
-                            (state->jointype == JOIN_LEFT ||
-                             state->jointype == JOIN_FULL))
-                        {
-                            state->phase = VMJ_LEFT_EMIT;
-                            continue;
-                        }
                         state->phase = VMJ_DONE;
+                    if (state->phase == VMJ_DONE)
                         return NULL;
-                    }
                     continue;
                 }
                 else
@@ -1910,12 +1678,6 @@ vjoin_merge_exec(CustomScanState *node)
                  * or we stopped at a boundary-spanning group.
                  * For LEFT JOIN, emit unmatched outers before refilling.
                  */
-                if (state->ob_matched &&
-                    state->batch_left_pos < state->ob_pos)
-                {
-                    state->phase = VMJ_BATCH_LEFT;
-                    continue;
-                }
                 if (state->ob_pos >= state->ob_count)
                 {
                     if (state->ob_exhausted)
@@ -1935,23 +1697,12 @@ vjoin_merge_exec(CustomScanState *node)
                 {
                     if (state->ib_exhausted)
                     {
-                        /* Inner exhausted — remaining outers are unmatched */
-                        if (state->ob_matched)
-                        {
-                            state->phase = VMJ_BATCH_LEFT;
-                            continue;
-                        }
                         state->phase = VMJ_DONE;
                         return NULL;
                     }
                     vmj_fill_inner(state);
                     if (state->ib_count == 0)
                     {
-                        if (state->ob_matched)
-                        {
-                            state->phase = VMJ_BATCH_LEFT;
-                            continue;
-                        }
                         state->phase = VMJ_DONE;
                         return NULL;
                     }
@@ -1967,11 +1718,6 @@ vjoin_merge_exec(CustomScanState *node)
                     vmj_fill_inner(state);
                 if (state->ob_count == 0 || state->ib_count == 0)
                 {
-                    if (state->ob_matched && state->ob_count > 0)
-                    {
-                        state->phase = VMJ_BATCH_LEFT;
-                        continue;
-                    }
                     state->phase = VMJ_DONE;
                     return NULL;
                 }
@@ -2018,132 +1764,6 @@ vjoin_merge_exec(CustomScanState *node)
                         return ExecProject(projInfo);
                     return scan_slot;
                 }
-            }
-
-            case VMJ_BATCH_LEFT:
-            {
-                /*
-                 * LEFT JOIN batch: emit unmatched outer tuples with NULL inner.
-                 * Scans ob_matched[batch_left_pos .. limit) for false entries.
-                 * limit = ob_pos normally, or ob_count when inner is exhausted
-                 * (remaining outers past ob_pos can never match).
-                 */
-                TupleTableSlot *result;
-                int limit = state->ob_pos;
-
-                /* If inner is fully consumed, all remaining outers are unmatched */
-                if (state->ib_exhausted &&
-                    (state->ib_count == 0 || state->ib_pos >= state->ib_count))
-                    limit = state->ob_count;
-
-                while (state->batch_left_pos < limit)
-                {
-                    int idx = state->batch_left_pos++;
-                    if (!state->ob_matched[idx])
-                    {
-                        result = vmj_batch_form_result_left(state, idx);
-                        ResetExprContext(econtext);
-                        econtext->ecxt_scantuple = result;
-
-                        if (qual && !ExecQual(qual, econtext))
-                            continue;
-
-                        if (projInfo)
-                            return ExecProject(projInfo);
-                        return result;
-                    }
-                }
-
-                /*
-                 * All unmatched outers emitted for current range.
-                 * Continue with refill or finish.
-                 */
-                if (limit == state->ob_count)
-                {
-                    /* Whole block scanned — mark all as consumed before refill */
-                    state->ob_pos = state->ob_count;
-                    if (state->ob_exhausted)
-                    {
-                        state->phase = VMJ_DONE;
-                        return NULL;
-                    }
-                    vmj_batch_fill_side(state, true);
-                    if (state->ob_count == 0)
-                    {
-                        state->phase = VMJ_DONE;
-                        return NULL;
-                    }
-                    /* If inner is exhausted, stay in VMJ_BATCH_LEFT */
-                    if (state->ib_exhausted &&
-                        (state->ib_count == 0 || state->ib_pos >= state->ib_count))
-                        continue;
-                }
-                else if (state->ob_pos >= state->ob_count)
-                {
-                    /* Outer block consumed — refill */
-                    if (state->ob_exhausted)
-                    {
-                        state->phase = VMJ_DONE;
-                        return NULL;
-                    }
-                    vmj_batch_fill_side(state, true);
-                    if (state->ob_count == 0)
-                    {
-                        state->phase = VMJ_DONE;
-                        return NULL;
-                    }
-                }
-                state->phase = VMJ_BATCH_MERGE;
-                continue;
-            }
-
-            case VMJ_LEFT_EMIT:
-            {
-                /* Drain remaining outer tuples with NULL inner */
-                TupleTableSlot *result;
-
-                if (state->outer_done)
-                {
-                    if (!state->inner_done &&
-                        (state->jointype == JOIN_RIGHT ||
-                         state->jointype == JOIN_FULL))
-                    {
-                        state->phase = VMJ_RIGHT_EMIT;
-                        continue;
-                    }
-                    state->phase = VMJ_DONE;
-                    return NULL;
-                }
-
-                result = vmj_form_result_left_slot(state);
-                vmj_fetch_outer(state);
-
-                ResetExprContext(econtext);
-                econtext->ecxt_scantuple = result;
-                if (projInfo)
-                    return ExecProject(projInfo);
-                return result;
-            }
-
-            case VMJ_RIGHT_EMIT:
-            {
-                /* Drain remaining inner tuples with NULL outer */
-                TupleTableSlot *result;
-
-                if (state->inner_done)
-                {
-                    state->phase = VMJ_DONE;
-                    return NULL;
-                }
-
-                result = vmj_form_result_right_slot(state);
-                vmj_fetch_inner(state);
-
-                ResetExprContext(econtext);
-                econtext->ecxt_scantuple = result;
-                if (projInfo)
-                    return ExecProject(projInfo);
-                return result;
             }
 
             case VMJ_DONE:
@@ -2209,8 +1829,6 @@ vjoin_merge_rescan(CustomScanState *node)
     state->batch_result_pos = 0;
     state->batch_cp_oi = -1;
     state->batch_left_pos = 0;
-    if (state->ob_matched)
-        memset(state->ob_matched, 0, sizeof(bool) * state->batch_size);
 
     /* Restore scan_slot pointers if redirected by zero-copy emit */
     if (state->saved_tts_values)
@@ -2232,16 +1850,7 @@ void
 vjoin_merge_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
     VectorMergeJoinState *state = (VectorMergeJoinState *) node;
-    const char *jt;
-
-    switch (state->jointype)
-    {
-        case JOIN_LEFT:  jt = "Left";  break;
-        case JOIN_RIGHT: jt = "Right"; break;
-        case JOIN_FULL:  jt = "Full";  break;
-        default:         jt = "Inner"; break;
-    }
-    ExplainPropertyText("Join Type", jt, es);
+    ExplainPropertyText("Join Type", "Inner", es);
     ExplainPropertyInteger("Keys", NULL, state->num_keys, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);
     if (state->batch_size > 0)
