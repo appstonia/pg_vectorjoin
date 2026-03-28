@@ -1047,7 +1047,10 @@ vjoin_hash_rescan(CustomScanState *node)
     ExecReScan(state->outer_ps);
     /* Inner doesn't need rescan — hash table remains valid */
 
-    state->phase = VHJ_PROBE;
+    /* If hash table hasn't been built yet, preserve BUILD phase */
+    if (state->phase != VHJ_BUILD)
+        state->phase = VHJ_PROBE;
+
     state->batch_count = 0;
     state->result_count = 0;
     state->result_pos = 0;

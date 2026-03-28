@@ -5,6 +5,12 @@
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 
+/*
+ * Runtime guard: only enforce MaxAllocSize (palloc hard ceiling).
+ * work_mem is a planner-level preference enforced in vjoin_path.c;
+ * at runtime, row estimates may be off, so we allow the hash table
+ * to exceed work_mem — same behavior as native PostgreSQL hash join.
+ */
 static void
 vjoin_hash_check_array_sizes(int capacity, int num_all_attrs)
 {

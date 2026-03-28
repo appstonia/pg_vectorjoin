@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "access/stratnum.h"
+#include "catalog/pg_namespace_d.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -10,6 +11,8 @@
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
+#include "parser/parsetree.h"
+#include "miscadmin.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/typcache.h"
@@ -17,41 +20,6 @@
 #include "pg_vectorjoin.h"
 
 #include <math.h>
-
-#define VJOIN_HASH_PATH_BIAS       0.35
-#define VJOIN_MERGE_PATH_BIAS      0.40
-#define VJOIN_NESTLOOP_EQUI_BIAS   0.70
-#define VJOIN_NESTLOOP_THETA_BIAS  0.95
-#define VJOIN_NESTLOOP_EQUI_MAX_WORK 250000.0
-
-static void
-vjoin_apply_path_bias(CustomPath *cpath, double bias)
-{
-    cpath->path.startup_cost *= bias;
-    cpath->path.total_cost *= bias;
-
-    if (cpath->path.total_cost < cpath->path.startup_cost)
-        cpath->path.total_cost = cpath->path.startup_cost;
-}
-
-static double
-vjoin_nestloop_path_bias(int nkeys, int theta_strategy,
-                         double outer_rows, double inner_rows)
-{
-    if (nkeys == 0 || theta_strategy != 0)
-    {
-        if (outer_rows <= vjoin_batch_size &&
-            inner_rows <= vjoin_batch_size * 4)
-            return 0.75;
-
-        return VJOIN_NESTLOOP_THETA_BIAS;
-    }
-
-    if (outer_rows <= vjoin_batch_size || inner_rows <= vjoin_batch_size)
-        return 0.55;
-
-    return VJOIN_NESTLOOP_EQUI_BIAS;
-}
 
 static int
 vjoin_path_next_power_of_2(uint64 n)
@@ -68,12 +36,30 @@ vjoin_path_next_power_of_2(uint64 n)
     return (int) p;
 }
 
+/*
+ * Estimate whether the vector hash table for a given inner relation fits
+ * within PostgreSQL's hash memory budget (work_mem * hash_mem_multiplier).
+ *
+ * Unlike native hash join, vector hash join cannot batch to disk when the
+ * hash table exceeds memory.  We therefore apply a 2x safety margin to
+ * account for planner row-count estimation errors -- the hash path is only
+ * created when the estimated footprint is at most 50% of the budget.
+ *
+ * The vector hash table stores three flat arrays:
+ *   hashvals:   capacity * sizeof(uint32)
+ *   all_values: capacity * sizeof(Datum) * num_inner_attrs
+ *   all_isnull: capacity * sizeof(bool)  * num_inner_attrs
+ *
+ * Also enforces MaxAllocSize per-array as a hard ceiling.
+ */
 static bool
 vjoin_hash_allocation_fits(double inner_rows, int num_inner_attrs,
                            bool parallel_build)
 {
     uint64 target_rows;
     int    capacity;
+    uint64 total_bytes;
+    uint64 hash_mem_limit;
 
     if (num_inner_attrs <= 0)
         return false;
@@ -91,6 +77,7 @@ vjoin_hash_allocation_fits(double inner_rows, int num_inner_attrs,
     if (capacity <= 0)
         return false;
 
+    /* Per-array MaxAllocSize hard ceiling (palloc limit) */
     if ((uint64) capacity > (uint64) MaxAllocSize / sizeof(uint32))
         return false;
     if ((uint64) capacity >
@@ -100,7 +87,34 @@ vjoin_hash_allocation_fits(double inner_rows, int num_inner_attrs,
         (uint64) MaxAllocSize / ((uint64) sizeof(bool) * num_inner_attrs))
         return false;
 
+    /* Total memory footprint vs work_mem budget.
+     * Apply 2x safety margin: vector hash join cannot batch to disk,
+     * so we must leave headroom for planner estimation errors. */
+    total_bytes = (uint64) capacity * sizeof(uint32) +
+                  (uint64) capacity * sizeof(Datum) * num_inner_attrs +
+                  (uint64) capacity * sizeof(bool)  * num_inner_attrs;
+
+    hash_mem_limit = (uint64)((double) work_mem * hash_mem_multiplier * 1024.0);
+
+    if (total_bytes * 2 > hash_mem_limit)
+        return false;
+
     return true;
+}
+
+static int
+vjoin_path_num_attrs(Path *path, RelOptInfo *rel)
+{
+    PathTarget *target = NULL;
+
+    if (path != NULL)
+        target = path->pathtarget;
+    if (target == NULL && rel != NULL)
+        target = rel->reltarget;
+    if (target == NULL)
+        return 0;
+
+    return list_length(target->exprs);
 }
 
 static Node *
@@ -127,15 +141,24 @@ vjoin_strip_key_expr(Node *node)
 }
 
 static bool
-vjoin_should_add_nestloop_path(int nkeys,
-                               int theta_strategy,
-                               double outer_rows,
-                               double inner_rows)
+vjoin_relids_are_supported(PlannerInfo *root, Relids relids)
 {
-    if (nkeys > 0 && theta_strategy == 0 &&
-        (vjoin_enable_hashjoin || vjoin_enable_mergejoin) &&
-        outer_rows * inner_rows > VJOIN_NESTLOOP_EQUI_MAX_WORK)
-        return false;
+    int relid = -1;
+
+    while ((relid = bms_next_member(relids, relid)) >= 0)
+    {
+        RangeTblEntry *rte = planner_rt_fetch(relid, root);
+
+        if (rte == NULL)
+            return false;
+
+        if (rte->rtekind != RTE_RELATION)
+            return false;
+
+        if (OidIsValid(rte->relid) &&
+            get_rel_namespace(rte->relid) == PG_CATALOG_NAMESPACE)
+            return false;
+    }
 
     return true;
 }
@@ -517,21 +540,30 @@ vjoin_try_hashjoin(PlannerInfo *root,
                 run_cost;
     double      outer_rows,
                 inner_rows;
-    int         num_inner_attrs = list_length(innerrel->reltarget->exprs);
 
     /* --- Non-parallel path --- */
     if (outer_path != NULL && inner_path != NULL)
     {
+        int num_inner_attrs = vjoin_path_num_attrs(inner_path, innerrel);
+
         outer_rows = outer_path->rows;
         inner_rows = inner_path->rows;
 
+        /*
+         * For base relations, cross-check with pg_class.reltuples.
+         * Planner estimates can severely undercount after join selectivity;
+         * reltuples is the physical reality.  Use the larger of the two.
+         */
+        if (innerrel->tuples > 0 && innerrel->tuples > inner_rows)
+            inner_rows = innerrel->tuples;
+
         if (!vjoin_hash_allocation_fits(inner_rows, num_inner_attrs, false))
-            return;
+            goto try_parallel_hash;
 
         startup_cost = inner_path->total_cost +
-                       inner_rows * cpu_operator_cost * 2.0;
+                       inner_rows * cpu_operator_cost * vjoin_cost_factor;
         run_cost = outer_path->total_cost +
-                   outer_rows * cpu_operator_cost * 2.0 * vjoin_cost_factor;
+                   outer_rows * cpu_operator_cost * vjoin_cost_factor;
 
         cpath = makeNode(CustomPath);
         cpath->path.pathtype = T_CustomScan;
@@ -557,10 +589,11 @@ vjoin_try_hashjoin(PlannerInfo *root,
                                                     hash_procs, eq_oprs,
                                                     collations);
         cpath->methods = &vjoin_hash_path_methods;
-        vjoin_apply_path_bias(cpath, VJOIN_HASH_PATH_BIAS);
 
         add_path(joinrel, &cpath->path);
     }
+
+try_parallel_hash:
 
     /* --- Parallel path ---
      * Only INNER joins are supported. If inner has partial paths,
@@ -621,67 +654,66 @@ vjoin_try_hashjoin(PlannerInfo *root,
 
             if (par_inner != NULL)
             {
+                int num_inner_attrs = vjoin_path_num_attrs(par_inner, innerrel);
+                double par_inner_rows = par_inner->rows;
+
+                if (innerrel->tuples > 0 && innerrel->tuples > par_inner_rows)
+                    par_inner_rows = innerrel->tuples;
+
                 outer_rows = par_outer->rows;
 
-                if (!vjoin_hash_allocation_fits(par_inner->rows,
-                                                num_inner_attrs,
-                                                parallel_build))
-                    return;
-
-                if (parallel_build)
+                if (vjoin_hash_allocation_fits(par_inner_rows,
+                                               num_inner_attrs,
+                                               parallel_build))
                 {
-                    double nprocs = parallel_workers + 1.0;
+                    if (parallel_build)
+                    {
+                        startup_cost = par_inner->total_cost +
+                                       par_inner->rows * cpu_operator_cost * vjoin_cost_factor;
 
-                    startup_cost = par_inner->total_cost +
-                                   par_inner->rows * cpu_operator_cost * 2.0;
+                        /* par_outer is a partial path: cost is already per-worker */
+                        run_cost = par_outer->total_cost +
+                                   outer_rows * cpu_operator_cost * vjoin_cost_factor;
+                    }
+                    else
+                    {
+                        inner_rows = par_inner->rows;
+                        startup_cost = par_inner->total_cost +
+                                       inner_rows * cpu_operator_cost * vjoin_cost_factor;
 
-                    run_cost = par_outer->total_cost +
-                               outer_rows * cpu_operator_cost * 2.0 *
-                               vjoin_cost_factor;
-                    run_cost /= nprocs;
-                }
-                else
-                {
-                    double nprocs = parallel_workers + 1.0;
+                        /* par_outer is a partial path: cost is already per-worker */
+                        run_cost = par_outer->total_cost +
+                                   outer_rows * cpu_operator_cost * vjoin_cost_factor;
+                    }
 
-                    inner_rows = par_inner->rows;
-                    startup_cost = par_inner->total_cost +
-                                   inner_rows * cpu_operator_cost * 2.0;
-
-                    run_cost = par_outer->total_cost +
-                               outer_rows * cpu_operator_cost * 2.0 *
-                               vjoin_cost_factor;
-                    run_cost /= nprocs;
-                }
-
-                cpath = makeNode(CustomPath);
-                cpath->path.pathtype = T_CustomScan;
-                cpath->path.parent = joinrel;
-                cpath->path.pathtarget = joinrel->reltarget;
-                cpath->path.param_info = NULL;
-                cpath->path.parallel_aware = true;
-                cpath->path.parallel_safe = true;
-                cpath->path.parallel_workers = parallel_workers;
-                cpath->path.rows = clamp_row_est(joinrel->rows /
-                                                  parallel_workers);
-                cpath->path.startup_cost = startup_cost;
-                cpath->path.total_cost = startup_cost + run_cost;
-                cpath->path.pathkeys = NIL;
-                cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-                cpath->custom_paths = list_make2(par_outer, par_inner);
+                    cpath = makeNode(CustomPath);
+                    cpath->path.pathtype = T_CustomScan;
+                    cpath->path.parent = joinrel;
+                    cpath->path.pathtarget = joinrel->reltarget;
+                    cpath->path.param_info = NULL;
+                    cpath->path.parallel_aware = true;
+                    cpath->path.parallel_safe = true;
+                    cpath->path.parallel_workers = parallel_workers;
+                    cpath->path.rows = clamp_row_est(joinrel->rows /
+                                                      parallel_workers);
+                    cpath->path.startup_cost = startup_cost;
+                    cpath->path.total_cost = startup_cost + run_cost;
+                    cpath->path.pathkeys = NIL;
+                    cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+                    cpath->custom_paths = list_make2(par_outer, par_inner);
 #if VJOIN_HAS_CUSTOM_RESTRICTINFO
-                cpath->custom_restrictinfo = extra->restrictlist;
+                    cpath->custom_restrictinfo = extra->restrictlist;
 #endif
-                cpath->custom_private = vjoin_build_private(jointype, nkeys,
-                                                            outer_keynos,
-                                                            inner_keynos,
-                                                            key_types,
-                                                            hash_procs, eq_oprs,
-                                                            collations);
-                cpath->methods = &vjoin_hash_path_methods;
-                vjoin_apply_path_bias(cpath, VJOIN_HASH_PATH_BIAS);
+                    cpath->custom_private = vjoin_build_private(jointype, nkeys,
+                                                                outer_keynos,
+                                                                inner_keynos,
+                                                                key_types,
+                                                                hash_procs, eq_oprs,
+                                                                collations);
+                    cpath->methods = &vjoin_hash_path_methods;
 
-                add_partial_path(joinrel, &cpath->path);
+                    add_partial_path(joinrel, &cpath->path);
+                }
             }
         }
     }
@@ -716,8 +748,7 @@ vjoin_try_nestloop(PlannerInfo *root,
                 run_cost;
     double      outer_rows,
                 inner_rows,
-                num_blocks,
-                bias;
+                num_blocks;
     int         simd_width = (nkeys > 0 || theta_strategy != 0) ? 4 : 1;
 
     /* --- Non-parallel path --- */
@@ -727,15 +758,10 @@ vjoin_try_nestloop(PlannerInfo *root,
         inner_rows = inner_path->rows;
         num_blocks = ceil(outer_rows / vjoin_batch_size);
 
-        if (!vjoin_should_add_nestloop_path(nkeys, theta_strategy,
-                            outer_rows, inner_rows))
-            return;
-
         startup_cost = outer_path->startup_cost;
         run_cost = outer_path->total_cost - outer_path->startup_cost +
                    num_blocks * inner_path->total_cost +
-                   outer_rows * inner_rows * cpu_operator_cost *
-                   vjoin_cost_factor / simd_width;
+                   outer_rows * inner_rows * cpu_operator_cost / simd_width * vjoin_cost_factor;
 
         cpath = makeNode(CustomPath);
         cpath->path.pathtype = T_CustomScan;
@@ -784,9 +810,6 @@ vjoin_try_nestloop(PlannerInfo *root,
             cpath->custom_private = lappend(cpath->custom_private, join_clauses);
         }
         cpath->methods = &vjoin_nestloop_path_methods;
-            bias = vjoin_nestloop_path_bias(nkeys, theta_strategy,
-                            outer_rows, inner_rows);
-            vjoin_apply_path_bias(cpath, bias);
 
         add_path(joinrel, &cpath->path);
     }
@@ -817,10 +840,6 @@ vjoin_try_nestloop(PlannerInfo *root,
             outer_rows = par_outer->rows;
             inner_rows = par_inner->rows;
 
-            if (!vjoin_should_add_nestloop_path(nkeys, theta_strategy,
-                                                outer_rows, inner_rows))
-                return;
-
             num_blocks = ceil(outer_rows / vjoin_batch_size);
             parallel_workers = par_outer->parallel_workers;
             if (parallel_workers <= 0)
@@ -829,8 +848,7 @@ vjoin_try_nestloop(PlannerInfo *root,
             startup_cost = par_outer->startup_cost;
             run_cost = par_outer->total_cost - par_outer->startup_cost +
                        num_blocks * par_inner->total_cost +
-                       outer_rows * inner_rows * cpu_operator_cost *
-                       vjoin_cost_factor / simd_width;
+                       outer_rows * inner_rows * cpu_operator_cost / simd_width * vjoin_cost_factor;
 
             /* Gather tuple-queue overhead */
             run_cost += clamp_row_est(joinrel->rows / parallel_workers) *
@@ -882,9 +900,6 @@ vjoin_try_nestloop(PlannerInfo *root,
                 cpath->custom_private = lappend(cpath->custom_private, join_clauses);
             }
             cpath->methods = &vjoin_nestloop_path_methods;
-            bias = vjoin_nestloop_path_bias(nkeys, theta_strategy,
-                                            outer_rows, inner_rows);
-            vjoin_apply_path_bias(cpath, bias);
 
             add_partial_path(joinrel, &cpath->path);
         }
@@ -1017,12 +1032,12 @@ vjoin_try_mergejoin(PlannerInfo *root,
     /*
      * Cost model: linear merge of two sorted streams.
      * Vectorized batch processing reduces per-tuple overhead significantly.
-     * Apply cost_factor to the join processing portion (not child scan costs).
+     * cost_factor scales the join comparison overhead only (not child scan costs).
      */
     startup_cost = outer_path->startup_cost + inner_path->startup_cost;
     run_cost = (outer_path->total_cost - outer_path->startup_cost) +
                (inner_path->total_cost - inner_path->startup_cost) +
-               (outer_rows + inner_rows) * cpu_operator_cost * vjoin_cost_factor / 4.0;
+               (outer_rows + inner_rows) * cpu_operator_cost * vjoin_cost_factor;
 
     cpath = makeNode(CustomPath);
     cpath->path.pathtype = T_CustomScan;
@@ -1049,7 +1064,6 @@ vjoin_try_mergejoin(PlannerInfo *root,
                                                 hash_procs, eq_oprs,
                                                 collations);
     cpath->methods = &vjoin_merge_path_methods;
-    vjoin_apply_path_bias(cpath, VJOIN_MERGE_PATH_BIAS);
 
     add_path(joinrel, &cpath->path);
 
@@ -1164,14 +1178,14 @@ vjoin_try_mergejoin(PlannerInfo *root,
                           (par_inner->total_cost - par_inner->startup_cost) +
                           par_inner->rows * cpu_tuple_cost * 0.5 +
                           (par_outer_rows + par_inner->rows) *
-                          cpu_operator_cost * vjoin_cost_factor / 4.0;
+                          cpu_operator_cost * vjoin_cost_factor;
             }
             else
             {
                 par_run = (par_outer->total_cost - par_outer->startup_cost) +
                           (par_inner->total_cost - par_inner->startup_cost) +
                           (par_outer_rows + par_inner->rows) *
-                          cpu_operator_cost * vjoin_cost_factor / 4.0;
+                          cpu_operator_cost * vjoin_cost_factor;
             }
 
             /* Gather tuple-queue overhead (parallel paths only) */
@@ -1214,7 +1228,6 @@ vjoin_try_mergejoin(PlannerInfo *root,
                                                          hash_procs, eq_oprs,
                                                          collations);
             pcpath->methods = &vjoin_merge_path_methods;
-            vjoin_apply_path_bias(pcpath, VJOIN_MERGE_PATH_BIAS);
 
             if (par_is_parallel)
                 add_partial_path(joinrel, &pcpath->path);
@@ -1263,6 +1276,17 @@ vjoin_pathlist_hook(PlannerInfo *root,
     /* We need cheapest paths */
     if (outerrel->cheapest_total_path == NULL ||
         innerrel->cheapest_total_path == NULL)
+        return;
+
+    /*
+     * Keep vector joins away from system-catalog and non-relation RTEs.
+     * Metadata/introspection queries often use function RTEs (for example
+     * unnest(...)) and catalog tables with plan shapes this executor does not
+     * support safely yet.
+     */
+    
+    if (!vjoin_relids_are_supported(root, outerrel->relids) ||
+        !vjoin_relids_are_supported(root, innerrel->relids))
         return;
 
     /* Build temporary targetlists from PathTarget exprs for key matching */
