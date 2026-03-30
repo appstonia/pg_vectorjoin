@@ -574,9 +574,9 @@ vjoin_try_hashjoin(PlannerInfo *root,
             goto try_parallel_hash;
 
         startup_cost = inner_path->total_cost +
-                       inner_rows * cpu_operator_cost * vjoin_cost_factor;
+                       inner_rows * (cpu_tuple_cost + cpu_operator_cost) * vjoin_cost_factor;
         run_cost = outer_path->total_cost +
-                   outer_rows * cpu_operator_cost * vjoin_cost_factor;
+                   outer_rows * (cpu_tuple_cost + cpu_operator_cost) * vjoin_cost_factor;
 
         cpath = makeNode(CustomPath);
         cpath->path.pathtype = T_CustomScan;
@@ -682,21 +682,21 @@ try_parallel_hash:
                     if (parallel_build)
                     {
                         startup_cost = par_inner->total_cost +
-                                       par_inner->rows * cpu_operator_cost * vjoin_cost_factor;
+                                       par_inner->rows * (cpu_tuple_cost + cpu_operator_cost) * vjoin_cost_factor;
 
                         /* par_outer is a partial path: cost is already per-worker */
                         run_cost = par_outer->total_cost +
-                                   outer_rows * cpu_operator_cost * vjoin_cost_factor;
+                                   outer_rows * (cpu_tuple_cost + cpu_operator_cost) * vjoin_cost_factor;
                     }
                     else
                     {
                         inner_rows = par_inner->rows;
                         startup_cost = par_inner->total_cost +
-                                       inner_rows * cpu_operator_cost * vjoin_cost_factor;
+                                       inner_rows * (cpu_tuple_cost + cpu_operator_cost) * vjoin_cost_factor;
 
                         /* par_outer is a partial path: cost is already per-worker */
                         run_cost = par_outer->total_cost +
-                                   outer_rows * cpu_operator_cost * vjoin_cost_factor;
+                                   outer_rows * (cpu_tuple_cost + cpu_operator_cost) * vjoin_cost_factor;
                     }
 
                     cpath = makeNode(CustomPath);
@@ -1089,7 +1089,7 @@ vjoin_try_mergejoin(PlannerInfo *root,
     startup_cost = outer_path->startup_cost + inner_path->startup_cost;
     run_cost = (outer_path->total_cost - outer_path->startup_cost) +
                (inner_path->total_cost - inner_path->startup_cost) +
-               (outer_rows + inner_rows) * cpu_operator_cost * vjoin_cost_factor;
+               (outer_rows + inner_rows) * (cpu_tuple_cost + cpu_operator_cost) * vjoin_cost_factor;
 
     cpath = makeNode(CustomPath);
     cpath->path.pathtype = T_CustomScan;
@@ -1230,14 +1230,14 @@ vjoin_try_mergejoin(PlannerInfo *root,
                           (par_inner->total_cost - par_inner->startup_cost) +
                           par_inner->rows * cpu_tuple_cost * 0.5 +
                           (par_outer_rows + par_inner->rows) *
-                          cpu_operator_cost * vjoin_cost_factor;
+                          (cpu_tuple_cost + cpu_operator_cost) * vjoin_cost_factor;
             }
             else
             {
                 par_run = (par_outer->total_cost - par_outer->startup_cost) +
                           (par_inner->total_cost - par_inner->startup_cost) +
                           (par_outer_rows + par_inner->rows) *
-                          cpu_operator_cost * vjoin_cost_factor;
+                          (cpu_tuple_cost + cpu_operator_cost) * vjoin_cost_factor;
             }
 
             /* Gather tuple-queue overhead (parallel paths only) */
