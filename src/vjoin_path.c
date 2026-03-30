@@ -540,6 +540,19 @@ vjoin_try_hashjoin(PlannerInfo *root,
                 run_cost;
     double      outer_rows,
                 inner_rows;
+    int         i;
+
+    /*
+     * Vector hash join only benefits from SIMD on numeric types.
+     * For text/generic keys the per-tuple overhead (batch deform, fmgr hash/eq)
+     * is higher than native hash join with no batching advantage, and VHJ
+     * cannot spill to disk.  Reject if any key is non-numeric.
+     */
+    for (i = 0; i < nkeys; i++)
+    {
+        if (!vjoin_is_fast_type(key_types[i]))
+            return;
+    }
 
     /* --- Non-parallel path --- */
     if (outer_path != NULL && inner_path != NULL)
@@ -749,7 +762,19 @@ vjoin_try_nestloop(PlannerInfo *root,
     double      outer_rows,
                 inner_rows,
                 num_blocks;
-    int         simd_width = (nkeys > 0 || theta_strategy != 0) ? 4 : 1;
+    int         simd_width;
+
+    /*
+     * SIMD width for cost model: only single-key numeric equi-join or
+     * theta-join (always numeric) gets the 4-wide SIMD benefit.
+     * Multi-key or text keys fall back to scalar comparison.
+     */
+    if (theta_strategy != 0)
+        simd_width = 4;    /* theta SIMD — always numeric */
+    else if (nkeys == 1 && vjoin_is_fast_type(key_types[0]))
+        simd_width = 4;    /* single numeric key — true SIMD */
+    else
+        simd_width = 1;    /* multi-key or text — scalar fallback */
 
     /* --- Non-parallel path --- */
     if (outer_path != NULL && inner_path != NULL)
@@ -937,6 +962,18 @@ vjoin_try_mergejoin(PlannerInfo *root,
     double      outer_rows,
                 inner_rows;
     int         merge_keys_found = 0;
+    int         i;
+
+    /*
+     * Vector merge join only benefits from SIMD on numeric types.
+     * For text/generic keys the per-tuple fmgr comparison overhead exceeds
+     * any batching advantage.  Reject if any key is non-numeric.
+     */
+    for (i = 0; i < nkeys; i++)
+    {
+        if (!vjoin_is_fast_type(key_types[i]))
+            return;
+    }
 
     /*
      * Build PathKeys for each merge-joinable key.
