@@ -763,6 +763,21 @@ vjoin_try_nestloop(PlannerInfo *root,
                 inner_rows,
                 num_blocks;
     int         simd_width;
+    int         i;
+
+    /*
+     * For equi-joins, require all keys to be fast numeric types.
+     * VNL cannot use parameterized inner paths (unlike native NL which
+     * pushes outer values into index conditions).  For text/generic keys
+     * VNL has no SIMD advantage and the full inner scan + fmgr comparison
+     * overhead makes it strictly worse than native NL.
+     * Theta joins are always numeric (enforced by vjoin_analyze_theta_clause).
+     */
+    for (i = 0; i < nkeys; i++)
+    {
+        if (!vjoin_is_fast_type(key_types[i]))
+            return;
+    }
 
     /*
      * SIMD width for cost model: only single-key numeric equi-join or

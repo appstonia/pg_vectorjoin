@@ -572,9 +572,16 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
                                              "NestLoop block",
                                              ALLOCSET_DEFAULT_SIZES);
 
-    state->use_simd = ((state->num_keys > 0) || (state->theta_strategy != 0)) &&
-                       (vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
-                        vjoin_simd_caps.has_neon);
+    state->use_simd = false;
+    if (vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
+        vjoin_simd_caps.has_neon)
+    {
+        if (state->theta_strategy != 0)
+            state->use_simd = true;   /* theta — always numeric */
+        else if (state->num_keys == 1 &&
+                 vjoin_is_fast_type(state->key_types[0]))
+            state->use_simd = true;   /* single numeric key */
+    }
 
     /* Pre-allocated SIMD scratch for single-key equi-join comparison */
     if (state->num_keys == 1 && state->use_simd)
