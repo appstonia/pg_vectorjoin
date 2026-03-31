@@ -1003,12 +1003,6 @@ vjoin_nestloop_explain(CustomScanState *node, List *ancestors, ExplainState *es)
     ExplainPropertyText("Join Type", "Inner", es);
     ExplainPropertyInteger("Block Size", NULL, state->block_size, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);
-    if (state->num_keys == 0)
-    {
-        ExplainPropertyBool("Theta Join", true, es);
-        if (state->theta_strategy != 0)
-            ExplainPropertyBool("Theta SIMD", true, es);
-    }
 }
 
 /* ----------------------------------------------------------------

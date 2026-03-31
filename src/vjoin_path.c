@@ -172,11 +172,20 @@ vjoin_type_has_hash_support(Oid typid, Oid *hash_proc, Oid *eq_opr)
 {
     TypeCacheEntry *typentry;
 
-    /* Fast numeric types — always supported, no cache lookup needed */
+    /* Fast types — always supported, no cache lookup needed */
     switch (typid)
     {
         case INT4OID:
+        case INT2OID:
+        case DATEOID:
+        case OIDOID:
+        case REGCLASSOID:
+        case REGTYPEOID:
+        case REGPROCOID:
         case INT8OID:
+        case TIMESTAMPOID:
+        case TIMESTAMPTZOID:
+        case TIMEOID:
         case FLOAT8OID:
             *hash_proc = InvalidOid;   /* will use inline fast path */
             *eq_opr = InvalidOid;
@@ -276,7 +285,7 @@ vjoin_analyze_clauses(List *restrictlist,
 
         outer_keynos[nkeys] = outer_tle->resno;
         inner_keynos[nkeys] = inner_tle->resno;
-        key_types[nkeys] = keytype;
+        key_types[nkeys] = vjoin_map_fast_type(keytype);
         hash_procs[nkeys] = hp;
         eq_oprs[nkeys] = eo;
         collations[nkeys] = opexpr->inputcollid;

@@ -199,11 +199,51 @@ vjoin_hash_datum_generic(Datum d, FmgrInfo *hashfn, Oid collation)
     return DatumGetUInt32(FunctionCall1Coll(hashfn, collation, d));
 }
 
+/*
+ * Map a type OID to its SIMD-compatible base type.
+ *
+ * Only pass-by-value types whose Datum representation matches the target
+ * integer/float width are eligible.  In particular FLOAT4 is excluded
+ * because DatumGetFloat8() reads 8 bytes but FLOAT4 stores only 4 — the
+ * remaining bits are undefined, producing wrong hashes and comparisons.
+ *
+ *   32-bit integer path (DatumGetInt32):
+ *     INT4, INT2, DATE, OID, REGCLASS, REGTYPE, REGPROC
+ *   64-bit integer path (DatumGetInt64):
+ *     INT8, TIMESTAMP, TIMESTAMPTZ, TIME
+ *   64-bit float path (DatumGetFloat8):
+ *     FLOAT8
+ */
+static inline Oid
+vjoin_map_fast_type(Oid typid)
+{
+    switch (typid)
+    {
+        case INT4OID:
+        case INT2OID:
+        case DATEOID:
+        case OIDOID:
+        case REGCLASSOID:
+        case REGTYPEOID:
+        case REGPROCOID:
+            return INT4OID;
+        case INT8OID:
+        case TIMESTAMPOID:
+        case TIMESTAMPTZOID:
+        case TIMEOID:
+            return INT8OID;
+        case FLOAT8OID:
+            return FLOAT8OID;
+        default:
+            return InvalidOid;
+    }
+}
+
 /* Returns true if type uses inline fast path, false if generic FmgrInfo needed */
 static inline bool
 vjoin_is_fast_type(Oid typid)
 {
-    return typid == INT4OID || typid == INT8OID || typid == FLOAT8OID;
+    return OidIsValid(vjoin_map_fast_type(typid));
 }
 
 static inline uint32
