@@ -54,6 +54,18 @@
 #define VJOIN_MIN_AUTO_TUNE_MARGIN        0.10
 #define VJOIN_MAX_AUTO_TUNE_MARGIN        1.50
 
+/*
+ * Hash join multi-batch spilling.  When enabled (default), an oversized
+ * inner relation is partitioned into 2^k batches via the high bits of the
+ * 32-bit hashvalue and spilled to BufFiles instead of being rejected by
+ * the planner.  hash_max_batches is a hard upper bound on nbatch to guard
+ * against pathological recursive splits.
+ */
+#define VJOIN_DEFAULT_ENABLE_HASH_SPILL   true
+#define VJOIN_DEFAULT_HASH_MAX_BATCHES    1024
+#define VJOIN_MIN_HASH_MAX_BATCHES        1
+#define VJOIN_MAX_HASH_MAX_BATCHES        1048576
+
 /* GUC variables */
 extern bool vjoin_enable;
 extern bool vjoin_enable_hashjoin;
@@ -66,6 +78,8 @@ extern double vjoin_merge_cost_factor;
 extern double vjoin_nestloop_cost_factor;
 extern bool   vjoin_auto_tune;
 extern double vjoin_auto_tune_margin;
+extern bool   vjoin_enable_hash_spill;
+extern int    vjoin_hash_max_batches;
 
 /* Saved previous hooks (needed across translation units) */
 extern set_join_pathlist_hook_type prev_join_pathlist_hook;

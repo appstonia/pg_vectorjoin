@@ -6,7 +6,8 @@ OBJS = src/pg_vectorjoin.o \
        src/vjoin_exec_nestloop.o \
        src/vjoin_hashtable.o \
        src/vjoin_simd.o \
-       src/vjoin_exec_merge.o
+       src/vjoin_exec_merge.o \
+       src/vjoin_spill.o
 
 EXTENSION = pg_vectorjoin
 DATA = pg_vectorjoin--1.0.sql

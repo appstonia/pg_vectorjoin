@@ -30,6 +30,8 @@ double  vjoin_merge_cost_factor = VJOIN_DEFAULT_MERGE_COST_FACTOR;
 double  vjoin_nestloop_cost_factor = VJOIN_DEFAULT_NESTLOOP_COST_FACTOR;
 bool    vjoin_auto_tune = VJOIN_DEFAULT_AUTO_TUNE;
 double  vjoin_auto_tune_margin = VJOIN_DEFAULT_AUTO_TUNE_MARGIN;
+bool    vjoin_enable_hash_spill = VJOIN_DEFAULT_ENABLE_HASH_SPILL;
+int     vjoin_hash_max_batches = VJOIN_DEFAULT_HASH_MAX_BATCHES;
 
 /* Saved previous hooks */
 set_join_pathlist_hook_type prev_join_pathlist_hook = NULL;
@@ -215,6 +217,24 @@ _PG_init(void)
                              VJOIN_MAX_AUTO_TUNE_MARGIN,
                              PGC_USERSET,
                              0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_vectorjoin.enable_hash_spill",
+                             "Allow vectorized hash join to spill oversized inner relations to disk in multiple batches (PostgreSQL-style multi-batch hash join). When off, joins whose inner does not fit in work_mem fall back to native join.",
+                             NULL,
+                             &vjoin_enable_hash_spill,
+                             VJOIN_DEFAULT_ENABLE_HASH_SPILL,
+                             PGC_USERSET,
+                             0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_vectorjoin.hash_max_batches",
+                            "Upper bound on the number of hash-join batches (must be a power of two; values are rounded up). Guards against pathological recursive splits when row estimates are wildly off.",
+                            NULL,
+                            &vjoin_hash_max_batches,
+                            VJOIN_DEFAULT_HASH_MAX_BATCHES,
+                            VJOIN_MIN_HASH_MAX_BATCHES,
+                            VJOIN_MAX_HASH_MAX_BATCHES,
+                            PGC_USERSET,
+                            0, NULL, NULL, NULL);
 
     MarkGUCPrefixReserved("pg_vectorjoin");
 

@@ -84,6 +84,8 @@ typedef struct VJoinParallelState
 } VJoinParallelState;
 
 /* ---------- Open-addressing hash table ---------- */
+struct vjoin_spill_file;            /* opaque, defined in vjoin_spill.h */
+
 typedef struct VJoinHashTable
 {
     uint32     *hashvals;       /* [capacity] — 0 means empty slot */
@@ -92,6 +94,7 @@ typedef struct VJoinHashTable
     int         num_all_attrs;  /* total inner attrs */
     int         capacity;       /* power of 2 */
     int         mask;           /* capacity - 1 */
+    int         log2_nbuckets;  /* log2(capacity) — for batch routing */
     int         num_entries;
     int         num_keys;
     AttrNumber *inner_keynos;   /* [num_keys] — 1-based attr positions of keys */
@@ -104,6 +107,20 @@ typedef struct VJoinHashTable
     bool        is_shared;      /* true = arrays are DSA-backed */
     dsa_area   *dsa;            /* DSA area (only when is_shared) */
     struct VJoinParallelState *pstate; /* shared state (only when is_shared) */
+
+    /*
+     * Multi-batch spilling state (PG-style).  When nbatch == 1 the table
+     * behaves exactly as before (single in-memory batch).  When nbatch > 1
+     * tuples whose batch index != curbatch are written to per-batch
+     * BufFiles and replayed once their batch becomes current.
+     */
+    int         nbatch;             /* power-of-2; 1 = no spilling */
+    int         curbatch;           /* index of batch currently in HT */
+    Size        space_allowed;      /* byte budget for in-memory batch */
+    Size        space_used;         /* current bytes consumed by tuples */
+    int         max_nbatch;         /* upper bound on nbatch */
+    struct vjoin_spill_file **inner_batch_files; /* [nbatch] inner spill */
+    struct vjoin_spill_file **outer_batch_files; /* [nbatch] outer spill */
 } VJoinHashTable;
 
 /* ---------- Result buffer entry ---------- */
