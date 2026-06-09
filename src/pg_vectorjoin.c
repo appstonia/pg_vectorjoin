@@ -19,12 +19,17 @@ vjoin_loaded(PG_FUNCTION_ARGS)
 }
 
 /* GUC variables */
-bool    vjoin_enable = true;
-bool    vjoin_enable_hashjoin = true;
-bool    vjoin_enable_nestloop = true;
-bool    vjoin_enable_mergejoin = true;
+bool    vjoin_enable = VJOIN_DEFAULT_ENABLE;
+bool    vjoin_enable_hashjoin = VJOIN_DEFAULT_ENABLE_HASHJOIN;
+bool    vjoin_enable_nestloop = VJOIN_DEFAULT_ENABLE_NESTLOOP;
+bool    vjoin_enable_mergejoin = VJOIN_DEFAULT_ENABLE_MERGEJOIN;
 int     vjoin_batch_size = VJOIN_DEFAULT_BATCH;
-double  vjoin_cost_factor = 0.5;
+double  vjoin_cost_factor = VJOIN_DEFAULT_COST_FACTOR;
+double  vjoin_hash_cost_factor = VJOIN_DEFAULT_HASH_COST_FACTOR;
+double  vjoin_merge_cost_factor = VJOIN_DEFAULT_MERGE_COST_FACTOR;
+double  vjoin_nestloop_cost_factor = VJOIN_DEFAULT_NESTLOOP_COST_FACTOR;
+bool    vjoin_auto_tune = VJOIN_DEFAULT_AUTO_TUNE;
+double  vjoin_auto_tune_margin = VJOIN_DEFAULT_AUTO_TUNE_MARGIN;
 
 /* Saved previous hooks */
 set_join_pathlist_hook_type prev_join_pathlist_hook = NULL;
@@ -115,7 +120,7 @@ _PG_init(void)
                              "Enable vectorized join optimization.",
                              NULL,
                              &vjoin_enable,
-                             true,
+                             VJOIN_DEFAULT_ENABLE,
                              PGC_USERSET,
                              0, NULL, NULL, NULL);
 
@@ -123,7 +128,7 @@ _PG_init(void)
                              "Enable vectorized hash join.",
                              NULL,
                              &vjoin_enable_hashjoin,
-                             true,
+                             VJOIN_DEFAULT_ENABLE_HASHJOIN,
                              PGC_USERSET,
                              0, NULL, NULL, NULL);
 
@@ -131,7 +136,7 @@ _PG_init(void)
                              "Enable block nested loop join.",
                              NULL,
                              &vjoin_enable_nestloop,
-                             true,
+                             VJOIN_DEFAULT_ENABLE_NESTLOOP,
                              PGC_USERSET,
                              0, NULL, NULL, NULL);
 
@@ -139,7 +144,7 @@ _PG_init(void)
                              "Enable vectorized merge join.",
                              NULL,
                              &vjoin_enable_mergejoin,
-                             true,
+                             VJOIN_DEFAULT_ENABLE_MERGEJOIN,
                              PGC_USERSET,
                              0, NULL, NULL, NULL);
 
@@ -154,12 +159,60 @@ _PG_init(void)
                             0, NULL, NULL, NULL);
 
     DefineCustomRealVariable("pg_vectorjoin.cost_factor",
-                             "Cost scaling for vectorized join (lower = more aggressive).",
+                             "Global cost scaling for vectorized join (lower = more aggressive). Stacks multiplicatively with per-jointype factors.",
                              NULL,
                              &vjoin_cost_factor,
-                             0.5,
-                             0.01,
-                             10.0,
+                             VJOIN_DEFAULT_COST_FACTOR,
+                             VJOIN_MIN_COST_FACTOR,
+                             VJOIN_MAX_COST_FACTOR,
+                             PGC_USERSET,
+                             0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable("pg_vectorjoin.hash_cost_factor",
+                             "Per-jointype cost scaling for vectorized hash join. Multiplied with cost_factor.",
+                             NULL,
+                             &vjoin_hash_cost_factor,
+                             VJOIN_DEFAULT_HASH_COST_FACTOR,
+                             VJOIN_MIN_COST_FACTOR,
+                             VJOIN_MAX_COST_FACTOR,
+                             PGC_USERSET,
+                             0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable("pg_vectorjoin.merge_cost_factor",
+                             "Per-jointype cost scaling for vectorized merge join. Multiplied with cost_factor.",
+                             NULL,
+                             &vjoin_merge_cost_factor,
+                             VJOIN_DEFAULT_MERGE_COST_FACTOR,
+                             VJOIN_MIN_COST_FACTOR,
+                             VJOIN_MAX_COST_FACTOR,
+                             PGC_USERSET,
+                             0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable("pg_vectorjoin.nestloop_cost_factor",
+                             "Per-jointype cost scaling for vectorized nested loop join. Multiplied with cost_factor.",
+                             NULL,
+                             &vjoin_nestloop_cost_factor,
+                             VJOIN_DEFAULT_NESTLOOP_COST_FACTOR,
+                             VJOIN_MIN_COST_FACTOR,
+                             VJOIN_MAX_COST_FACTOR,
+                             PGC_USERSET,
+                             0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_vectorjoin.auto_tune",
+                             "Clamp each vector join path's cost down to (cheapest comparable native path) * auto_tune_margin when the native path is cheaper. Lets vjoin be selected without manually tuning per-jointype cost factors.",
+                             NULL,
+                             &vjoin_auto_tune,
+                             VJOIN_DEFAULT_AUTO_TUNE,
+                             PGC_USERSET,
+                             0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable("pg_vectorjoin.auto_tune_margin",
+                             "Target ratio of vector join cost to cheapest comparable native path cost when auto_tune is on (e.g. 0.95 = always 5%% cheaper than native of same type).",
+                             NULL,
+                             &vjoin_auto_tune_margin,
+                             VJOIN_DEFAULT_AUTO_TUNE_MARGIN,
+                             VJOIN_MIN_AUTO_TUNE_MARGIN,
+                             VJOIN_MAX_AUTO_TUNE_MARGIN,
                              PGC_USERSET,
                              0, NULL, NULL, NULL);
 

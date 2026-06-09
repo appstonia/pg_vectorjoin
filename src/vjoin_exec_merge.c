@@ -174,6 +174,61 @@ vmj_fetch_inner(VectorMergeJoinState *state)
 }
 
 /*
+ * Fetch the next inner tuple from the shared materialized buffer.
+ * Used for parallel merge when tuple-at-a-time path is active
+ * (all_byval == false).  Populates inner_key/inner_null from
+ * the shared keys array and inner_cur_slot from shared values.
+ * Returns false if no more tuples.
+ */
+static bool
+vmj_fetch_inner_shared(VectorMergeJoinState *state)
+{
+    int pos, nkeys, nattrs, i;
+    TupleTableSlot *slot;
+
+    if (state->shared_inner_pos >= state->shared_inner_count)
+    {
+        state->inner_done = true;
+        state->inner_cur_slot = NULL;
+        return false;
+    }
+
+    pos = state->shared_inner_pos++;
+    nkeys = state->num_keys;
+    nattrs = state->num_inner_attrs;
+
+    /* Extract keys from shared buffer */
+    for (i = 0; i < nkeys; i++)
+    {
+        state->inner_key[i] = state->shared_inner_keys[pos * nkeys + i];
+        state->inner_null[i] = false;  /* NULLs were skipped during materialize */
+    }
+
+    /* Store shared values into the inner_slot for tuple-at-a-time path */
+    slot = state->inner_slot;
+    ExecClearTuple(slot);
+    memcpy(slot->tts_values, &state->shared_inner_values[pos * nattrs],
+           nattrs * sizeof(Datum));
+    memcpy(slot->tts_isnull, &state->shared_inner_isnull[pos * nattrs],
+           nattrs * sizeof(bool));
+    ExecStoreVirtualTuple(slot);
+
+    state->inner_cur_slot = slot;
+    return true;
+}
+
+/*
+ * Parallel-aware inner fetch: dispatches to shared buffer or child plan.
+ */
+static inline bool
+vmj_fetch_inner_auto(VectorMergeJoinState *state)
+{
+    if (state->is_parallel && state->shared_inner_ready)
+        return vmj_fetch_inner_shared(state);
+    return vmj_fetch_inner(state);
+}
+
+/*
  * Collect all tuples with the same key into the specified group array.
  * first_mt is the already-saved first tuple of the group.
  * If *_multi is true, the current child slot has the second tuple
@@ -233,7 +288,7 @@ vmj_collect_group(VectorMergeJoinState *state, bool is_outer,
         MemoryContextSwitchTo(oldctx);
 
         /* Keep fetching while key matches */
-        while (is_outer ? vmj_fetch_outer(state) : vmj_fetch_inner(state))
+        while (is_outer ? vmj_fetch_outer(state) : vmj_fetch_inner_auto(state))
         {
             Datum *cur_key  = is_outer ? state->outer_key  : state->inner_key;
             bool  *cur_null = is_outer ? state->outer_null  : state->inner_null;
@@ -404,6 +459,87 @@ vmj_materialize_shared_inner(VectorMergeJoinState *state)
             count++;
         }
 
+        /*
+         * Deep-copy pass-by-ref data into a flat DSA buffer.
+         * Store offsets (from buffer start) in the vals/keys arrays so
+         * workers can translate them to valid local pointers after attach.
+         */
+        if (pstate->has_byref && count > 0)
+        {
+            TupleDesc   inner_desc = state->inner_desc;
+            Size        total_vardata = 0;
+            int         i, a;
+
+            /* Pass 1: compute total size of all byref values + keys */
+            for (i = 0; i < count; i++)
+            {
+                for (a = 0; a < nattrs; a++)
+                {
+                    int idx = i * nattrs + a;
+                    if (!TupleDescAttr(inner_desc, a)->attbyval &&
+                        !nulls[idx])
+                        total_vardata += MAXALIGN(datumGetSize(
+                            vals[idx], false,
+                            TupleDescAttr(inner_desc, a)->attlen));
+                }
+                for (a = 0; a < nkeys; a++)
+                {
+                    if (!state->key_byval[a])
+                    {
+                        /* Keys are never NULL here (filtered above) */
+                        int kidx = i * nkeys + a;
+                        total_vardata += MAXALIGN(datumGetSize(
+                            keys[kidx], false, state->key_typlen[a]));
+                    }
+                }
+            }
+
+            if (total_vardata > 0)
+            {
+                /* Pass 2: allocate one flat buffer, copy data, store offsets */
+                dsa_pointer var_dp;
+                char       *var_buf;
+                Size        offset = 0;
+
+                var_dp  = dsa_allocate_extended(dsa, total_vardata,
+                                               DSA_ALLOC_HUGE);
+                var_buf = (char *) dsa_get_address(dsa, var_dp);
+                pstate->vardata_dp = var_dp;
+
+                for (i = 0; i < count; i++)
+                {
+                    for (a = 0; a < nattrs; a++)
+                    {
+                        int idx = i * nattrs + a;
+                        if (!TupleDescAttr(inner_desc, a)->attbyval &&
+                            !nulls[idx])
+                        {
+                            Size dsz = datumGetSize(
+                                vals[idx], false,
+                                TupleDescAttr(inner_desc, a)->attlen);
+                            memcpy(var_buf + offset,
+                                   DatumGetPointer(vals[idx]), dsz);
+                            vals[idx] = (Datum) offset;
+                            offset += MAXALIGN(dsz);
+                        }
+                    }
+                    for (a = 0; a < nkeys; a++)
+                    {
+                        if (!state->key_byval[a])
+                        {
+                            int kidx = i * nkeys + a;
+                            Size dsz = datumGetSize(
+                                keys[kidx], false, state->key_typlen[a]);
+                            memcpy(var_buf + offset,
+                                   DatumGetPointer(keys[kidx]), dsz);
+                            keys[kidx] = (Datum) offset;
+                            offset += MAXALIGN(dsz);
+                        }
+                    }
+                }
+            }
+        }
+
         /* Publish to shared state */
         pstate->inner_values_dp = vals_dp;
         pstate->inner_isnull_dp = nulls_dp;
@@ -427,6 +563,40 @@ vmj_materialize_shared_inner(VectorMergeJoinState *state)
             dsa, pstate->inner_isnull_dp);
         state->shared_inner_keys = (Datum *) dsa_get_address(
             dsa, pstate->inner_keys_dp);
+
+        /* Fixup byref offsets → valid local pointers */
+        if (pstate->has_byref && DsaPointerIsValid(pstate->vardata_dp))
+        {
+            char *var_base = (char *) dsa_get_address(dsa, pstate->vardata_dp);
+            int   nattrs = pstate->num_inner_attrs;
+            int   nkeys = pstate->num_keys;
+            TupleDesc inner_desc = state->inner_desc;
+            int   cnt = pstate->inner_count;
+            int   i, a;
+
+            for (i = 0; i < cnt; i++)
+            {
+                for (a = 0; a < nattrs; a++)
+                {
+                    int idx = i * nattrs + a;
+                    if (!TupleDescAttr(inner_desc, a)->attbyval &&
+                        !state->shared_inner_isnull[idx])
+                        state->shared_inner_values[idx] =
+                            PointerGetDatum(var_base +
+                                            (Size) state->shared_inner_values[idx]);
+                }
+                for (a = 0; a < nkeys; a++)
+                {
+                    if (!state->key_byval[a])
+                    {
+                        int kidx = i * nkeys + a;
+                        state->shared_inner_keys[kidx] =
+                            PointerGetDatum(var_base +
+                                            (Size) state->shared_inner_keys[kidx]);
+                    }
+                }
+            }
+        }
     }
     else
     {
@@ -434,6 +604,9 @@ vmj_materialize_shared_inner(VectorMergeJoinState *state)
         state->shared_inner_isnull = NULL;
         state->shared_inner_keys = NULL;
     }
+
+    state->shared_inner_ready = true;
+    state->inner_done = (state->shared_inner_count == 0);
 }
 
 /*
@@ -566,6 +739,15 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
     *count_p = remaining;
     *pos_p = 0;
 
+    /* Reset byref datum context when no entries carry over */
+    if (!state->all_byval && remaining == 0)
+    {
+        MemoryContext datacxt = is_outer ? state->ob_data_ctx
+                                         : state->ib_data_ctx;
+        if (datacxt)
+            MemoryContextReset(datacxt);
+    }
+
     /* Reset ob_matched for new entries + batch_left_pos */
     if (is_outer && state->ob_matched)
     {
@@ -612,6 +794,33 @@ vmj_batch_fill_side(VectorMergeJoinState *state, bool is_outer)
             int off = idx * ncols;
             memcpy(&values[off], slot->tts_values, ncols * sizeof(Datum));
             memcpy(&isnull[off], slot->tts_isnull, ncols * sizeof(bool));
+
+            /* Deep-copy byref datums so they survive child plan advances */
+            if (!state->all_byval)
+            {
+                TupleDesc desc = is_outer ? state->outer_desc
+                                          : state->inner_desc;
+                MemoryContext datacxt = is_outer ? state->ob_data_ctx
+                                                 : state->ib_data_ctx;
+                MemoryContext old = MemoryContextSwitchTo(datacxt);
+                int a;
+
+                for (a = 0; a < ncols; a++)
+                {
+                    if (!TupleDescAttr(desc, a)->attbyval && !isnull[off + a])
+                        values[off + a] = datumCopy(values[off + a], false,
+                                                    TupleDescAttr(desc, a)->attlen);
+                }
+                /* Deep-copy byref keys (all non-null at this point) */
+                for (k = 0; k < nkeys; k++)
+                {
+                    if (!state->key_byval[k])
+                        keys[idx * nkeys + k] = datumCopy(
+                            keys[idx * nkeys + k], false,
+                            state->key_typlen[k]);
+                }
+                MemoryContextSwitchTo(old);
+            }
         }
 
         (*count_p)++;
@@ -1281,7 +1490,7 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
     }
 
     /* Allocate batch buffers for block merge (INNER only). */
-    if (state->all_byval && state->jointype == JOIN_INNER)
+    if (state->jointype == JOIN_INNER)
     {
         int bs = vjoin_batch_size;
 
@@ -1322,6 +1531,22 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
 
         state->ob_matched = NULL;
         state->batch_left_pos = 0;
+
+        /* Memory contexts for byref datum deep-copies in batch mode */
+        if (!state->all_byval)
+        {
+            state->ob_data_ctx = AllocSetContextCreate(CurrentMemoryContext,
+                                                       "VMJ outer batch data",
+                                                       ALLOCSET_DEFAULT_SIZES);
+            state->ib_data_ctx = AllocSetContextCreate(CurrentMemoryContext,
+                                                       "VMJ inner batch data",
+                                                       ALLOCSET_DEFAULT_SIZES);
+        }
+        else
+        {
+            state->ob_data_ctx = NULL;
+            state->ib_data_ctx = NULL;
+        }
     }
     else
     {
@@ -1331,6 +1556,8 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
         state->batch_result_isnull = NULL;
         state->saved_tts_values = NULL;
         state->saved_tts_isnull = NULL;
+        state->ob_data_ctx = NULL;
+        state->ib_data_ctx = NULL;
     }
 
     /* Initialize parallel fields (DSM callbacks set these later if parallel) */
@@ -1343,6 +1570,7 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
     state->shared_inner_keys = NULL;
     state->shared_inner_count = 0;
     state->shared_inner_pos = 0;
+    state->shared_inner_ready = false;
 
     state->phase = VMJ_INIT;
 }
@@ -1360,12 +1588,11 @@ vjoin_merge_exec(CustomScanState *node)
         switch (state->phase)
         {
             case VMJ_INIT:
-                /* Parallel: materialize shared inner before any fills */
-                if (state->is_parallel && state->shared_inner_values == NULL &&
-                    state->shared_inner_count == 0)
+                /* Parallel: materialize shared inner (once only) */
+                if (state->is_parallel && !state->shared_inner_ready)
                     vmj_materialize_shared_inner(state);
 
-                if (state->all_byval && state->batch_size > 0 &&
+                if (state->batch_size > 0 &&
                     state->jointype == JOIN_INNER)
                 {
                     /* Block merge mode: fill both blocks */
@@ -1390,7 +1617,9 @@ vjoin_merge_exec(CustomScanState *node)
                     state->phase = VMJ_DONE;
                     return NULL;
                 }
-                if (!vmj_fetch_inner(state))
+                /* Parallel: inner was materialized into shared buffer,
+                 * ExecProcNode(inner_ps) would return NULL. Use shared fetch. */
+                if (!vmj_fetch_inner_auto(state))
                 {
                     state->phase = VMJ_DONE;
                     return NULL;
@@ -1412,7 +1641,7 @@ vjoin_merge_exec(CustomScanState *node)
                 }
                 while (!state->inner_done && state->inner_null[0])
                 {
-                    if (!vmj_fetch_inner(state))
+                    if (!vmj_fetch_inner_auto(state))
                         break;
                 }
 
@@ -1435,7 +1664,7 @@ vjoin_merge_exec(CustomScanState *node)
                 else if (cmp > 0)
                 {
                     state->inner_matched = false;
-                    if (!vmj_fetch_inner(state))
+                    if (!vmj_fetch_inner_auto(state))
                         state->phase = VMJ_DONE;
                     if (state->phase == VMJ_DONE)
                         return NULL;
@@ -1495,7 +1724,7 @@ vjoin_merge_exec(CustomScanState *node)
                                 state, state->match_key, state->match_null,
                                 state->outer_key, state->outer_null);
 
-                        if (!vmj_fetch_inner(state))
+                        if (!vmj_fetch_inner_auto(state))
                             state->inner_multi = false;
                         else
                             state->inner_multi = vmj_keys_equal(
@@ -1552,7 +1781,7 @@ vjoin_merge_exec(CustomScanState *node)
                                 state, state->match_key, state->match_null,
                                 state->outer_key, state->outer_null);
 
-                        if (!vmj_fetch_inner(state))
+                        if (!vmj_fetch_inner_auto(state))
                             state->inner_multi = false;
                         else
                             state->inner_multi = vmj_keys_equal(
@@ -1795,6 +2024,23 @@ vjoin_merge_end(CustomScanState *node)
 
     if (state->match_ctx)
         MemoryContextDelete(state->match_ctx);
+
+    if (state->ob_data_ctx)
+        MemoryContextDelete(state->ob_data_ctx);
+    if (state->ib_data_ctx)
+        MemoryContextDelete(state->ib_data_ctx);
+
+    /* Detach from barrier before DSA cleanup */
+    if (state->pstate)
+        BarrierDetach(&state->pstate->barrier);
+
+    /* Detach DSA */
+    if (state->dsa)
+    {
+        dsa_detach(state->dsa);
+        state->dsa = NULL;
+    }
+    state->pstate = NULL;
 }
 
 void
@@ -1829,6 +2075,12 @@ vjoin_merge_rescan(CustomScanState *node)
     state->batch_result_pos = 0;
     state->batch_cp_oi = -1;
     state->batch_left_pos = 0;
+
+    /* Reset byref datum contexts */
+    if (state->ob_data_ctx)
+        MemoryContextReset(state->ob_data_ctx);
+    if (state->ib_data_ctx)
+        MemoryContextReset(state->ib_data_ctx);
 
     /* Restore scan_slot pointers if redirected by zero-copy emit */
     if (state->saved_tts_values)
@@ -1885,13 +2137,16 @@ vjoin_merge_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     dsa_pin_mapping(state->dsa);
 
     pstate->dsa_handle = dsa_get_handle(state->dsa);
-    BarrierInit(&pstate->barrier, vjoin_pcxt_nworkers(pcxt) + 1);
+    BarrierInit(&pstate->barrier, 0);  /* dynamic party — attach/detach */
+    BarrierAttach(&pstate->barrier);   /* leader attaches */
     pstate->inner_count = 0;
     pstate->num_inner_attrs = state->num_inner_attrs;
     pstate->num_keys = state->num_keys;
+    pstate->has_byref = !state->all_byval;
     pstate->inner_values_dp = InvalidDsaPointer;
     pstate->inner_isnull_dp = InvalidDsaPointer;
     pstate->inner_keys_dp = InvalidDsaPointer;
+    pstate->vardata_dp = InvalidDsaPointer;
 
     state->pstate = pstate;
     state->is_parallel = true;
@@ -1915,6 +2170,8 @@ vjoin_merge_initialize_worker(CustomScanState *node, shm_toc *toc,
     /* Attach to the DSA area created by the leader */
     state->dsa = dsa_attach(pstate->dsa_handle);
     dsa_pin_mapping(state->dsa);
+
+    BarrierAttach(&pstate->barrier);   /* worker attaches to dynamic barrier */
 
     state->pstate = pstate;
     state->is_parallel = true;

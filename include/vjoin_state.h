@@ -34,9 +34,11 @@ typedef struct VJoinMergeParallelState
     int         inner_count;        /* number of inner tuples materialized */
     int         num_inner_attrs;    /* inner tuple descriptor width */
     int         num_keys;           /* number of join keys */
+    bool        has_byref;          /* true if any inner attr/key is byref */
     dsa_pointer inner_values_dp;    /* Datum[inner_count * num_inner_attrs] */
     dsa_pointer inner_isnull_dp;    /* bool[inner_count * num_inner_attrs] */
     dsa_pointer inner_keys_dp;      /* Datum[inner_count * num_keys] */
+    dsa_pointer vardata_dp;         /* flat buffer for pass-by-ref datum data */
 } VJoinMergeParallelState;
 
 /* ---------- Parallel shared state for Hash Join (DSM-resident) ---------- */
@@ -423,6 +425,10 @@ typedef struct VectorMergeJoinState
     bool        outer_matched;          /* current outer tuple has a match */
     bool        inner_matched;          /* current inner tuple has a match */
 
+    /* Memory contexts for byref datum deep-copies in batch mode */
+    MemoryContext ob_data_ctx;          /* outer batch byref datums */
+    MemoryContext ib_data_ctx;          /* inner batch byref datums */
+
     /* Parallel merge state */
     VJoinMergeParallelState *pstate;    /* shared DSM state (NULL if non-parallel) */
     dsa_area               *dsa;       /* DSA area (NULL if non-parallel) */
@@ -435,6 +441,7 @@ typedef struct VectorMergeJoinState
     Datum      *shared_inner_keys;     /* points into DSA */
     int         shared_inner_count;    /* total inner tuples */
     int         shared_inner_pos;      /* current read position */
+    bool        shared_inner_ready;    /* true after materialize done */
 } VectorMergeJoinState;
 
 #endif /* VJOIN_STATE_H */

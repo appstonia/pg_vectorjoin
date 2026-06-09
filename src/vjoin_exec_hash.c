@@ -1029,6 +1029,10 @@ vjoin_hash_end(CustomScanState *node)
     if (state->batch_ctx)
         MemoryContextDelete(state->batch_ctx);
 
+    /* Detach from barrier before DSA cleanup */
+    if (state->pstate)
+        BarrierDetach(&state->pstate->barrier);
+
     /* Detach DSA — the shared memory persists until leader destroys it */
     if (state->dsa)
     {
@@ -1106,7 +1110,8 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 
     /* Initialize the shared state */
     pstate->dsa_handle = dsa_get_handle(state->dsa);
-    BarrierInit(&pstate->barrier, vjoin_pcxt_nworkers(pcxt) + 1);
+    BarrierInit(&pstate->barrier, 0);  /* dynamic party — attach/detach */
+    BarrierAttach(&pstate->barrier);   /* leader attaches */
     pstate->num_entries = 0;
     pstate->built_in_dsa = false;
     pstate->parallel_build = false;
@@ -1170,6 +1175,8 @@ vjoin_hash_initialize_worker(CustomScanState *node, shm_toc *toc,
     /* Attach to the DSA area created by the leader */
     state->dsa = dsa_attach(pstate->dsa_handle);
     dsa_pin_mapping(state->dsa);
+
+    BarrierAttach(&pstate->barrier);   /* worker attaches to dynamic barrier */
 
     state->pstate = pstate;
     state->is_parallel = true;

@@ -117,7 +117,7 @@ All parameters are settable per-session without server restart:
 | pg_vectorjoin.enable_hashjoin | true | -- | Enable VectorHashJoin paths |
 | pg_vectorjoin.enable_nestloop | true | -- | Enable VectorNestedLoop paths |
 | pg_vectorjoin.enable_mergejoin | true | -- | Enable VectorMergeJoin paths |
-| pg_vectorjoin.batch_size | 2000 | 100 -- 10000 | Block size for batch processing |
+| pg_vectorjoin.batch_size | 2048 | 64 -- 8192 | Block size for batch processing |
 | pg_vectorjoin.cost_factor | 0.5 | 0.01 -- 10.0 | Join overhead cost multiplier (lower = prefer vectorized) |
 
 ## Usage
@@ -131,7 +131,7 @@ LOAD 'pg_vectorjoin';
 
 -- Tune parameters per-session
 SET pg_vectorjoin.enable = on;
-SET pg_vectorjoin.batch_size = 2000;
+SET pg_vectorjoin.batch_size = 2048;
 SET pg_vectorjoin.cost_factor = 0.3;
 
 SET pg_vectorjoin.enable_hashjoin = on;

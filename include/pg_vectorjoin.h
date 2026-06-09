@@ -9,10 +9,50 @@
 
 /* Constants */
 #define VJOIN_MAX_KEYS          8
-#define VJOIN_DEFAULT_BATCH     2000
-#define VJOIN_MIN_BATCH         100
-#define VJOIN_MAX_BATCH         10000
-#define VJOIN_HT_LOAD_FACTOR   2       /* capacity = inner_rows * factor */
+/*
+ * Batch (= outer block) sizing for SIMD.  The batch is the outer block fed as
+ * block_count to the SIMD compare kernels; it is re-scanned for every inner
+ * tuple, so it must stay cache-hot and be a multiple of the widest SIMD lane
+ * (AVX2 int32 = 8 lanes).  Values are powers of two:
+ *   MIN 64    = 8x the widest lane -> SIMD always runs >=1 full vector pass.
+ *   DEFAULT 2048 = 8KB (int32) / 16KB (int64,float8) -> L1-resident.
+ *   MAX 8192  = 32KB (int32, = L1) / 64KB (8-byte keys, L2) -> upper bound.
+ */
+#define VJOIN_DEFAULT_BATCH     2048
+#define VJOIN_MIN_BATCH         64
+#define VJOIN_MAX_BATCH         8192
+#define VJOIN_HT_LOAD_FACTOR    2       /* capacity = inner_rows * factor */
+
+/*
+ * GUC default / range macros.  Centralised so initializers and
+ * DefineCustomXxxVariable() calls cannot drift out of sync.
+ *
+ * Development-phase policy (pre-1.0):
+ *   - All physical operators enabled.
+ *   - cost_factor / per-jointype factors are NEUTRAL (1.0); we no longer
+ *     hand-bias the model down to make vjoin look cheaper.
+ *   - auto_tune is ON by default: when a native path of the same physical
+ *     type is cheaper, we clamp our cost to native * auto_tune_margin.
+ *     This makes vjoin selectable without manual tuning while still
+ *     deferring to honest model wins.
+ */
+#define VJOIN_DEFAULT_ENABLE              true
+#define VJOIN_DEFAULT_ENABLE_HASHJOIN     true
+#define VJOIN_DEFAULT_ENABLE_NESTLOOP     true
+#define VJOIN_DEFAULT_ENABLE_MERGEJOIN    true
+
+#define VJOIN_DEFAULT_COST_FACTOR         1.0
+#define VJOIN_MIN_COST_FACTOR             0.01
+#define VJOIN_MAX_COST_FACTOR             10.0
+
+#define VJOIN_DEFAULT_HASH_COST_FACTOR     1.0
+#define VJOIN_DEFAULT_MERGE_COST_FACTOR    1.0
+#define VJOIN_DEFAULT_NESTLOOP_COST_FACTOR 1.0
+
+#define VJOIN_DEFAULT_AUTO_TUNE           true
+#define VJOIN_DEFAULT_AUTO_TUNE_MARGIN    0.95
+#define VJOIN_MIN_AUTO_TUNE_MARGIN        0.10
+#define VJOIN_MAX_AUTO_TUNE_MARGIN        1.50
 
 /* GUC variables */
 extern bool vjoin_enable;
@@ -21,6 +61,11 @@ extern bool vjoin_enable_nestloop;
 extern bool vjoin_enable_mergejoin;
 extern int  vjoin_batch_size;
 extern double vjoin_cost_factor;
+extern double vjoin_hash_cost_factor;
+extern double vjoin_merge_cost_factor;
+extern double vjoin_nestloop_cost_factor;
+extern bool   vjoin_auto_tune;
+extern double vjoin_auto_tune_margin;
 
 /* Saved previous hooks (needed across translation units) */
 extern set_join_pathlist_hook_type prev_join_pathlist_hook;
