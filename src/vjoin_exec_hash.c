@@ -1247,6 +1247,7 @@ vjoin_hash_explain(CustomScanState *node, List *ancestors, ExplainState *es)
     /* Use cached count — safe even after DSM detach */
     ExplainPropertyInteger("Hash Table Size", NULL,
                            state->cached_ht_entries, es);
+    ExplainPropertyInteger("Batches", NULL, state->cached_nbatch, es);
     ExplainPropertyInteger("Batch Size", NULL, state->batch_size, es);
     ExplainPropertyBool("SIMD", state->use_simd, es);
 }

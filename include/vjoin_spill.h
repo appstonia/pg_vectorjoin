@@ -29,6 +29,7 @@
 typedef struct vjoin_spill_file
 {
     BufFile    *bf;             /* NULL until first write */
+    MemoryContext owner;        /* context the BufFile must be allocated in */
     int64       tuple_count;
     int64       byte_count;
 } vjoin_spill_file;

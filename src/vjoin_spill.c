@@ -27,6 +27,16 @@ vjoin_spill_create(void)
 {
     vjoin_spill_file *sf = palloc0(sizeof(vjoin_spill_file));
 
+    /*
+     * Remember the context the struct itself lives in.  The BufFile is
+     * created lazily on first write, possibly while a short-lived context
+     * (e.g. the per-batch context, which is reset between batches) is
+     * current.  BufFileCreateTemp allocates in CurrentMemoryContext, so we
+     * must switch back to this long-lived context to keep the BufFile alive
+     * until vjoin_spill_close.
+     */
+    sf->owner = CurrentMemoryContext;
+
     /* Lazy: BufFile is only created on first write. */
     return sf;
 }
@@ -59,7 +69,12 @@ static inline void
 vjoin_spill_ensure_bf(vjoin_spill_file *sf)
 {
     if (sf->bf == NULL)
+    {
+        MemoryContext old = MemoryContextSwitchTo(sf->owner);
+
         sf->bf = BufFileCreateTemp(false);
+        MemoryContextSwitchTo(old);
+    }
 }
 
 static inline int

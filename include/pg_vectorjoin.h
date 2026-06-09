@@ -66,6 +66,10 @@
 #define VJOIN_MIN_HASH_MAX_BATCHES        1
 #define VJOIN_MAX_HASH_MAX_BATCHES        1048576
 
+/* Approximate spilled tuples per temp-file page, used by the spill I/O cost
+ * estimate in vjoin_path.c. */
+#define VJOIN_SPILL_TUPLES_PER_PAGE       100.0
+
 /* GUC variables */
 extern bool vjoin_enable;
 extern bool vjoin_enable_hashjoin;

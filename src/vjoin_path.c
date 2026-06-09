@@ -40,26 +40,37 @@ vjoin_path_next_power_of_2(uint64 n)
  * Estimate whether the vector hash table for a given inner relation fits
  * within PostgreSQL's hash memory budget (work_mem * hash_mem_multiplier).
  *
- * Unlike native hash join, vector hash join cannot batch to disk when the
- * hash table exceeds memory.  We therefore apply a 2x safety margin to
- * account for planner row-count estimation errors -- the hash path is only
- * created when the estimated footprint is at most 50% of the budget.
+ * When multi-batch spilling is enabled (vjoin_enable_hash_spill) and this is
+ * not a parallel build (spilling is serial-only in v1), the inner relation no
+ * longer has to fit in memory: we estimate how many batches (power of two,
+ * capped by vjoin_hash_max_batches) are needed so that one batch's in-memory
+ * footprint fits the budget, and accept the path.  The estimated batch count
+ * is returned via *nbatch_out for use by the cost model.
+ *
+ * Otherwise (spilling off, or parallel build) the old strict behavior applies:
+ * the whole table must fit within 50% of the budget (2x safety margin for
+ * planner row-count estimation errors), and *nbatch_out is set to 1.
  *
  * The vector hash table stores three flat arrays:
  *   hashvals:   capacity * sizeof(uint32)
  *   all_values: capacity * sizeof(Datum) * num_inner_attrs
  *   all_isnull: capacity * sizeof(bool)  * num_inner_attrs
  *
- * Also enforces MaxAllocSize per-array as a hard ceiling.
+ * Also enforces MaxAllocSize per-array (per-batch when spilling) as a hard
+ * ceiling.
  */
 static bool
 vjoin_hash_allocation_fits(double inner_rows, int num_inner_attrs,
-                           bool parallel_build)
+                           bool parallel_build, int *nbatch_out)
 {
     uint64 target_rows;
     int    capacity;
     uint64 total_bytes;
     uint64 hash_mem_limit;
+    bool   spill;
+
+    if (nbatch_out)
+        *nbatch_out = 1;
 
     if (num_inner_attrs <= 0)
         return false;
@@ -72,6 +83,53 @@ vjoin_hash_allocation_fits(double inner_rows, int num_inner_attrs,
         target_rows *= 2;
     if (target_rows < 128)
         target_rows = 128;
+
+    hash_mem_limit = (uint64)((double) work_mem * hash_mem_multiplier * 1024.0);
+    if (hash_mem_limit < 64 * 1024)
+        hash_mem_limit = 64 * 1024;
+
+    /* Spilling is serial-only in v1. */
+    spill = vjoin_enable_hash_spill && !parallel_build;
+
+    if (spill)
+    {
+        uint64 row_bytes;
+        uint64 est_bytes;
+        int    max_nbatch;
+        int    nbatch;
+        uint64 per_batch_rows;
+        int    per_batch_cap;
+
+        /* Approximate per-row in-memory footprint of the flat arrays. */
+        row_bytes = (uint64) sizeof(uint32) +
+                    ((uint64) sizeof(Datum) + sizeof(bool)) * num_inner_attrs;
+        est_bytes = target_rows * row_bytes;
+
+        /* Choose the smallest power-of-two nbatch whose batch fits the budget. */
+        max_nbatch = vjoin_path_next_power_of_2(Max(vjoin_hash_max_batches, 1));
+        nbatch = 1;
+        while (nbatch < max_nbatch &&
+               (double) est_bytes / nbatch > (double) hash_mem_limit)
+            nbatch *= 2;
+
+        /* Per-batch capacity must still respect the palloc ceiling. */
+        per_batch_rows = (target_rows + nbatch - 1) / (uint64) nbatch;
+        per_batch_cap = vjoin_path_next_power_of_2(per_batch_rows);
+        if (per_batch_cap <= 0)
+            return false;
+        if ((uint64) per_batch_cap > (uint64) MaxAllocSize / sizeof(uint32))
+            return false;
+        if ((uint64) per_batch_cap >
+            (uint64) MaxAllocSize / ((uint64) sizeof(Datum) * num_inner_attrs))
+            return false;
+        if ((uint64) per_batch_cap >
+            (uint64) MaxAllocSize / ((uint64) sizeof(bool) * num_inner_attrs))
+            return false;
+
+        if (nbatch_out)
+            *nbatch_out = nbatch;
+        return true;
+    }
 
     capacity = vjoin_path_next_power_of_2(target_rows);
     if (capacity <= 0)
@@ -88,13 +146,11 @@ vjoin_hash_allocation_fits(double inner_rows, int num_inner_attrs,
         return false;
 
     /* Total memory footprint vs work_mem budget.
-     * Apply 2x safety margin: vector hash join cannot batch to disk,
-     * so we must leave headroom for planner estimation errors. */
+     * Apply 2x safety margin: without spilling, vector hash join cannot
+     * batch to disk, so we must leave headroom for estimation errors. */
     total_bytes = (uint64) capacity * sizeof(uint32) +
                   (uint64) capacity * sizeof(Datum) * num_inner_attrs +
                   (uint64) capacity * sizeof(bool)  * num_inner_attrs;
-
-    hash_mem_limit = (uint64)((double) work_mem * hash_mem_multiplier * 1024.0);
 
     if (total_bytes * 2 > hash_mem_limit)
         return false;
@@ -675,6 +731,7 @@ vjoin_try_hashjoin(PlannerInfo *root,
     if (outer_path != NULL && inner_path != NULL)
     {
         int num_inner_attrs = vjoin_path_num_attrs(inner_path, innerrel);
+        int nbatch_est = 1;
 
         outer_rows = outer_path->rows;
         inner_rows = inner_path->rows;
@@ -687,13 +744,29 @@ vjoin_try_hashjoin(PlannerInfo *root,
         if (innerrel->tuples > 0 && innerrel->tuples > inner_rows)
             inner_rows = innerrel->tuples;
 
-        if (!vjoin_hash_allocation_fits(inner_rows, num_inner_attrs, false))
+        if (!vjoin_hash_allocation_fits(inner_rows, num_inner_attrs, false,
+                                        &nbatch_est))
             goto try_parallel_hash;
 
         startup_cost = inner_path->total_cost +
                        inner_rows * (cpu_tuple_cost + cpu_operator_cost) * cost_factor;
         run_cost = outer_path->total_cost +
                    outer_rows * (cpu_tuple_cost + cpu_operator_cost) * cost_factor;
+
+        /*
+         * Multi-batch spill I/O cost.  Roughly (nbatch_est - 1)/nbatch_est of
+         * both inputs are written to and re-read from temp files, i.e. two
+         * sequential I/Os per spilled tuple.  Charge inner spill to startup
+         * (happens during build) and outer spill to run.
+         */
+        if (nbatch_est > 1)
+        {
+            double spill_frac = (double) (nbatch_est - 1) / nbatch_est;
+            double io_per_tuple = seq_page_cost / VJOIN_SPILL_TUPLES_PER_PAGE;
+
+            startup_cost += inner_rows * spill_frac * 2.0 * io_per_tuple;
+            run_cost += outer_rows * spill_frac * 2.0 * io_per_tuple;
+        }
 
         cpath = makeNode(CustomPath);
         cpath->path.pathtype = T_CustomScan;
@@ -798,7 +871,7 @@ try_parallel_hash:
 
                 if (vjoin_hash_allocation_fits(par_inner_rows,
                                                num_inner_attrs,
-                                               parallel_build))
+                                               parallel_build, NULL))
                 {
                     if (parallel_build)
                     {
