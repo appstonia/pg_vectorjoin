@@ -12,12 +12,14 @@ EXTENSION = pg_vectorjoin
 DATA = pg_vectorjoin--1.0.sql
 
 PG_CPPFLAGS = -I$(srcdir)/include
-PG_CFLAGS = -O2
+PG_CFLAGS = -O2 -Wno-ignored-attributes
 
 REGRESS = basic outer_join_test
 REGRESS_OPTS = --inputdir=$(srcdir)/test
 
-PG_CONFIG ?= pg_config
+# Default to PostgreSQL 18 (Homebrew). Override with `make PG_CONFIG=...`
+# to build against a different installation.
+PG_CONFIG ?= /opt/homebrew/opt/postgresql@18/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 
 # Fix stale sysroot on macOS when pg_config was built with an older SDK
