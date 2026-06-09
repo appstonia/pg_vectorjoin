@@ -20,6 +20,7 @@
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
 #include "vjoin_simd.h"
+#include "vjoin_spill.h"
 
 /*
  * Fill the scan slot from pre-deformed outer + inner Datum arrays.
@@ -547,6 +548,7 @@ vjoin_hash_build(VectorHashJoinState *state)
 
     /* Cache entry count before DSA (for EXPLAIN after DSM detach) */
     state->cached_ht_entries = state->hashtable->num_entries;
+    state->cached_nbatch = state->hashtable->nbatch;
 
     /* In parallel mode, share the HT */
     if (state->is_parallel)
@@ -614,46 +616,46 @@ vjoin_extract_outer_attrs(VectorHashJoinState *state,
 }
 
 /*
- * Fetch a batch of outer tuples and probe the hash table.
+ * Fetch one outer tuple into batch slot `batch_idx`, computing its hash.
+ *
+ * Source is either the live outer plan node (first pass, curbatch 0) or the
+ * spilled outer file for the current batch (replay passes).  When spilling is
+ * active, tuples that no longer belong to the current batch are routed to
+ * their batch's outer spill file instead of being placed in the batch.
+ *
+ * Returns:  1 = tuple placed at batch_idx
+ *           0 = source exhausted
+ *          -1 = tuple routed to spill (slot not consumed; caller retries)
  */
-static void
-vjoin_hash_probe_batch(VectorHashJoinState *state)
+static int
+vjoin_fetch_outer(VectorHashJoinState *state, int batch_idx,
+                  MemoryContext oldctx)
 {
-    MemoryContext oldctx;
-    TupleTableSlot *slot;
     VJoinHashTable *ht = state->hashtable;
-    int batch_idx;
-    int noa = state->num_outer_attrs;
+    int     noa = state->num_outer_attrs;
+    int     off = batch_idx * noa;
+    uint32  hashval = 0;
 
-    oldctx = MemoryContextSwitchTo(state->batch_ctx);
-    MemoryContextReset(state->batch_ctx);
-
-    state->batch_count = 0;
-    state->result_count = 0;
-    state->result_pos = 0;
-
-    /* Pull up to batch_size outer tuples */
-    for (batch_idx = 0; batch_idx < state->batch_size; batch_idx++)
+    if (!state->probe_from_spill)
     {
-        bool has_null = false;
-        uint32 hashval = 0;
-        int i, off;
+        TupleTableSlot *slot;
+        bool    has_null = false;
+        int     i;
 
-        /* Switch to parent context for ExecProcNode */
         MemoryContextSwitchTo(oldctx);
         slot = ExecProcNode(state->outer_ps);
         MemoryContextSwitchTo(state->batch_ctx);
         if (TupIsNull(slot))
-            break;
+        {
+            state->outer_exhausted = true;
+            return 0;
+        }
 
-        /* Extract all outer attributes into batch Datum arrays */
         vjoin_extract_outer_attrs(state, slot, batch_idx);
 
-        /* Compute hash from key values within batch_values */
-        off = batch_idx * noa;
         for (i = 0; i < state->num_keys; i++)
         {
-            int keyoff = state->outer_keynos[i] - 1;  /* 1-based → 0-based */
+            int keyoff = state->outer_keynos[i] - 1;
             if (state->batch_isnull[off + keyoff])
             {
                 has_null = true;
@@ -666,15 +668,166 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
                 if (vjoin_is_fast_type(state->key_types[i]))
                     h = vjoin_hash_datum(d, state->key_types[i]);
                 else
-                    h = vjoin_hash_datum_generic(d,
-                                                 &state->hash_finfo[i],
+                    h = vjoin_hash_datum_generic(d, &state->hash_finfo[i],
                                                  state->key_collations[i]);
                 hashval = (i == 0) ? h : vjoin_combine_hashes(hashval, h);
             }
         }
+        if (has_null)
+            hashval = 0;
+    }
+    else
+    {
+        vjoin_spill_file *sf = ht->outer_batch_files[ht->curbatch];
+        bool    ok;
 
-        state->batch_hashes[batch_idx] = has_null ? 0 : hashval;
+        if (sf == NULL)
+            return 0;
+        ok = vjoin_spill_read_tuple(sf, &hashval, noa,
+                                    &state->batch_values[off],
+                                    &state->batch_isnull[off],
+                                    state->outer_byval, state->outer_typlen);
+        if (!ok)
+            return 0;
+    }
+
+    /* Route to the correct batch when spilling is active. */
+    if (ht->nbatch > 1 && hashval != 0)
+    {
+        int batchno = VJOIN_BATCH_OF(ht, hashval);
+
+        if (batchno != ht->curbatch)
+        {
+            vjoin_spill_write_tuple(vjoin_ht_outer_file(ht, batchno), hashval,
+                                    noa, &state->batch_values[off],
+                                    &state->batch_isnull[off],
+                                    state->outer_byval, state->outer_typlen);
+            return -1;
+        }
+    }
+
+    state->batch_hashes[batch_idx] = hashval;
+    return 1;
+}
+
+/*
+ * Reload the inner tuples for `batchno` from its spill file into the (already
+ * reset) in-memory hash table.  Tuples that were spilled before a later split
+ * may now belong to a higher batch — those are re-routed to their new batch's
+ * inner file.  Inserting may itself trigger another split.
+ */
+static void
+vjoin_reload_inner_batch(VectorHashJoinState *state, int batchno)
+{
+    VJoinHashTable *ht = state->hashtable;
+    vjoin_spill_file *sf = ht->inner_batch_files[batchno];
+    int     na = ht->num_all_attrs;
+    MemoryContext readctx,
+                  old;
+
+    if (sf == NULL)
+        return;
+
+    vjoin_spill_rewind(sf);
+
+    readctx = AllocSetContextCreate(CurrentMemoryContext, "VJoinReloadRead",
+                                    ALLOCSET_SMALL_SIZES);
+    old = MemoryContextSwitchTo(readctx);
+
+    for (;;)
+    {
+        uint32  hashval;
+        bool    ok;
+
+        CHECK_FOR_INTERRUPTS();
+        MemoryContextReset(readctx);
+
+        ok = vjoin_spill_read_tuple(sf, &hashval, na,
+                                    state->reload_values, state->reload_isnull,
+                                    ht->attr_byval, ht->attr_typlen);
+        if (!ok)
+            break;
+
+        if (VJOIN_BATCH_OF(ht, hashval) != ht->curbatch)
+        {
+            int bn = VJOIN_BATCH_OF(ht, hashval);
+
+            vjoin_spill_write_tuple(vjoin_ht_inner_file(ht, bn), hashval, na,
+                                    state->reload_values, state->reload_isnull,
+                                    ht->attr_byval, ht->attr_typlen);
+            continue;
+        }
+
+        vjoin_ht_insert(ht, hashval, state->reload_values, state->reload_isnull);
+    }
+
+    MemoryContextSwitchTo(old);
+    MemoryContextDelete(readctx);
+}
+
+/*
+ * Advance to the next spilled batch: reload its inner tuples and rewind its
+ * outer file for replay.  Returns false when no batches remain.
+ */
+static bool
+vjoin_load_next_batch(VectorHashJoinState *state)
+{
+    VJoinHashTable *ht = state->hashtable;
+
+    if (ht->nbatch <= 1)
+        return false;
+
+    for (;;)
+    {
+        if (ht->curbatch + 1 >= ht->nbatch)
+            return false;
+
+        ht->curbatch++;
+        vjoin_ht_reset_for_batch(ht);
+        vjoin_reload_inner_batch(state, ht->curbatch);
+
+        state->probe_from_spill = true;
+
+        /* Nothing to probe if no outer tuples landed in this batch. */
+        if (ht->outer_batch_files[ht->curbatch] == NULL)
+            continue;
+
+        vjoin_spill_rewind(ht->outer_batch_files[ht->curbatch]);
+        return true;
+    }
+}
+
+/*
+ * Fetch a batch of outer tuples and probe the hash table.
+ */
+static void
+vjoin_hash_probe_batch(VectorHashJoinState *state)
+{
+    MemoryContext oldctx;
+    VJoinHashTable *ht = state->hashtable;
+    int batch_idx;
+    int noa = state->num_outer_attrs;
+
+    oldctx = MemoryContextSwitchTo(state->batch_ctx);
+    MemoryContextReset(state->batch_ctx);
+
+    state->batch_count = 0;
+    state->result_count = 0;
+    state->result_pos = 0;
+
+    /* Pull up to batch_size outer tuples (routing spilled ones to disk) */
+    batch_idx = 0;
+    while (batch_idx < state->batch_size)
+    {
+        int r = vjoin_fetch_outer(state, batch_idx, oldctx);
+
+        if (r == 0)
+            break;              /* source exhausted */
+        if (r < 0)
+            continue;           /* routed to spill; slot not consumed */
+
         state->batch_count++;
+        batch_idx++;
     }
 
     if (state->jointype == JOIN_LEFT && state->batch_count > 0)
@@ -795,7 +948,7 @@ vjoin_hash_probe_batch(VectorHashJoinState *state)
     if (state->result_count > 0)
         state->phase = VHJ_EMIT;
     else if (state->batch_count < state->batch_size)
-        state->phase = VHJ_DONE;
+        state->phase = VHJ_LOAD_BATCH;  /* source exhausted: advance batch */
     /* else: stay in VHJ_PROBE to fetch next batch */
 }
 
@@ -939,6 +1092,13 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
     state->left_emit_pos = 0;
     state->right_emit_pos = 0;
 
+    /* Multi-batch spill probe scratch + flags */
+    state->probe_from_spill = false;
+    state->outer_exhausted = false;
+    state->reload_values = palloc(sizeof(Datum) * state->num_inner_attrs);
+    state->reload_isnull = palloc(sizeof(bool) * state->num_inner_attrs);
+    state->cached_nbatch = 1;
+
     /* SIMD detection */
     state->use_simd = vjoin_simd_caps.has_avx2 || vjoin_simd_caps.has_sse2 ||
                       vjoin_simd_caps.has_neon;
@@ -968,11 +1128,18 @@ vjoin_hash_exec(CustomScanState *node)
                 vjoin_hash_probe_batch(state);
                 continue;
 
+            case VHJ_LOAD_BATCH:
+                if (vjoin_load_next_batch(state))
+                    state->phase = VHJ_PROBE;
+                else
+                    state->phase = VHJ_DONE;
+                continue;
+
             case VHJ_EMIT:
                 if (state->result_pos >= state->result_count)
                 {
                     if (state->batch_count < state->batch_size)
-                        state->phase = VHJ_DONE;
+                        state->phase = VHJ_LOAD_BATCH;
                     else
                         state->phase = VHJ_PROBE;
                     continue;
@@ -1023,7 +1190,10 @@ vjoin_hash_end(CustomScanState *node)
      * For leader/non-parallel, the HT owns its own allocations.
      */
     if (state->hashtable)
+    {
+        vjoin_ht_close_spill_files(state->hashtable);
         vjoin_ht_destroy(state->hashtable);
+    }
     if (state->hash_ctx)
         MemoryContextDelete(state->hash_ctx);
     if (state->batch_ctx)
@@ -1060,6 +1230,10 @@ vjoin_hash_rescan(CustomScanState *node)
     state->result_pos = 0;
     state->left_emit_pos = 0;
     state->right_emit_pos = 0;
+    state->probe_from_spill = false;
+    state->outer_exhausted = false;
+    if (state->hashtable)
+        state->hashtable->curbatch = 0;
 }
 
 void

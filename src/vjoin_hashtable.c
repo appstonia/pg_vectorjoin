@@ -1,9 +1,12 @@
 #include "postgres.h"
+#include "miscadmin.h"
+#include "optimizer/cost.h"
 #include "utils/datum.h"
 #include "utils/dsa.h"
 #include "utils/memutils.h"
 #include "pg_vectorjoin.h"
 #include "vjoin_state.h"
+#include "vjoin_spill.h"
 
 /*
  * Runtime guard: only enforce MaxAllocSize (palloc hard ceiling).
@@ -89,6 +92,47 @@ vjoin_ht_create(int estimated_rows, int num_keys, int num_all_attrs,
     ht->dsa = NULL;
     ht->pstate = NULL;
 
+    /*
+     * Multi-batch spilling setup (serial path only).  Until the in-memory
+     * footprint exceeds space_allowed the table behaves as a single batch.
+     */
+    ht->nbatch = 1;
+    ht->curbatch = 0;
+    ht->space_used = 0;
+    ht->routing_frozen = false;
+    ht->log2_nbuckets = 0;
+    ht->valctx = htctx;
+    ht->inner_batch_files = NULL;
+    ht->outer_batch_files = NULL;
+
+    ht->spill_enabled = vjoin_enable_hash_spill;
+    if (ht->spill_enabled)
+    {
+        double  mult = hash_mem_multiplier;
+        Size    budget;
+
+        if (mult < 1.0)
+            mult = 1.0;
+        budget = (Size) ((double) work_mem * 1024.0 * mult);
+        if (budget < 64 * 1024)
+            budget = 64 * 1024;     /* floor: avoid pathological tiny batches */
+        ht->space_allowed = budget;
+
+        ht->max_nbatch = vjoin_next_power_of_2(Max(vjoin_hash_max_batches, 1));
+
+        /*
+         * Byref payloads live in a resettable child context so they can be
+         * discarded between batches when reloading spilled inner tuples.
+         */
+        ht->valctx = AllocSetContextCreate(htctx, "VJoinHashBatchVals",
+                                           ALLOCSET_DEFAULT_SIZES);
+    }
+    else
+    {
+        ht->space_allowed = (Size) -1;  /* never trigger */
+        ht->max_nbatch = 1;
+    }
+
     return ht;
 }
 
@@ -155,7 +199,254 @@ vjoin_ht_create_shared(VJoinParallelState *pstate, dsa_area *dsa,
     ht->dsa = dsa;
     ht->pstate = pstate;
 
+    /* Spilling is not supported for shared/parallel hash tables in v1. */
+    ht->nbatch = 1;
+    ht->curbatch = 0;
+    ht->space_used = 0;
+    ht->space_allowed = (Size) -1;
+    ht->max_nbatch = 1;
+    ht->spill_enabled = false;
+    ht->routing_frozen = false;
+    ht->log2_nbuckets = 0;
+    ht->valctx = htctx;
+    ht->inner_batch_files = NULL;
+    ht->outer_batch_files = NULL;
+
     return ht;
+}
+
+/* log2 of a power-of-2 value. */
+static int
+vjoin_log2_int(int n)
+{
+    int l = 0;
+
+    while ((1 << l) < n)
+        l++;
+    return l;
+}
+
+/* Logical in-memory byte cost of one stored entry (for the space budget). */
+static inline Size
+vjoin_entry_bytes(VJoinHashTable *ht, const Datum *values, const bool *isnull)
+{
+    int   na = ht->num_all_attrs;
+    Size  b = sizeof(uint32) + (Size) na * (sizeof(Datum) + sizeof(bool));
+    int   a;
+
+    if (ht->all_attrs_byval)
+        return b;
+
+    for (a = 0; a < na; a++)
+    {
+        if (isnull[a] || ht->attr_byval[a])
+            continue;
+        b += (Size) datumGetSize(values[a], false, ht->attr_typlen[a]);
+    }
+    return b;
+}
+
+/* Ensure inner/outer spill-file pointer arrays exist and are sized [nbatch]. */
+static void
+vjoin_ht_ensure_file_arrays(VJoinHashTable *ht, int nbatch)
+{
+    MemoryContext old = MemoryContextSwitchTo(ht->htctx);
+
+    if (ht->inner_batch_files == NULL)
+    {
+        ht->inner_batch_files = palloc0(sizeof(vjoin_spill_file *) * nbatch);
+        ht->outer_batch_files = palloc0(sizeof(vjoin_spill_file *) * nbatch);
+    }
+    else
+    {
+        int old_nbatch = ht->nbatch;
+
+        ht->inner_batch_files = repalloc(ht->inner_batch_files,
+                                         sizeof(vjoin_spill_file *) * nbatch);
+        ht->outer_batch_files = repalloc(ht->outer_batch_files,
+                                         sizeof(vjoin_spill_file *) * nbatch);
+        memset(&ht->inner_batch_files[old_nbatch], 0,
+               sizeof(vjoin_spill_file *) * (nbatch - old_nbatch));
+        memset(&ht->outer_batch_files[old_nbatch], 0,
+               sizeof(vjoin_spill_file *) * (nbatch - old_nbatch));
+    }
+
+    MemoryContextSwitchTo(old);
+}
+
+/* Lazily create and return the inner spill file for the given batch. */
+vjoin_spill_file *
+vjoin_ht_inner_file(VJoinHashTable *ht, int batchno)
+{
+    MemoryContext old;
+
+    if (ht->inner_batch_files[batchno] != NULL)
+        return ht->inner_batch_files[batchno];
+
+    old = MemoryContextSwitchTo(ht->htctx);
+    ht->inner_batch_files[batchno] = vjoin_spill_create();
+    MemoryContextSwitchTo(old);
+    return ht->inner_batch_files[batchno];
+}
+
+/* Lazily create and return the outer spill file for the given batch. */
+vjoin_spill_file *
+vjoin_ht_outer_file(VJoinHashTable *ht, int batchno)
+{
+    MemoryContext old;
+
+    if (ht->outer_batch_files[batchno] != NULL)
+        return ht->outer_batch_files[batchno];
+
+    old = MemoryContextSwitchTo(ht->htctx);
+    ht->outer_batch_files[batchno] = vjoin_spill_create();
+    MemoryContextSwitchTo(old);
+    return ht->outer_batch_files[batchno];
+}
+
+/*
+ * Double nbatch and evict every in-memory entry that no longer belongs to
+ * curbatch to its inner spill file.  Called when the in-memory footprint
+ * exceeds space_allowed.  Re-hashes survivors into fresh arrays (open
+ * addressing cannot tolerate tombstones).
+ */
+static void
+vjoin_ht_grow_batches(VJoinHashTable *ht)
+{
+    int         na = ht->num_all_attrs;
+    int         old_cap = ht->capacity;
+    uint32     *old_hv = ht->hashvals;
+    Datum      *old_val = ht->all_values;
+    bool       *old_null = ht->all_isnull;
+    uint32     *new_hv;
+    Datum      *new_val;
+    bool       *new_null;
+    int         new_nbatch;
+    int         i;
+    MemoryContext old;
+
+    Assert(!ht->is_shared);
+
+    if (ht->nbatch >= ht->max_nbatch)
+    {
+        /* Cannot split further: stop enforcing the budget. */
+        ht->space_allowed = (Size) -1;
+        return;
+    }
+
+    new_nbatch = ht->nbatch * 2;
+
+    /* Freeze the bucket-index width used for batch routing at first split. */
+    if (!ht->routing_frozen)
+    {
+        ht->log2_nbuckets = vjoin_log2_int(ht->capacity);
+        ht->routing_frozen = true;
+    }
+
+    vjoin_ht_ensure_file_arrays(ht, new_nbatch);
+    ht->nbatch = new_nbatch;
+
+    /* Fresh arrays (same capacity); re-insert survivors, spill the rest. */
+    old = MemoryContextSwitchTo(ht->htctx);
+    new_hv = (uint32 *) palloc0(sizeof(uint32) * old_cap);
+    new_val = (Datum *) palloc0(sizeof(Datum) * old_cap * na);
+    new_null = (bool *) palloc0(sizeof(bool) * old_cap * na);
+    MemoryContextSwitchTo(old);
+
+    ht->hashvals = new_hv;
+    ht->all_values = new_val;
+    ht->all_isnull = new_null;
+    ht->num_entries = 0;
+    ht->space_used = 0;
+
+    for (i = 0; i < old_cap; i++)
+    {
+        uint32  hv = old_hv[i];
+        int     batchno;
+        int     pos;
+        int     sbase;
+
+        if (hv == 0)
+            continue;
+
+        sbase = i * na;
+        batchno = VJOIN_BATCH_OF(ht, hv);
+
+        if (batchno != ht->curbatch)
+        {
+            vjoin_spill_write_tuple(vjoin_ht_inner_file(ht, batchno), hv, na,
+                                    &old_val[sbase], &old_null[sbase],
+                                    ht->attr_byval, ht->attr_typlen);
+            continue;
+        }
+
+        /* Survivor: re-insert into the new arrays. */
+        pos = hv & ht->mask;
+        while (ht->hashvals[pos] != 0)
+            pos = (pos + 1) & ht->mask;
+        ht->hashvals[pos] = hv;
+        memcpy(&ht->all_values[pos * na], &old_val[sbase], sizeof(Datum) * na);
+        memcpy(&ht->all_isnull[pos * na], &old_null[sbase], sizeof(bool) * na);
+        ht->num_entries++;
+        ht->space_used += vjoin_entry_bytes(ht, &old_val[sbase],
+                                            &old_null[sbase]);
+    }
+
+    pfree(old_hv);
+    pfree(old_val);
+    pfree(old_null);
+
+    /*
+     * If a single split was not enough to get back under budget, recurse.
+     * (Bounded by max_nbatch.)
+     */
+    if (ht->space_used > ht->space_allowed)
+        vjoin_ht_grow_batches(ht);
+}
+
+/*
+ * Reset the in-memory portion of the table so a new batch can be loaded.
+ * Clears occupancy (hashvals) and any byref payloads; keeps the flat
+ * arrays and metadata.
+ */
+void
+vjoin_ht_reset_for_batch(VJoinHashTable *ht)
+{
+    memset(ht->hashvals, 0, sizeof(uint32) * ht->capacity);
+    ht->num_entries = 0;
+    ht->space_used = 0;
+    if (ht->valctx != ht->htctx)
+        MemoryContextReset(ht->valctx);
+}
+
+/* Close and free all spill files (idempotent). */
+void
+vjoin_ht_close_spill_files(VJoinHashTable *ht)
+{
+    int i;
+
+    if (ht->inner_batch_files != NULL)
+    {
+        for (i = 0; i < ht->nbatch; i++)
+        {
+            if (ht->inner_batch_files[i] != NULL)
+            {
+                vjoin_spill_close(ht->inner_batch_files[i]);
+                ht->inner_batch_files[i] = NULL;
+            }
+        }
+    }
+    if (ht->outer_batch_files != NULL)
+    {
+        for (i = 0; i < ht->nbatch; i++)
+        {
+            if (ht->outer_batch_files[i] != NULL)
+            {
+                vjoin_spill_close(ht->outer_batch_files[i]);
+                ht->outer_batch_files[i] = NULL;
+            }
+        }
+    }
 }
 
 void
@@ -170,6 +461,29 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
     /* Ensure hash is non-zero (0 = empty marker) */
     if (hashval == 0)
         hashval = 1;
+
+    /*
+     * Spilling: enforce the memory budget before inserting.  When the
+     * in-memory footprint exceeds space_allowed we split into more batches,
+     * evicting non-curbatch entries to disk.  After (possibly) splitting,
+     * route this tuple: if it no longer belongs to curbatch, spill it.
+     */
+    if (ht->spill_enabled && !ht->is_shared)
+    {
+        int batchno;
+
+        if (ht->space_used > ht->space_allowed && ht->nbatch < ht->max_nbatch)
+            vjoin_ht_grow_batches(ht);
+
+        batchno = VJOIN_BATCH_OF(ht, hashval);
+        if (batchno != ht->curbatch)
+        {
+            vjoin_spill_write_tuple(vjoin_ht_inner_file(ht, batchno), hashval,
+                                    na, all_values, all_isnull,
+                                    ht->attr_byval, ht->attr_typlen);
+            return;
+        }
+    }
 
     /* Check if we need to grow (load factor > 50%) */
     if (ht->num_entries * 2 >= ht->capacity)
@@ -260,7 +574,7 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
     }
 
     /* Insert into table */
-    old = MemoryContextSwitchTo(ht->htctx);
+    old = MemoryContextSwitchTo(ht->valctx);
 
     pos = hashval & ht->mask;
     while (ht->hashvals[pos] != 0)
@@ -290,6 +604,8 @@ vjoin_ht_insert(VJoinHashTable *ht, uint32 hashval,
     }
 
     ht->num_entries++;
+    if (ht->spill_enabled && !ht->is_shared)
+        ht->space_used += vjoin_entry_bytes(ht, all_values, all_isnull);
 
     MemoryContextSwitchTo(old);
 }

@@ -205,6 +205,12 @@ bool vjoin_ht_insert_cas(VJoinHashTable *ht,
                          uint32 hashval,
                          Datum *all_values, bool *all_isnull);
 void vjoin_ht_destroy(VJoinHashTable *ht);
+/* Multi-batch spilling (vjoin_hashtable.c) */
+struct vjoin_spill_file;
+void vjoin_ht_reset_for_batch(VJoinHashTable *ht);
+void vjoin_ht_close_spill_files(VJoinHashTable *ht);
+struct vjoin_spill_file *vjoin_ht_inner_file(VJoinHashTable *ht, int batchno);
+struct vjoin_spill_file *vjoin_ht_outer_file(VJoinHashTable *ht, int batchno);
 void vjoin_ht_serialize_to_dsa(VJoinHashTable *ht, dsa_area *dsa,
                                 struct VJoinParallelState *pstate);
 VJoinHashTable *vjoin_ht_attach_from_dsa(struct VJoinParallelState *pstate,

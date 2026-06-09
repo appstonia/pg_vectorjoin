@@ -119,9 +119,19 @@ typedef struct VJoinHashTable
     Size        space_allowed;      /* byte budget for in-memory batch */
     Size        space_used;         /* current bytes consumed by tuples */
     int         max_nbatch;         /* upper bound on nbatch */
+    bool        spill_enabled;      /* false for shared/parallel tables */
+    bool        routing_frozen;     /* log2_nbuckets fixed at first split */
+    MemoryContext valctx;           /* byref payload storage (resettable) */
     struct vjoin_spill_file **inner_batch_files; /* [nbatch] inner spill */
     struct vjoin_spill_file **outer_batch_files; /* [nbatch] outer spill */
 } VJoinHashTable;
+
+/*
+ * Batch routing: high bits of the 32-bit hashvalue above the (frozen)
+ * bucket-index width select the batch.  When nbatch == 1 this is always 0.
+ */
+#define VJOIN_BATCH_OF(ht, hv) \
+    (((uint32) (hv) >> (ht)->log2_nbuckets) & (uint32) ((ht)->nbatch - 1))
 
 /* ---------- Result buffer entry ---------- */
 typedef struct VJoinMatch
@@ -135,6 +145,7 @@ typedef enum VHJPhase
 {
     VHJ_BUILD,
     VHJ_PROBE,
+    VHJ_LOAD_BATCH,
     VHJ_EMIT,
     VHJ_DONE
 } VHJPhase;
@@ -210,6 +221,13 @@ typedef struct VectorHashJoinState
     VJoinParallelState *pstate;     /* pointer to DSM-resident shared state */
     dsa_area   *dsa;                /* attached DSA area (leader + workers) */
     int         cached_ht_entries;  /* snapshot for EXPLAIN after DSM detach */
+
+    /* Multi-batch spill probe support */
+    bool        probe_from_spill;   /* true once replaying outer spill files */
+    bool        outer_exhausted;    /* live outer node fully read */
+    Datum      *reload_values;      /* [num_inner_attrs] scratch for reload */
+    bool       *reload_isnull;      /* [num_inner_attrs] scratch for reload */
+    int         cached_nbatch;      /* snapshot for EXPLAIN */
 } VectorHashJoinState;
 
 /* ---------- Block Nested Loop state ---------- */
