@@ -13,6 +13,16 @@ VectorMergeJoin) alongside native join strategies. The optimizer's
 cost-based selection decides which path wins -- vectorized or native -- on
 a per-join basis.
 
+## Key Features
+
+- Transparent planner integration: no query rewrites are required.
+- Vectorized hash, nested-loop, and merge join paths for supported joins.
+- Runtime SIMD detection on x86-64 and ARM; no compile-time flags needed.
+- Parallel vectorized hash join with shared DSA hash table support.
+- Cost-model auto-tuning to make vectorized joins selectable without manual
+  per-jointype tuning.
+- Optional hash spill for oversized inner relations with bounded partitioning.
+
 ## How It Works
 
 PostgreSQL's Volcano execution model processes one tuple at a time through
@@ -21,7 +31,7 @@ key comparison or hashing because there is only a single value to work with
 at any given moment.
 
 pg_vectorjoin changes this by buffering tuples into fixed-size blocks
-(default 2000) and operating on them in bulk:
+(default 128, power-of-two, range 64–8192) and operating on them in bulk:
 
 **VectorHashJoin** -- Deforms all inner tuples into flat columnar arrays at
 build time. During the probe phase, outer tuples are batch-hashed and
@@ -117,8 +127,15 @@ All parameters are settable per-session without server restart:
 | pg_vectorjoin.enable_hashjoin | true | -- | Enable VectorHashJoin paths |
 | pg_vectorjoin.enable_nestloop | true | -- | Enable VectorNestedLoop paths |
 | pg_vectorjoin.enable_mergejoin | true | -- | Enable VectorMergeJoin paths |
-| pg_vectorjoin.batch_size | 2048 | 64 -- 8192 | Block size for batch processing |
-| pg_vectorjoin.cost_factor | 0.5 | 0.01 -- 10.0 | Join overhead cost multiplier (lower = prefer vectorized) |
+| pg_vectorjoin.batch_size | 128 | 64 -- 8192 | Batch/block size for vectorized processing |
+| pg_vectorjoin.cost_factor | 1.0 | 0.01 -- 10.0 | Global join cost scaling (lower = prefer vectorized) |
+| pg_vectorjoin.hash_cost_factor | 1.0 | 0.01 -- 10.0 | Per-jointype cost scaling for vectorized hash join |
+| pg_vectorjoin.merge_cost_factor | 1.0 | 0.01 -- 10.0 | Per-jointype cost scaling for vectorized merge join |
+| pg_vectorjoin.nestloop_cost_factor | 1.0 | 0.01 -- 10.0 | Per-jointype cost scaling for vectorized nested loop join |
+| pg_vectorjoin.auto_tune | true | -- | Automatically reduce vectorized cost close to comparable native path |
+| pg_vectorjoin.auto_tune_margin | 0.95 | 0.10 -- 1.50 | Target margin for auto-tuned vectorized cost |
+| pg_vectorjoin.enable_hash_spill | true | -- | Allow vectorized hash join to partition and spill oversized inner relations |
+| pg_vectorjoin.hash_max_batches | 1024 | 1 -- 1048576 | Upper bound on hash join spill batch count |
 
 ## Usage
 
@@ -131,8 +148,9 @@ LOAD 'pg_vectorjoin';
 
 -- Tune parameters per-session
 SET pg_vectorjoin.enable = on;
-SET pg_vectorjoin.batch_size = 2048;
+SET pg_vectorjoin.batch_size = 128;
 SET pg_vectorjoin.cost_factor = 0.3;
+SET pg_vectorjoin.auto_tune = on;
 
 SET pg_vectorjoin.enable_hashjoin = on;
 SET pg_vectorjoin.enable_mergejoin = on;
@@ -149,7 +167,7 @@ JOIN customers c ON c.id = o.customer_id;
    ->  Custom Scan (VectorHashJoin)
          Join Type: Inner
          Hash Table Size: 50000
-         Batch Size: 2000
+         Batch Size: 128
          SIMD: true
          ->  Seq Scan on orders o
          ->  Seq Scan on customers c
@@ -165,32 +183,37 @@ SET pg_vectorjoin.enable_nestloop = off;
 
 ## Limitations
 
-- **Numeric key types only.** Text, varchar, uuid, bytea, jsonb, and other
-  variable-length or pass-by-reference types are not eligible for vectorized
-  join. Joins on these types use native PostgreSQL strategies.
+- **Numeric or fixed-width pass-by-value keys only.** Text, varchar, uuid,
+  bytea, jsonb, and other variable-length or pass-by-reference types are not
+  eligible for the SIMD fast path. These joins fall back to native PostgreSQL
+  strategies.
 
-- **No disk spill.** VectorHashJoin keeps the entire hash table in memory.
-  If the estimated table exceeds work_mem * hash_mem_multiplier, the
-  vectorized hash path is not created. Native hash join (which can batch to
-  disk) is used instead.
+- **Batch size constraints.** `pg_vectorjoin.batch_size` must be a power of two
+  between 64 and 8192. Very large batch sizes may increase memory usage and
+  reduce cache efficiency.
 
-- **No parameterized inner paths.** VectorNestedLoop cannot push outer
-  values into inner index conditions. For index nested loop patterns
-  (SELECT ... FROM a JOIN b ON a.id = b.id where b has an index on id),
-  native nested loop with parameterized index scan is typically faster.
+- **Hash spill is bounded.** VectorHashJoin can spill oversized inner
+  relations when `pg_vectorjoin.enable_hash_spill` is enabled, but the number
+  of spill batches is clipped by `pg_vectorjoin.hash_max_batches`.
 
-- **Limited LEFT JOIN.** Only hash join, only equi-join, no anti-join
-  patterns, no projection of nullable inner columns. Complex outer join
-  queries fall back to native execution.
+- **No parameterized inner paths.** VectorNestedLoop cannot push outer values
+  into inner index conditions. For index nested loop patterns, native nested
+  loop with parameterized index scan is typically faster.
 
-- **No SEMI/ANTI/RIGHT/FULL joins.** These join types are handled entirely
-  by native PostgreSQL.
+- **Limited LEFT JOIN support.** Only hash join is supported, and only safe
+  equi-join patterns are considered. Anti-join patterns, nullable inner-side
+  projections, and complex outer-join semantics may fall back to native
+  execution.
 
-- **Maximum 8 join keys** per join clause (VJOIN_MAX_KEYS = 8).
+- **No SEMI/ANTI/RIGHT/FULL joins.** These join types are handled entirely by
+  native PostgreSQL.
 
-- **Single-key SIMD only.** The SIMD comparison fast path activates for
-  single-key equi-joins on numeric types. Multi-key joins use a scalar
-  comparison loop (still batched, but without SIMD acceleration).
+- **Maximum 8 join keys.** A single join clause may use up to 8 key columns
+  (VJOIN_MAX_KEYS = 8).
+
+- **Single-key SIMD only.** SIMD acceleration is available only for single-key
+  equi-joins on supported numeric types. Multi-key joins are batched, but use a
+  scalar comparison loop.
 
 ## Compatibility
 
