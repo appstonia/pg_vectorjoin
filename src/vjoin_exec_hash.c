@@ -95,6 +95,24 @@ vjoin_hash_build(VectorHashJoinState *state)
                      state->hashtable->all_attrs_byval &&
                      state->inner_ps->plan->parallel_aware;
 
+
+    /*
+     * The CAS shared-DSA build cannot spill: its arrays live in fixed-size
+     * DSA memory and vjoin_ht_grow_batches Asserts !is_shared.  Disable
+     * spilling defensively for that path so a runtime row-count misestimate
+     * cannot trigger grow_batches.  The serial path and the per-worker
+     * private parallel build (handled below) keep spilling enabled.
+     */
+    if (parallel_build && state->hashtable != NULL &&
+        state->hashtable->spill_enabled)
+    {
+        VJoinHashTable *ht = state->hashtable;
+
+        ht->spill_enabled = false;
+        ht->space_allowed = (Size) -1;
+        ht->max_nbatch = 1;
+    }
+
     /*
      * All-participants parallel build (byval + parallel inner scan).
      * Leader and workers all scan inner chunks and CAS-insert into shared HT.
@@ -397,99 +415,16 @@ vjoin_hash_build(VectorHashJoinState *state)
     }
 
     /*
-     * Parallel worker (leader-only build): skip build, wait at barrier,
-     * then attach to the shared HT.
-     */
-    if (state->is_parallel && !state->is_leader)
-    {
-        BarrierArriveAndWait(&state->pstate->barrier, 0);
-
-        /* Destroy the empty local HT created during begin */
-        if (state->hashtable)
-        {
-            vjoin_ht_destroy(state->hashtable);
-            state->hashtable = NULL;
-        }
-
-        if (state->pstate->built_in_dsa)
-        {
-            /*
-             * Fast path: leader built directly in DSA (byval tables).
-             * Create a thin read-only wrapper pointing at shared arrays.
-             */
-            VJoinParallelState *ps = state->pstate;
-            dsa_area      *dsa = state->dsa;
-            MemoryContext  htctx;
-            VJoinHashTable *ht;
-
-            htctx = AllocSetContextCreate(state->hash_ctx,
-                                          "VJoinHashTable (shared-direct)",
-                                          ALLOCSET_DEFAULT_SIZES);
-            ht = (VJoinHashTable *)
-                MemoryContextAllocZero(htctx, sizeof(VJoinHashTable));
-
-            ht->htctx          = htctx;
-            ht->capacity       = ps->capacity;
-            ht->mask           = ps->mask;
-            ht->num_entries    = ps->num_entries;
-            ht->num_all_attrs  = ps->num_all_attrs;
-            ht->num_keys       = ps->num_keys;
-            ht->all_attrs_byval = ps->all_attrs_byval;
-            ht->is_shared      = false;  /* worker doesn't write */
-
-            /* Point directly at shared DSA arrays — zero memcpy */
-            ht->hashvals     = (uint32 *)    dsa_get_address(dsa, ps->hashvals_dp);
-            ht->all_values   = (Datum *)     dsa_get_address(dsa, ps->all_values_dp);
-            ht->all_isnull   = (bool *)      dsa_get_address(dsa, ps->all_isnull_dp);
-            ht->inner_keynos = (AttrNumber *) dsa_get_address(dsa, ps->inner_keynos_dp);
-            ht->attr_byval   = NULL;
-            ht->attr_typlen  = NULL;
-
-            state->hashtable = ht;
-        }
-        else
-        {
-            /* Slow path: byref table — attach with offset→pointer fixup */
-            state->hashtable = vjoin_ht_attach_from_dsa(state->pstate,
-                                                         state->dsa,
-                                                         state->hash_ctx);
-        }
-
-        state->cached_ht_entries = state->hashtable->num_entries;
-
-        state->phase = VHJ_PROBE;
-        return;
-    }
-
-    /*
-     * Leader (parallel) or non-parallel: build the hash table.
+     * Per-worker private build (parallel, non-CAS) or serial build.
      *
-     * For parallel + all-byval, switch to a DSA-backed HT so that
-     * the build writes directly into shared memory — no serialize step.
+     * For the parallel leader-only path the inner scan is NOT parallel-aware,
+     * so every participant (leader + workers) scans the FULL inner and builds
+     * its OWN private hash table here, with spilling enabled.  Each worker
+     * then probes its disjoint slice of the parallel-aware outer scan, so the
+     * union of the per-worker results is the complete join.  Because no shared
+     * DSA arrays and no build barrier are involved, this path can spill to
+     * disk independently in every worker.
      */
-    if (state->is_parallel && state->hashtable->all_attrs_byval)
-    {
-        /* Copy type metadata out of the local HT's context before destroying */
-        int    na = state->num_inner_attrs;
-        bool  *saved_byval  = palloc(sizeof(bool) * na);
-        int16 *saved_typlen = palloc(sizeof(int16) * na);
-
-        memcpy(saved_byval, state->hashtable->attr_byval, sizeof(bool) * na);
-        memcpy(saved_typlen, state->hashtable->attr_typlen, sizeof(int16) * na);
-
-        vjoin_ht_destroy(state->hashtable);
-
-        /* Create a shared HT that writes directly into pre-allocated DSA arrays */
-        state->hashtable = vjoin_ht_create_shared(
-            state->pstate, state->dsa,
-            state->num_keys, na,
-            state->hash_ctx, state->inner_keynos,
-            saved_byval, saved_typlen);
-
-        pfree(saved_byval);
-        pfree(saved_typlen);
-    }
-
     oldctx = MemoryContextSwitchTo(state->hash_ctx);
 
     for (;;)
@@ -550,31 +485,12 @@ vjoin_hash_build(VectorHashJoinState *state)
     state->cached_ht_entries = state->hashtable->num_entries;
     state->cached_nbatch = state->hashtable->nbatch;
 
-    /* In parallel mode, share the HT */
-    if (state->is_parallel)
-    {
-        if (state->hashtable->is_shared)
-        {
-            /*
-             * DSA-direct path (byval): HT is already in shared memory.
-             * Just publish metadata to pstate so workers can read it.
-             */
-            VJoinParallelState *ps = state->pstate;
-            ps->num_entries    = state->hashtable->num_entries;
-            ps->all_attrs_byval = true;
-            ps->built_in_dsa  = true;
-        }
-        else
-        {
-            /* Byref path: serialize HT arrays into DSA (existing logic) */
-            vjoin_ht_serialize_to_dsa(state->hashtable, state->dsa,
-                                      state->pstate);
-            state->pstate->built_in_dsa = false;
-        }
-
-        BarrierArriveAndWait(&state->pstate->barrier, 0);
-    }
-
+    /*
+     * Private build (serial or per-worker parallel): there is nothing to
+     * publish to shared memory and no barrier to synchronize — every
+     * participant owns its hash table and probes its own outer slice
+     * independently.
+     */
     state->phase = VHJ_PROBE;
 }
 
@@ -1278,6 +1194,7 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     VJoinParallelState *pstate = (VJoinParallelState *) coordinate;
     double inner_rows;
     int    est_capacity;
+    bool   cas_build;
 
     /* Create DSA in the DSM segment */
     state->dsa = dsa_create(LWTRANCHE_PARALLEL_HASH_JOIN);
@@ -1292,6 +1209,39 @@ vjoin_hash_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
     pstate->parallel_build = false;
     pg_atomic_init_u32(&pstate->num_entries_atomic, 0);
     pg_atomic_init_u32(&pstate->cas_resizing, 0);
+
+    /*
+     * Only the CAS shared-DSA build (parallel-aware byval inner) uses the
+     * pre-allocated shared arrays.  When the inner scan is not parallel-aware
+     * or has byref attrs, every worker builds its own private (spill-capable)
+     * hash table instead, so there is nothing to pre-allocate here — and we
+     * must avoid sizing a full-inner array that could exceed MaxAllocSize for
+     * a large, spilling inner.
+     */
+    cas_build = state->inner_ps->plan->parallel_aware &&
+                state->hashtable != NULL &&
+                state->hashtable->all_attrs_byval;
+
+    pstate->num_all_attrs = state->num_inner_attrs;
+    pstate->num_keys = state->num_keys;
+
+    if (!cas_build)
+    {
+        pstate->est_inner_rows = 0;
+        pstate->capacity = 0;
+        pstate->mask = 0;
+        pstate->hashvals_dp = InvalidDsaPointer;
+        pstate->all_values_dp = InvalidDsaPointer;
+        pstate->all_isnull_dp = InvalidDsaPointer;
+        pstate->inner_keynos_dp = InvalidDsaPointer;
+        pstate->vardata_dp = InvalidDsaPointer;
+        pstate->attr_byval_dp = InvalidDsaPointer;
+
+        state->pstate = pstate;
+        state->is_parallel = true;
+        state->is_leader = true;
+        return;
+    }
 
     /*
      * Pre-allocate DSA arrays based on estimated inner rows.
@@ -1361,5 +1311,22 @@ vjoin_hash_initialize_worker(CustomScanState *node, shm_toc *toc,
 void
 vjoin_hash_shutdown(CustomScanState *node)
 {
-    /* All cleanup handled by vjoin_hash_end */
+    VectorHashJoinState *state = (VectorHashJoinState *) node;
+
+    /*
+     * Shutdown runs before the parallel DSM segment (which backs pstate and
+     * the DSA area) is torn down by ExecParallelCleanup.  We must release our
+     * barrier reference and detach the DSA here — accessing them later in
+     * vjoin_hash_end would dereference freed shared memory and crash.
+     */
+    if (state->pstate)
+    {
+        BarrierDetach(&state->pstate->barrier);
+        state->pstate = NULL;
+    }
+    if (state->dsa)
+    {
+        dsa_detach(state->dsa);
+        state->dsa = NULL;
+    }
 }

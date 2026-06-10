@@ -15,7 +15,7 @@ DATA = pg_vectorjoin--1.0.sql
 PG_CPPFLAGS = -I$(srcdir)/include
 PG_CFLAGS = -O2 -Wno-ignored-attributes
 
-REGRESS = basic outer_join_test
+REGRESS = basic outer_join_test spill_test par_spill_test
 REGRESS_OPTS = --inputdir=$(srcdir)/test
 
 # Default to PostgreSQL 18 (Homebrew). Override with `make PG_CONFIG=...`

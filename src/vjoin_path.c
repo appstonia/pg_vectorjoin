@@ -61,7 +61,8 @@ vjoin_path_next_power_of_2(uint64 n)
  */
 static bool
 vjoin_hash_allocation_fits(double inner_rows, int num_inner_attrs,
-                           bool parallel_build, int *nbatch_out)
+                           bool parallel_build, bool is_parallel_path,
+                           int *nbatch_out)
 {
     uint64 target_rows;
     int    capacity;
@@ -88,8 +89,14 @@ vjoin_hash_allocation_fits(double inner_rows, int num_inner_attrs,
     if (hash_mem_limit < 64 * 1024)
         hash_mem_limit = 64 * 1024;
 
-    /* Spilling is serial-only in v1. */
-    spill = vjoin_enable_hash_spill && !parallel_build;
+    /*
+     * Spilling is serial-only in v1: it is unsupported on every parallel
+     * path (the shared DSA hash table cannot grow_batches, and the byref
+     * leader build serializes only the in-memory batch to DSA).  Gate on
+     * is_parallel_path, not parallel_build, so the leader-only build path
+     * (parallel_build == false but still parallel) also refuses to spill.
+     */
+    spill = vjoin_enable_hash_spill && !is_parallel_path;
 
     if (spill)
     {
@@ -745,7 +752,7 @@ vjoin_try_hashjoin(PlannerInfo *root,
             inner_rows = innerrel->tuples;
 
         if (!vjoin_hash_allocation_fits(inner_rows, num_inner_attrs, false,
-                                        &nbatch_est))
+                                        false, &nbatch_est))
             goto try_parallel_hash;
 
         startup_cost = inner_path->total_cost +
@@ -816,26 +823,25 @@ try_parallel_hash:
 
         if (parallel_workers >= 2)
         {
-            Path *par_inner_partial = NULL;
             Path *par_inner_full = NULL;
             Path *par_inner;
             bool  parallel_build;
             ListCell *lc2;
 
-            /* Try partial inner path first (enables parallel build).
-             * Skip CustomPath nodes to avoid nested parallel VHJ which
-             * would produce only partial results per worker and deadlock. */
-            foreach(lc2, innerrel->partial_pathlist)
-            {
-                Path *p = (Path *) lfirst(lc2);
-                if (!IsA(p, CustomPath) &&
-                    p->param_info == NULL &&
-                    (par_inner_partial == NULL ||
-                     p->total_cost < par_inner_partial->total_cost))
-                    par_inner_partial = p;
-            }
-
-            /* Also find cheapest non-parameterized parallel-safe full path */
+            /*
+             * Always use the per-worker private build over a full
+             * (non-parallel-aware) inner scan: every worker scans the entire
+             * inner, builds its own private (spill-capable) hash table, and
+             * probes its disjoint slice of the parallel-aware outer scan.
+             *
+             * The alternative CAS shared-DSA build (all participants insert
+             * into one shared hash table over a parallel-aware partial inner)
+             * is intentionally disabled: its dynamic-party barrier
+             * synchronization is race-prone and can deadlock.  The private
+             * build is robust, supports per-worker spilling, and — since the
+             * inner is typically far smaller than the outer — the redundant
+             * per-worker inner builds are an acceptable cost.
+             */
             foreach(lc2, innerrel->pathlist)
             {
                 Path *p = (Path *) lfirst(lc2);
@@ -845,33 +851,39 @@ try_parallel_hash:
                     par_inner_full = p;
             }
 
-            /* Prefer parallel build when partial inner is available */
-            if (par_inner_partial != NULL)
-            {
-                par_inner = par_inner_partial;
-                parallel_build = true;
-            }
-            else if (par_inner_full != NULL)
-            {
-                par_inner = par_inner_full;
-                parallel_build = false;
-            }
-            else
-                par_inner = NULL;
+            par_inner = par_inner_full;
+            parallel_build = false;
 
             if (par_inner != NULL)
             {
                 int num_inner_attrs = vjoin_path_num_attrs(par_inner, innerrel);
                 double par_inner_rows = par_inner->rows;
+                int    par_nbatch = 1;
+                bool   par_fits;
 
                 if (innerrel->tuples > 0 && innerrel->tuples > par_inner_rows)
                     par_inner_rows = innerrel->tuples;
 
                 outer_rows = par_outer->rows;
 
-                if (vjoin_hash_allocation_fits(par_inner_rows,
-                                               num_inner_attrs,
-                                               parallel_build, NULL))
+                /*
+                 * The CAS shared-DSA build (parallel_build) cannot spill:
+                 * the inner must fit.  The leader-only (par_inner_full) path
+                 * instead has every worker build its own private hash table
+                 * over the full inner, so it CAN spill per worker — allow it
+                 * and estimate the batch count for the I/O cost below.
+                 */
+                if (parallel_build)
+                    par_fits = vjoin_hash_allocation_fits(par_inner_rows,
+                                                          num_inner_attrs,
+                                                          true, true, NULL);
+                else
+                    par_fits = vjoin_hash_allocation_fits(par_inner_rows,
+                                                          num_inner_attrs,
+                                                          false, false,
+                                                          &par_nbatch);
+
+                if (par_fits)
                 {
                     if (parallel_build)
                     {
@@ -891,6 +903,21 @@ try_parallel_hash:
                         /* par_outer is a partial path: cost is already per-worker */
                         run_cost = par_outer->total_cost +
                                    outer_rows * (cpu_tuple_cost + cpu_operator_cost) * cost_factor;
+
+                        /*
+                         * Per-worker spill I/O when the private build spills.
+                         * Each worker writes/re-reads (nbatch-1)/nbatch of the
+                         * full inner during build and of its outer slice during
+                         * probe (two sequential I/Os per spilled tuple).
+                         */
+                        if (par_nbatch > 1)
+                        {
+                            double spill_frac = (double) (par_nbatch - 1) / par_nbatch;
+                            double io_per_tuple = seq_page_cost / VJOIN_SPILL_TUPLES_PER_PAGE;
+
+                            startup_cost += par_inner_rows * spill_frac * 2.0 * io_per_tuple;
+                            run_cost += outer_rows * spill_frac * 2.0 * io_per_tuple;
+                        }
                     }
 
                     cpath = makeNode(CustomPath);
