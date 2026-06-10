@@ -15,10 +15,10 @@
  * tuple, so it must stay cache-hot and be a multiple of the widest SIMD lane
  * (AVX2 int32 = 8 lanes).  Values are powers of two:
  *   MIN 64    = 8x the widest lane -> SIMD always runs >=1 full vector pass.
- *   DEFAULT 2048 = 8KB (int32) / 16KB (int64,float8) -> L1-resident.
+ *   DEFAULT 128 = 16KB (int32) / 32KB (int64,float8) -> L1-resident.
  *   MAX 8192  = 32KB (int32, = L1) / 64KB (8-byte keys, L2) -> upper bound.
  */
-#define VJOIN_DEFAULT_BATCH     2048
+#define VJOIN_DEFAULT_BATCH     128
 #define VJOIN_MIN_BATCH         64
 #define VJOIN_MAX_BATCH         8192
 #define VJOIN_HT_LOAD_FACTOR    2       /* capacity = inner_rows * factor */
