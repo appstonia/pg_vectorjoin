@@ -217,8 +217,7 @@ SET pg_vectorjoin.enable_nestloop = off;
 
 ## Compatibility
 
-Tested with PostgreSQL 14 through 19. Version-specific differences
-(API changes in PG 15, 17, 18, 19) are handled via compile-time
+Version-specific differences (API changes in PG 15, 17, 18, 19) are handled via compile-time
 compatibility shims.
 
 ## License
