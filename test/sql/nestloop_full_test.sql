@@ -373,7 +373,7 @@ DROP TABLE IF EXISTS bnl_block_l, bnl_block_r;
 CREATE TABLE bnl_block_l (id int, val int);
 CREATE TABLE bnl_block_r (id int, val int);
 
--- 3000 outer rows = 3 full blocks at batch_size=1024
+-- 3000 outer rows = 3 full blocks at nestloop_batch_size=1024
 INSERT INTO bnl_block_l SELECT g, g FROM generate_series(1, 3000) g;
 INSERT INTO bnl_block_r SELECT g, g * 10 FROM generate_series(1, 3000) g;
 ANALYZE bnl_block_l;
@@ -407,9 +407,9 @@ FROM bnl_block_l l JOIN bnl_block_r r ON l.id = r.id;
 DROP TABLE bnl_block_l, bnl_block_r;
 
 -- =============================================================
--- 7. SMALL BATCH SIZE (test with batch_size=64)
+-- 7. SMALL BATCH SIZE (test with nestloop_batch_size=64)
 -- =============================================================
-SET pg_vectorjoin.batch_size = 64;
+SET pg_vectorjoin.nestloop_batch_size = 64;
 
 DROP TABLE IF EXISTS bnl_small_l, bnl_small_r;
 CREATE TABLE bnl_small_l (id int, val int);
@@ -438,7 +438,7 @@ SET pg_vectorjoin.enable_nestloop = on;
 DROP TABLE bnl_small_l, bnl_small_r;
 
 -- Reset batch_size
-RESET pg_vectorjoin.batch_size;
+RESET pg_vectorjoin.nestloop_batch_size;
 
 -- =============================================================
 -- 8. MULTI-KEY JOIN (scalar fallback path)

@@ -127,7 +127,9 @@ All parameters are settable per-session without server restart:
 | pg_vectorjoin.enable_hashjoin | true | -- | Enable VectorHashJoin paths |
 | pg_vectorjoin.enable_nestloop | true | -- | Enable VectorNestedLoop paths |
 | pg_vectorjoin.enable_mergejoin | true | -- | Enable VectorMergeJoin paths |
-| pg_vectorjoin.batch_size | 128 | 64 -- 8192 | Batch/block size for vectorized processing |
+| pg_vectorjoin.hash_batch_size | 128 | 64 -- 8192 | Batch/block size for vectorized hash join processing |
+| pg_vectorjoin.merge_batch_size | 128 | 64 -- 8192 | Batch/block size for vectorized merge join processing |
+| pg_vectorjoin.nestloop_batch_size | 128 | 64 -- 8192 | Batch/block size for vectorized nested loop join processing |
 | pg_vectorjoin.cost_factor | 1.0 | 0.01 -- 10.0 | Global join cost scaling (lower = prefer vectorized) |
 | pg_vectorjoin.hash_cost_factor | 1.0 | 0.01 -- 10.0 | Per-jointype cost scaling for vectorized hash join |
 | pg_vectorjoin.merge_cost_factor | 1.0 | 0.01 -- 10.0 | Per-jointype cost scaling for vectorized merge join |
@@ -143,12 +145,14 @@ Once loaded, the extension is transparent. The planner automatically
 considers vectorized paths and selects them when their estimated cost is
 lower than native alternatives:
 
-```sql
+```
 LOAD 'pg_vectorjoin';
 
 -- Tune parameters per-session
 SET pg_vectorjoin.enable = on;
-SET pg_vectorjoin.batch_size = 128;
+SET pg_vectorjoin.hash_batch_size = 128;
+SET pg_vectorjoin.merge_batch_size = 128;
+SET pg_vectorjoin.nestloop_batch_size = 128;
 SET pg_vectorjoin.cost_factor = 0.3;
 SET pg_vectorjoin.auto_tune = on;
 
@@ -175,7 +179,7 @@ JOIN customers c ON c.id = o.customer_id;
 
 Disable individual strategies to compare performance:
 
-```sql
+```
 SET pg_vectorjoin.enable_hashjoin = off;
 SET pg_vectorjoin.enable_nestloop = off;
 -- Only VectorMergeJoin paths will be considered
@@ -188,9 +192,7 @@ SET pg_vectorjoin.enable_nestloop = off;
   eligible for the SIMD fast path. These joins fall back to native PostgreSQL
   strategies.
 
-- **Batch size constraints.** `pg_vectorjoin.batch_size` must be a power of two
-  between 64 and 8192. Very large batch sizes may increase memory usage and
-  reduce cache efficiency.
+- **Batch size constraints.** `pg_vectorjoin.hash_batch_size`, `pg_vectorjoin.merge_batch_size`, and `pg_vectorjoin.nestloop_batch_size` must each be a power of two between 64 and 8192. Very large batch sizes may increase memory usage and reduce cache efficiency.
 
 - **Hash spill is bounded.** VectorHashJoin can spill oversized inner
   relations when `pg_vectorjoin.enable_hash_spill` is enabled, but the number

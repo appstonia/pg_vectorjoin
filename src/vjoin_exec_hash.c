@@ -987,7 +987,7 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
     }
 
     /* Allocate batch buffers */
-    state->batch_size = vjoin_batch_size;
+    state->batch_size = vjoin_hash_batch_size;
     state->batch_hashes = palloc(sizeof(uint32) * state->batch_size);
     state->batch_values = palloc(sizeof(Datum) * state->batch_size *
                                  state->num_outer_attrs);

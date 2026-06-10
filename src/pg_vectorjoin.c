@@ -23,7 +23,9 @@ bool    vjoin_enable = VJOIN_DEFAULT_ENABLE;
 bool    vjoin_enable_hashjoin = VJOIN_DEFAULT_ENABLE_HASHJOIN;
 bool    vjoin_enable_nestloop = VJOIN_DEFAULT_ENABLE_NESTLOOP;
 bool    vjoin_enable_mergejoin = VJOIN_DEFAULT_ENABLE_MERGEJOIN;
-int     vjoin_batch_size = VJOIN_DEFAULT_BATCH;
+int     vjoin_hash_batch_size = VJOIN_DEFAULT_BATCH;
+int     vjoin_merge_batch_size = VJOIN_DEFAULT_BATCH;
+int     vjoin_nestloop_batch_size = VJOIN_DEFAULT_BATCH;
 double  vjoin_cost_factor = VJOIN_DEFAULT_COST_FACTOR;
 double  vjoin_hash_cost_factor = VJOIN_DEFAULT_HASH_COST_FACTOR;
 double  vjoin_merge_cost_factor = VJOIN_DEFAULT_MERGE_COST_FACTOR;
@@ -150,10 +152,30 @@ _PG_init(void)
                              PGC_USERSET,
                              0, NULL, NULL, NULL);
 
-    DefineCustomIntVariable("pg_vectorjoin.batch_size",
-                            "Batch/block size for vectorized processing.",
+    DefineCustomIntVariable("pg_vectorjoin.hash_batch_size",
+                            "Batch/block size for vectorized hash join processing.",
                             NULL,
-                            &vjoin_batch_size,
+                            &vjoin_hash_batch_size,
+                            VJOIN_DEFAULT_BATCH,
+                            VJOIN_MIN_BATCH,
+                            VJOIN_MAX_BATCH,
+                            PGC_USERSET,
+                            0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_vectorjoin.merge_batch_size",
+                            "Batch/block size for vectorized merge join processing.",
+                            NULL,
+                            &vjoin_merge_batch_size,
+                            VJOIN_DEFAULT_BATCH,
+                            VJOIN_MIN_BATCH,
+                            VJOIN_MAX_BATCH,
+                            PGC_USERSET,
+                            0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_vectorjoin.nestloop_batch_size",
+                            "Batch/block size for vectorized nested loop join processing.",
+                            NULL,
+                            &vjoin_nestloop_batch_size,
                             VJOIN_DEFAULT_BATCH,
                             VJOIN_MIN_BATCH,
                             VJOIN_MAX_BATCH,

@@ -56,8 +56,8 @@ SELECT count(*) FROM vjoin_big_outer o JOIN vjoin_big_inner i ON o.id = i.ref_id
 -- GUC test
 SET pg_vectorjoin.enable = off;
 SHOW pg_vectorjoin.enable;
-SET pg_vectorjoin.batch_size = 256;
-SHOW pg_vectorjoin.batch_size;
+SET pg_vectorjoin.hash_batch_size = 256;
+SHOW pg_vectorjoin.hash_batch_size;
 
 -- Cleanup
 DROP TABLE vjoin_outer, vjoin_inner, vjoin_empty, vjoin_big_outer, vjoin_big_inner;

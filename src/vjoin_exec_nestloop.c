@@ -523,7 +523,7 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
     }
 
     /* Block buffer */
-    state->block_size = vjoin_batch_size;
+    state->block_size = vjoin_nestloop_batch_size;
     if (state->num_keys > 0)
     {
         state->block_keys = palloc(sizeof(Datum) * state->block_size *

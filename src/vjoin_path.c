@@ -1064,7 +1064,7 @@ vjoin_try_nestloop(PlannerInfo *root,
     {
         outer_rows = outer_path->rows;
         inner_rows = inner_path->rows;
-        num_blocks = ceil(outer_rows / vjoin_batch_size);
+        num_blocks = ceil(outer_rows / vjoin_nestloop_batch_size);
 
         startup_cost = outer_path->startup_cost;
         run_cost = outer_path->total_cost - outer_path->startup_cost +
@@ -1149,7 +1149,7 @@ vjoin_try_nestloop(PlannerInfo *root,
             outer_rows = par_outer->rows;
             inner_rows = par_inner->rows;
 
-            num_blocks = ceil(outer_rows / vjoin_batch_size);
+            num_blocks = ceil(outer_rows / vjoin_nestloop_batch_size);
             parallel_workers = par_outer->parallel_workers;
             if (parallel_workers <= 0)
                 parallel_workers = 1;

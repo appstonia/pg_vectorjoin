@@ -1492,7 +1492,7 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
     /* Allocate batch buffers for block merge (INNER only). */
     if (state->jointype == JOIN_INNER)
     {
-        int bs = vjoin_batch_size;
+        int bs = vjoin_merge_batch_size;
 
         state->batch_size = bs;
 
