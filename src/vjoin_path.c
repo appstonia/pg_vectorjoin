@@ -184,11 +184,19 @@ vjoin_path_num_attrs(Path *path, RelOptInfo *rel)
  * Auto-tune helpers.
  *
  * When pg_vectorjoin.auto_tune is on we inspect the native paths the core
- * planner already produced for this joinrel and clamp our custom path's
- * cost down to (cheapest_comparable_native_cost * auto_tune_margin) iff
- * the native path is cheaper.  Lets the user enable vector joins by
- * intent without hand-tuning per-jointype cost factors, while still
- * leaving honest model decisions alone when our model already wins.
+ * planner already produced for this joinrel and, iff the cheapest
+ * comparable native path is cheaper than our path, apply a flat
+ * multiplicative discount (cost *= auto_tune_margin) to our path.  Lets
+ * the user enable vector joins by intent without hand-tuning per-jointype
+ * cost factors, while still leaving honest model decisions alone when our
+ * model already wins.
+ *
+ * Crucially this is a *multiplicative* discount, not an absolute clamp to
+ * native*margin.  An absolute clamp maps every one of our candidate paths
+ * for a joinrel onto the same value, erasing the relative cost differences
+ * between join orders so the planner can no longer tell a good join order
+ * from a bad one.  A flat multiplicative scale is monotone and therefore
+ * preserves the raw cost model's ordering across join orders.
  *
  * We only compare against unparameterized native paths of the same
  * physical type (Hash/Merge/Nest) and the same parallel-aware flag,
@@ -224,7 +232,6 @@ vjoin_apply_auto_tune(CustomPath *cpath, RelOptInfo *joinrel,
 {
     List *pathlist;
     Cost  native;
-    Cost  target;
 
     if (!vjoin_auto_tune)
         return;
@@ -235,15 +242,35 @@ vjoin_apply_auto_tune(CustomPath *cpath, RelOptInfo *joinrel,
     if (native < 0.0)
         return;                 /* no comparable native path to anchor on */
 
-    target = native * vjoin_auto_tune_margin;
-    if (target < 0.0)
-        target = 0.0;
-
-    if (cpath->path.total_cost > target)
+    /*
+     * Only adjust when the native path would otherwise beat us; honest wins
+     * are left untouched.
+     *
+     * We pull our cost down close to native*margin so the user's intent to
+     * use vector joins is honored, but we must NOT clamp every candidate to
+     * the same value: doing so erases the relative cost differences between
+     * join orders and the planner can no longer pick a good order from a bad
+     * one.  Instead we blend: scaled = native*margin + epsilon*raw_cost.
+     * This is strictly monotone in raw_cost (so the raw model's join-order
+     * ranking is preserved for add_path's exact-cost comparison) while the
+     * tiny epsilon keeps the result ~= native*margin (so we still win vs
+     * native).  The same factor is applied to startup_cost so it stays <=
+     * total_cost.
+     */
+    if (native < cpath->path.total_cost && cpath->path.total_cost > 0.0)
     {
-        cpath->path.total_cost = target;
-        if (cpath->path.startup_cost > target)
-            cpath->path.startup_cost = target;
+        Cost   target = native * vjoin_auto_tune_margin;
+        double eps = 0.001;
+        double factor;
+
+        if (target < 0.0)
+            target = 0.0;
+
+        factor = (target + eps * cpath->path.total_cost) /
+                 cpath->path.total_cost;
+
+        cpath->path.total_cost *= factor;
+        cpath->path.startup_cost *= factor;
     }
 }
 
@@ -755,10 +782,19 @@ vjoin_try_hashjoin(PlannerInfo *root,
                                         false, &nbatch_est))
             goto try_parallel_hash;
 
+        /*
+         * Build charges every inner row (hash + insert into the table);
+         * probe is lighter (hash + compare, no full tuple build) so it is
+         * charged at cpu_operator_cost only.  The output-cardinality charge
+         * (joinrel->rows * cpu_tuple_cost) makes the model sensitive to join
+         * order: orders that materialize/forward large intermediate results
+         * are penalized, steering the planner toward selective-joins-first.
+         */
         startup_cost = inner_path->total_cost +
                        inner_rows * (cpu_tuple_cost + cpu_operator_cost) * cost_factor;
         run_cost = outer_path->total_cost +
-                   outer_rows * (cpu_tuple_cost + cpu_operator_cost) * cost_factor;
+                   outer_rows * cpu_operator_cost * cost_factor +
+                   joinrel->rows * cpu_tuple_cost;
 
         /*
          * Multi-batch spill I/O cost.  Roughly (nbatch_est - 1)/nbatch_est of
@@ -900,9 +936,18 @@ try_parallel_hash:
                         startup_cost = par_inner->total_cost +
                                        inner_rows * (cpu_tuple_cost + cpu_operator_cost) * cost_factor;
 
-                        /* par_outer is a partial path: cost is already per-worker */
+                        /*
+                         * par_outer is a partial path: cost is already
+                         * per-worker.  Probe is charged at cpu_operator_cost
+                         * (hash + compare) and the per-worker output
+                         * cardinality at cpu_tuple_cost, matching the
+                         * non-parallel model so join-order signal is
+                         * preserved across parallel plans too.
+                         */
                         run_cost = par_outer->total_cost +
-                                   outer_rows * (cpu_tuple_cost + cpu_operator_cost) * cost_factor;
+                                   outer_rows * cpu_operator_cost * cost_factor +
+                                   clamp_row_est(joinrel->rows / parallel_workers) *
+                                   cpu_tuple_cost;
 
                         /*
                          * Per-worker spill I/O when the private build spills.
@@ -1311,11 +1356,17 @@ vjoin_try_mergejoin(PlannerInfo *root,
      * Cost model: linear merge of two sorted streams.
      * Vectorized batch processing reduces per-tuple overhead significantly.
      * cost_factor scales the join comparison overhead only (not child scan costs).
+     *
+     * The output-cardinality charge (joinrel->rows * cpu_tuple_cost) makes the
+     * model sensitive to join order — orders that materialize/forward large
+     * intermediate results are penalized — matching the hash-join model so the
+     * planner ranks join orders consistently across join methods.
      */
     startup_cost = outer_path->startup_cost + inner_path->startup_cost;
     run_cost = (outer_path->total_cost - outer_path->startup_cost) +
                (inner_path->total_cost - inner_path->startup_cost) +
-               (outer_rows + inner_rows) * (cpu_tuple_cost + cpu_operator_cost) * cost_factor;
+               (outer_rows + inner_rows) * (cpu_tuple_cost + cpu_operator_cost) * cost_factor +
+               joinrel->rows * cpu_tuple_cost;
 
     cpath = makeNode(CustomPath);
     cpath->path.pathtype = T_CustomScan;
@@ -1452,6 +1503,10 @@ vjoin_try_mergejoin(PlannerInfo *root,
                  * Inner cost is paid once (startup). Merge processing
                  * is distributed across workers.
                  * Small materialization overhead: memcpy cost per inner tuple.
+                 *
+                 * Per-output-row cost is charged once below via the Gather
+                 * tuple-queue overhead (per-worker rate), which doubles as the
+                 * output-cardinality term for parallel paths.
                  */
                 par_run = (par_outer->total_cost - par_outer->startup_cost) +
                           (par_inner->total_cost - par_inner->startup_cost) +
@@ -1464,7 +1519,8 @@ vjoin_try_mergejoin(PlannerInfo *root,
                 par_run = (par_outer->total_cost - par_outer->startup_cost) +
                           (par_inner->total_cost - par_inner->startup_cost) +
                           (par_outer_rows + par_inner->rows) *
-                          (cpu_tuple_cost + cpu_operator_cost) * cost_factor;
+                          (cpu_tuple_cost + cpu_operator_cost) * cost_factor +
+                          joinrel->rows * cpu_tuple_cost;
             }
 
             /* Gather tuple-queue overhead (parallel paths only) */
