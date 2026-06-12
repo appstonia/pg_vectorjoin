@@ -63,7 +63,11 @@
 #define vjoin_pcxt_nworkers(pcxt)  ((pcxt)->nworkers)
 #endif
 
-/* Value vs Integer API change: PG16+ uses makeInteger returning Integer*,
- * PG14-15 uses makeInteger returning Value* — but intVal() works across all */
+/* pull_varnos API changed in PG14: before it only took Node*, after it takes PlannerInfo* and Node* */
+#if PG_VERSION_NUM >= 140000
+#define vjoin_pull_varnos(root, node) pull_varnos((root), (node))
+#else
+#define vjoin_pull_varnos(root, node) pull_varnos((node))
+#endif
 
 #endif /* VJOIN_COMPAT_H */

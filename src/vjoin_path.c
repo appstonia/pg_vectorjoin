@@ -501,7 +501,7 @@ vjoin_expr_references_inner(PlannerInfo *root, Node *node, Relids inner_relids)
     if (node == NULL)
         return false;
 
-    varnos = pull_varnos(root, node);
+    varnos = vjoin_pull_varnos(root, node);
     references_inner = bms_overlap(varnos, inner_relids);
     bms_free(varnos);
 
