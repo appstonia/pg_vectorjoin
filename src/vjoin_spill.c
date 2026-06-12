@@ -14,7 +14,78 @@
 #include "storage/buffile.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
-#include "varatt.h"
+#include "catalog/pg_type.h"
+
+/* 
+ * In PostgreSQL 14+, VARSIZE_ANY and related macros are available through postgres.h -> c.h.
+ */
+#ifdef USE_VARLENA_MACROS
+#include "utils/expandeddatum.h"
+#endif
+
+/* Fallback: manually compute varlena size using standard approach */
+#ifndef VARSIZE_ANY
+static inline int32
+vjoin_varsize_any(struct varlena *ptr)
+{
+    /* Check if it's a short or compressed varlena */
+    if (((uint8 *) ptr)[0] & 0x01) {
+        /* Short or compressed - extract from first byte */
+        return ((uint8 *) ptr)[0] >> 1;
+    } else {
+        /* Standard 4-byte header */
+        return *((int32 *) ptr) >> 2;
+    }
+}
+#define VARSIZE_ANY(ptr) vjoin_varsize_any((struct varlena *)(ptr))
+#endif
+
+/* PostgreSQL 14/15 compatibility: BufFileReadMaybeEOF and BufFileReadExact
+ * were added in PG16. For older versions, we implement wrappers. */
+#if PG_VERSION_NUM < 160000
+
+/* Wrapper for BufFileReadMaybeEOF: returns bytes read, 0 on EOF */
+static inline size_t
+vjoin_BufFileReadMaybeEOF(BufFile *file, void *ptr, size_t size, bool allow_eof)
+{
+    int         nbytes;
+    
+    nbytes = BufFileRead(file, ptr, (int) size);
+    if (nbytes == 0)
+    {
+        if (!allow_eof)
+            ereport(ERROR,
+                    (errcode_for_file_access(),
+                     errmsg("unexpected EOF in spill file")));
+        return 0;
+    }
+    if (nbytes < (int) size)
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("short read from spill file: expected %zu bytes, got %d",
+                        size, nbytes)));
+    return (size_t) nbytes;
+}
+#define BufFileReadMaybeEOF(file, ptr, size, allow_eof) \
+    vjoin_BufFileReadMaybeEOF((file), (ptr), (size), (allow_eof))
+
+/* Wrapper for BufFileReadExact: reads exactly 'size' bytes or errors */
+static inline void
+vjoin_BufFileReadExact(BufFile *file, void *ptr, size_t size)
+{
+    int         nbytes;
+    
+    nbytes = BufFileRead(file, ptr, (int) size);
+    if (nbytes != (int) size)
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("short read from spill file: expected %zu bytes, got %d",
+                        size, nbytes)));
+}
+#define BufFileReadExact(file, ptr, size) \
+    vjoin_BufFileReadExact((file), (ptr), (size))
+
+#endif /* PG_VERSION_NUM < 160000 */
 
 #include "vjoin_spill.h"
 
@@ -134,7 +205,7 @@ vjoin_spill_write_tuple(vjoin_spill_file *sf,
         {
             /* Always serialize as a full Datum to keep the format uniform
              * regardless of platform pointer width. */
-            BufFileWrite(sf->bf, &values[i], sizeof(Datum));
+            BufFileWrite(sf->bf, (void *) &values[i], sizeof(Datum));
             sf->byte_count += sizeof(Datum);
         }
         else
@@ -171,8 +242,8 @@ vjoin_spill_write_tuple(vjoin_spill_file *sf,
                 elog(ERROR, "vjoin_spill: unsupported attr_typlen %d",
                      attr_typlen[i]);
 
-            BufFileWrite(sf->bf, &len, sizeof(int32));
-            BufFileWrite(sf->bf, src, (size_t) len);
+            BufFileWrite(sf->bf, (void *) &len, sizeof(int32));
+            BufFileWrite(sf->bf, (void *) src, (size_t) len);
             sf->byte_count += sizeof(int32) + len;
         }
     }
