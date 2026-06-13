@@ -43,10 +43,14 @@ table via DSA.
 
 **VectorNestedLoop** -- Loads a block of outer tuples, then scans the inner
 relation once per block instead of once per tuple. For a batch size of 2000,
-this reduces inner rescans by a factor of 2000x. A single-key SIMD fast path
-compares the entire outer block against each inner value in one pass. The
-inner relation is materialized into a tuplestore on first scan and replayed
-from memory for subsequent blocks.
+this reduces inner rescans by a factor of 2000x. A SIMD fast path compares
+the entire outer block against each inner value in one pass using the
+leading join key; for composite (multi-column) keys, the remaining key
+columns are verified with a scalar comparison on the SIMD-matched candidates.
+The inner relation is materialized into a tuplestore on first scan and
+replayed from memory for subsequent blocks. When a native index nested loop
+is available on the inner relation's join key, the planner declines the
+vectorized path in favor of the indexed plan.
 
 **VectorMergeJoin** -- Merges two sorted streams with batch processing of
 match groups. When all join keys are pass-by-value types, a block merge mode
@@ -211,11 +215,21 @@ SET pg_vectorjoin.enable_nestloop = off;
   native PostgreSQL.
 
 - **Maximum 8 join keys.** A single join clause may use up to 8 key columns
-  (VJOIN_MAX_KEYS = 8).
+  (VJOIN_MAX_KEYS = 8). Equi-join clauses beyond this limit are re-checked as
+  residual conditions instead of being matched as keys.
 
-- **Single-key SIMD only.** SIMD acceleration is available only for single-key
-  equi-joins on supported numeric types. Multi-key joins are batched, but use a
-  scalar comparison loop.
+- **Multi-key SIMD via leading key.** For composite (multi-column) equi-joins,
+  SIMD acceleration is applied to the leading key when it is a supported
+  numeric type; the remaining key columns are verified with a scalar
+  comparison on the SIMD-matched candidates. If the leading key is not a
+  supported numeric type, the join falls back to a fully scalar comparison
+  loop.
+
+- **Residual conditions are re-checked, not pre-filtered.** Join clauses that
+  are not modeled as equi-join keys (e.g. inequality conditions like
+  `a.x < b.y`, or equi-key clauses beyond the 8-key limit) are evaluated as a
+  residual qual on rows that already matched the equi-keys. Pure equi-key
+  joins have no residual qual and skip this check entirely.
 
 ## Compatibility
 
