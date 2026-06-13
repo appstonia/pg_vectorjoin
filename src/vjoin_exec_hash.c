@@ -591,6 +591,8 @@ vjoin_fetch_outer(VectorHashJoinState *state, int batch_idx,
         }
         if (has_null)
             hashval = 0;
+        else if (hashval == 0)
+            hashval = 1;
     }
     else
     {
@@ -936,6 +938,9 @@ vjoin_hash_begin(CustomScanState *node, EState *estate, int eflags)
             state->batch_all_byval = false;
     }
 
+    if (cscan->custom_exprs != NIL)
+        node->ss.ps.qual = ExecInitQual(cscan->custom_exprs, (PlanState *) node);
+
     /* Memory contexts */
     state->hash_ctx = AllocSetContextCreate(CurrentMemoryContext,
                                             "VectorHashJoin hash",
@@ -1071,8 +1076,18 @@ vjoin_hash_exec(CustomScanState *node)
                     ResetExprContext(econtext);
                     econtext->ecxt_scantuple = result;
 
-                    /* Apply remaining quals */
-                    if (qual && !ExecQual(qual, econtext))
+                    /*
+                     * Apply remaining join quals to matched rows only.
+                     *
+                     * For LEFT joins, unmatched outer rows (inner_idx < 0) are
+                     * emitted NULL-extended and must NOT be filtered by the join
+                     * qual: the original join condition references inner Vars
+                     * that are now NULL, so ExecQual would evaluate to NULL/false
+                     * and silently drop the row, degenerating the LEFT JOIN into
+                     * an INNER JOIN.  The equi-keys were already verified during
+                     * probe, so skipping the recheck here is safe.
+                     */
+                    if (ii >= 0 && qual && !ExecQual(qual, econtext))
                         continue;
 
                     /* Project result */

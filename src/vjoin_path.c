@@ -416,7 +416,8 @@ vjoin_analyze_clauses(List *restrictlist,
                       Oid *eq_oprs,
                       Oid *collations,
                       List *outer_tlist,
-                      List *inner_tlist)
+                      List *inner_tlist,
+                      List **consumed_rinfos)
 {
     ListCell   *lc;
     int         nkeys = 0;
@@ -487,6 +488,11 @@ vjoin_analyze_clauses(List *restrictlist,
         eq_oprs[nkeys] = eo;
         collations[nkeys] = opexpr->inputcollid;
         nkeys++;
+
+        /* Record which clause became an executor-matched equi-key, so the
+         * caller can recheck only the residual (non-key) clauses. */
+        if (consumed_rinfos)
+            *consumed_rinfos = lappend(*consumed_rinfos, rinfo);
     }
 
     return nkeys;
@@ -598,6 +604,32 @@ vjoin_build_private(JoinType jointype,
         result = lappend(result, makeInteger((int) collations[i]));
     }
     return result;
+}
+
+/*
+ * Build the list of join-clause expressions the executor must re-check as a
+ * qual.  Equi-key clauses that were already consumed as executor match keys
+ * (recorded in consumed_rinfos) are skipped — only residual conditions (e.g.
+ * a.x < b.y, NE clauses, or equi-keys beyond VJOIN_MAX_KEYS) remain.  When
+ * there are no residual clauses this returns NIL and the executor avoids the
+ * per-row ExecQual entirely.
+ */
+static List *
+vjoin_build_residual_clauses(List *restrictlist, List *consumed_rinfos)
+{
+    List *join_clauses = NIL;
+    ListCell *rlc;
+
+    foreach(rlc, restrictlist)
+    {
+        RestrictInfo *ri = lfirst_node(RestrictInfo, rlc);
+
+        if (list_member_ptr(consumed_rinfos, ri))
+            continue;
+        join_clauses = lappend(join_clauses, copyObject(ri->clause));
+    }
+
+    return join_clauses;
 }
 
 /*
@@ -737,7 +769,8 @@ vjoin_try_hashjoin(PlannerInfo *root,
                    Oid *key_types,
                    Oid *hash_procs,
                    Oid *eq_oprs,
-                   Oid *collations)
+                   Oid *collations,
+                   List *residual_clauses)
 {
     Path       *outer_path = outerrel->cheapest_total_path;
     Path       *inner_path = innerrel->cheapest_total_path;
@@ -834,6 +867,8 @@ vjoin_try_hashjoin(PlannerInfo *root,
                                                     inner_keynos, key_types,
                                                     hash_procs, eq_oprs,
                                                     collations);
+        cpath->custom_private = lappend(cpath->custom_private,
+                                        (List *) copyObject(residual_clauses));
         cpath->methods = &vjoin_hash_path_methods;
 
         vjoin_apply_auto_tune(cpath, joinrel, T_HashPath, false);
@@ -989,6 +1024,8 @@ try_parallel_hash:
                                                                 key_types,
                                                                 hash_procs, eq_oprs,
                                                                 collations);
+                    cpath->custom_private = lappend(cpath->custom_private,
+                                                    (List *) copyObject(residual_clauses));
                     cpath->methods = &vjoin_hash_path_methods;
 
                     vjoin_apply_auto_tune(cpath, joinrel, T_HashPath, true);
@@ -997,6 +1034,67 @@ try_parallel_hash:
             }
         }
     }
+}
+
+/*
+ * For equi-joins, VectorNestedLoop performs a full block nested loop over the
+ * inner relation and -- unlike native nested loop -- cannot push outer values
+ * into a parameterized index scan.  When the inner relation is a base table
+ * with an index whose leading column is one of the inner join keys, native
+ * PostgreSQL can run a far cheaper index nested loop.  Because join cardinality
+ * is frequently underestimated, the VNL cost model can wrongly win that race
+ * and cause catastrophic O(outer*inner) execution.  In that situation we
+ * decline to offer a VNL path and let core use its index nested loop; the
+ * vectorized hash/merge joins remain available for the equi-join.
+ */
+static bool
+vjoin_inner_has_indexable_key(RelOptInfo *innerrel,
+                              AttrNumber *inner_keynos, int nkeys)
+{
+    Bitmapset  *key_attnos = NULL;
+    ListCell   *lc;
+    int         i;
+    bool        result = false;
+
+    /* Only base relations carry an index list. */
+    if (innerrel->reloptkind != RELOPT_BASEREL ||
+        innerrel->indexlist == NIL)
+        return false;
+
+    /* Collect base-relation attribute numbers of the inner join keys. */
+    for (i = 0; i < nkeys; i++)
+    {
+        Node *expr = (Node *) list_nth(innerrel->reltarget->exprs,
+                                       inner_keynos[i] - 1);
+
+        if (IsA(expr, Var))
+        {
+            Var *v = (Var *) expr;
+
+            key_attnos = bms_add_member(key_attnos,
+                v->varattno - FirstLowInvalidHeapAttributeNumber);
+        }
+    }
+
+    if (key_attnos == NULL)
+        return false;
+
+    foreach(lc, innerrel->indexlist)
+    {
+        IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+
+        /* Leading index column must be a join key to drive an index NL. */
+        if (idx->nkeycolumns > 0 && idx->indexkeys[0] != 0 &&
+            bms_is_member(idx->indexkeys[0] - FirstLowInvalidHeapAttributeNumber,
+                          key_attnos))
+        {
+            result = true;
+            break;
+        }
+    }
+
+    bms_free(key_attnos);
+    return result;
 }
 
 /*
@@ -1016,6 +1114,7 @@ vjoin_try_nestloop(PlannerInfo *root,
               Oid *hash_procs,
               Oid *eq_oprs,
               Oid *collations,
+              List *residual_clauses,
               int theta_strategy,
               AttrNumber theta_outer_keyno,
               AttrNumber theta_inner_keyno,
@@ -1048,6 +1147,17 @@ vjoin_try_nestloop(PlannerInfo *root,
     }
 
     /*
+     * For equi-joins, decline the VNL path when native can drive an index
+     * nested loop on the inner relation.  This avoids choosing a full block
+     * nested loop (which cannot use indexes) over a vastly cheaper index NL,
+     * a regression that misestimated join cardinalities make dangerously easy.
+     * Theta joins (nkeys == 0) have no index-NL alternative and are unaffected.
+     */
+    if (nkeys > 0 &&
+        vjoin_inner_has_indexable_key(innerrel, inner_keynos, nkeys))
+        return;
+
+    /*
      * SIMD width for cost model: only single-key numeric equi-join or
      * theta-join (always numeric) gets the 4-wide SIMD benefit.
      * Multi-key or text keys fall back to scalar comparison.
@@ -1055,9 +1165,12 @@ vjoin_try_nestloop(PlannerInfo *root,
     if (theta_strategy != 0)
         simd_width = 4;    /* theta SIMD — always numeric */
     else if (nkeys == 1 && vjoin_is_fast_type(key_types[0]))
-        simd_width = 4;    /* single numeric key — true SIMD */
+        simd_width = 4;    /* single numeric key — fully vectorized */
+    else if (nkeys > 1 && vjoin_is_fast_type(key_types[0]))
+        simd_width = 2;    /* composite key — leading key vectorized,
+                            * residual keys verified scalar */
     else
-        simd_width = 1;    /* multi-key or text — scalar fallback */
+        simd_width = 1;    /* unsupported leading key — scalar fallback */
 
     /* --- Non-parallel path --- */
     if (outer_path != NULL && inner_path != NULL)
@@ -1106,17 +1219,11 @@ vjoin_try_nestloop(PlannerInfo *root,
             cpath->custom_private = lappend(cpath->custom_private,
                                             makeInteger((int) theta_keytype));
         }
-        /* Append join qual expressions for executor evaluation */
-        {
-            List *join_clauses = NIL;
-            ListCell *rlc;
-            foreach(rlc, extra->restrictlist)
-            {
-                RestrictInfo *ri = lfirst_node(RestrictInfo, rlc);
-                join_clauses = lappend(join_clauses, copyObject(ri->clause));
-            }
-            cpath->custom_private = lappend(cpath->custom_private, join_clauses);
-        }
+        /* Append residual join qual expressions for executor evaluation.
+         * For theta joins (nkeys == 0) every clause is residual; for equi
+         * joins only non-key clauses remain. */
+        cpath->custom_private = lappend(cpath->custom_private,
+                                        (List *) copyObject(residual_clauses));
         cpath->methods = &vjoin_nestloop_path_methods;
 
         vjoin_apply_auto_tune(cpath, joinrel, T_NestPath, false);
@@ -1234,7 +1341,8 @@ vjoin_try_mergejoin(PlannerInfo *root,
                     Oid *key_types,
                     Oid *hash_procs,
                     Oid *eq_oprs,
-                    Oid *collations)
+                    Oid *collations,
+                    List *residual_clauses)
 {
     ListCell   *lc;
     List       *outer_pathkeys = NIL;
@@ -1392,6 +1500,8 @@ vjoin_try_mergejoin(PlannerInfo *root,
                                                 inner_keynos, key_types,
                                                 hash_procs, eq_oprs,
                                                 collations);
+    cpath->custom_private = lappend(cpath->custom_private,
+                                    (List *) copyObject(residual_clauses));
     cpath->methods = &vjoin_merge_path_methods;
 
     vjoin_apply_auto_tune(cpath, joinrel, T_MergePath, false);
@@ -1591,6 +1701,8 @@ vjoin_pathlist_hook(PlannerInfo *root,
     Oid         eq_oprs[VJOIN_MAX_KEYS];
     Oid         collations[VJOIN_MAX_KEYS];
     int         nkeys;
+    List       *consumed_rinfos = NIL;
+    List       *residual_clauses = NIL;
 
     /* Chain to any previous hook first */
     if (prev_join_pathlist_hook)
@@ -1653,11 +1765,20 @@ vjoin_pathlist_hook(PlannerInfo *root,
                                       outer_keynos, inner_keynos,
                                       key_types, hash_procs, eq_oprs,
                                       collations,
-                                      outer_tl, inner_tl);
+                                      outer_tl, inner_tl,
+                                      &consumed_rinfos);
 
         list_free(outer_tl);
         list_free(inner_tl);
     }
+
+    /*
+     * Residual = join clauses the executor does not match as equi-keys; these
+     * (and only these) must be re-checked as a qual at run time.  For pure
+     * equi-key joins this is NIL, so the executor skips per-row ExecQual.
+     */
+    residual_clauses = vjoin_build_residual_clauses(extra->restrictlist,
+                                                    consumed_rinfos);
 
     /* Hash join and merge join require at least one equality key */
     if (jointype == JOIN_LEFT)
@@ -1675,7 +1796,8 @@ vjoin_pathlist_hook(PlannerInfo *root,
             vjoin_try_hashjoin(root, joinrel, outerrel, innerrel, extra,
                                jointype,
                                nkeys, outer_keynos, inner_keynos, key_types,
-                               hash_procs, eq_oprs, collations);
+                               hash_procs, eq_oprs, collations,
+                               residual_clauses);
 
         return;
     }
@@ -1688,7 +1810,8 @@ vjoin_pathlist_hook(PlannerInfo *root,
             vjoin_try_hashjoin(root, joinrel, outerrel, innerrel, extra,
                                jointype,
                                nkeys, outer_keynos, inner_keynos, key_types,
-                               hash_procs, eq_oprs, collations);
+                               hash_procs, eq_oprs, collations,
+                               residual_clauses);
 
             /*
              * Also try with swapped sides: build hash table on the
@@ -1703,14 +1826,16 @@ vjoin_pathlist_hook(PlannerInfo *root,
             vjoin_try_hashjoin(root, joinrel, innerrel, outerrel, extra,
                                jointype,
                                nkeys, inner_keynos, outer_keynos, key_types,
-                               hash_procs, eq_oprs, collations);
+                               hash_procs, eq_oprs, collations,
+                               residual_clauses);
         }
 
         if (vjoin_enable_mergejoin)
             vjoin_try_mergejoin(root, joinrel, outerrel, innerrel, extra,
                                 jointype,
                                 nkeys, outer_keynos, inner_keynos, key_types,
-                                hash_procs, eq_oprs, collations);
+                                hash_procs, eq_oprs, collations,
+                                residual_clauses);
     }
 
     /* Nested loop works for both equi-join (nkeys>0) and theta-join (nkeys==0) */
@@ -1754,6 +1879,7 @@ vjoin_pathlist_hook(PlannerInfo *root,
                       jointype,
                       nkeys, outer_keynos, inner_keynos, key_types,
                       hash_procs, eq_oprs, collations,
+                      residual_clauses,
                       theta_strategy, theta_outer_keyno,
                       theta_inner_keyno, theta_keytype);
     }

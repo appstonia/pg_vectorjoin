@@ -22,7 +22,7 @@ DATA = pg_vectorjoin--1.0.sql
 PG_CPPFLAGS = -I$(srcdir)/include
 PG_CFLAGS = -O2 -Wno-ignored-attributes
 
-REGRESS = basic outer_join_test spill_test par_spill_test
+REGRESS = basic outer_join_test spill_test par_spill_test multikey_basic
 REGRESS_OPTS = --inputdir=$(srcdir)/test
 
 PG_CONFIG ?= pg_config

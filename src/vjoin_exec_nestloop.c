@@ -260,21 +260,77 @@ nl_ensure_inner_matched(VJoinNestLoopState *state, int idx)
 }
 
 /*
+ * Compare outer block row `oi` against the inner tuple keys for the key range
+ * [start, num_keys).  Returns true when every key in the range is non-NULL on
+ * both sides and equal.  Shared by the scalar path (start = 0) and the
+ * multi-key SIMD path, which verifies the residual keys (start = 1) after the
+ * first key has been matched vectorially.
+ */
+static inline bool
+nl_keys_match(VJoinNestLoopState *state, int oi,
+              Datum *inner_keys, bool *inner_nulls, int start)
+{
+    int   base = oi * state->num_keys;
+    int   k;
+
+    for (k = start; k < state->num_keys; k++)
+    {
+        Datum outer_d,
+              inner_d;
+
+        if (state->block_nulls[base + k] || inner_nulls[k])
+            return false;
+
+        outer_d = state->block_keys[base + k];
+        inner_d = inner_keys[k];
+
+        switch (state->key_types[k])
+        {
+            case INT4OID:
+                if (DatumGetInt32(outer_d) != DatumGetInt32(inner_d))
+                    return false;
+                break;
+            case INT8OID:
+                if (DatumGetInt64(outer_d) != DatumGetInt64(inner_d))
+                    return false;
+                break;
+            case FLOAT8OID:
+                if (DatumGetFloat8(outer_d) != DatumGetFloat8(inner_d))
+                    return false;
+                break;
+            default:
+                if (!DatumGetBool(FunctionCall2Coll(
+                        &state->eq_finfo[k],
+                        state->key_collations[k],
+                        outer_d, inner_d)))
+                    return false;
+                break;
+        }
+    }
+    return true;
+}
+
+/*
  * Compare one inner tuple against the entire outer block.
- * Uses pre-extracted typed arrays for single-key SIMD fast path,
- * scalar fallback for multi-key or unsupported types.
+ *
+ * When the first key is a fast numeric type we vectorize the first-key
+ * comparison across the whole block (SIMD), producing candidate row indices,
+ * then verify any residual keys scalar.  For a single key this is a pure SIMD
+ * match; for composite keys the SIMD pass acts as a cheap pre-filter on the
+ * (usually most selective) leading key.  Falls back to a fully scalar scan for
+ * unsupported leading-key types.
  */
 static void
 nl_compare_block(VJoinNestLoopState *state,
                   Datum *inner_keys, bool *inner_nulls,
                   MinimalTuple inner_mt)
 {
-    int k, i;
+    int i;
 
-    /* Single-key SIMD fast path using pre-extracted typed arrays */
+    /* SIMD fast path on the leading key using pre-extracted typed arrays */
     if (state->simd_typed_keys != NULL && !inner_nulls[0])
     {
-        int  raw_matches, nmatches;
+        int  raw_matches;
         int *match_indices = state->simd_match_indices;
 
         switch (state->simd_key_type)
@@ -299,67 +355,28 @@ nl_compare_block(VJoinNestLoopState *state,
                 break;
         }
 
-        /* Post-filter NULL outer keys */
-        nmatches = 0;
         for (i = 0; i < raw_matches; i++)
         {
-            if (!state->block_nulls[match_indices[i] * state->num_keys])
-                match_indices[nmatches++] = match_indices[i];
-        }
+            int idx = match_indices[i];
 
-        for (i = 0; i < nmatches; i++)
-            nl_push_match(state, match_indices[i], inner_mt);
+            /*
+             * The leading key was matched on the typed array, where NULL outer
+             * keys are zero-filled; reject a spurious 0 == 0 hit here.  Then
+             * verify the residual keys (none for a single-key join).
+             */
+            if (state->block_nulls[idx * state->num_keys])
+                continue;
+            if (nl_keys_match(state, idx, inner_keys, inner_nulls, 1))
+                nl_push_match(state, idx, inner_mt);
+        }
 
         return;
     }
 
-    /* Scalar fallback for multiple keys or unsupported types */
+    /* Scalar fallback (unsupported leading-key type) */
     for (i = 0; i < state->block_count; i++)
     {
-        bool match = true;
-
-        for (k = 0; k < state->num_keys; k++)
-        {
-            bool outer_null = state->block_nulls[i * state->num_keys + k];
-            Datum outer_d,
-                  inner_d;
-
-            if (outer_null || inner_nulls[k])
-            {
-                match = false;
-                break;
-            }
-
-            outer_d = state->block_keys[i * state->num_keys + k];
-            inner_d = inner_keys[k];
-
-            switch (state->key_types[k])
-            {
-                case INT4OID:
-                    if (DatumGetInt32(outer_d) != DatumGetInt32(inner_d))
-                        match = false;
-                    break;
-                case INT8OID:
-                    if (DatumGetInt64(outer_d) != DatumGetInt64(inner_d))
-                        match = false;
-                    break;
-                case FLOAT8OID:
-                    if (DatumGetFloat8(outer_d) != DatumGetFloat8(inner_d))
-                        match = false;
-                    break;
-                default:
-                    if (!DatumGetBool(FunctionCall2Coll(
-                            &state->eq_finfo[k],
-                            state->key_collations[k],
-                            outer_d, inner_d)))
-                        match = false;
-                    break;
-            }
-            if (!match)
-                break;
-        }
-
-        if (match)
+        if (nl_keys_match(state, i, inner_keys, inner_nulls, 0))
             nl_push_match(state, i, inner_mt);
     }
 }
@@ -578,13 +595,17 @@ vjoin_nestloop_begin(CustomScanState *node, EState *estate, int eflags)
     {
         if (state->theta_strategy != 0)
             state->use_simd = true;   /* theta — always numeric */
-        else if (state->num_keys == 1 &&
+        else if (state->num_keys >= 1 &&
                  vjoin_is_fast_type(state->key_types[0]))
-            state->use_simd = true;   /* single numeric key */
+            state->use_simd = true;   /* numeric leading key (vectorized) */
     }
 
-    /* Pre-allocated SIMD scratch for single-key equi-join comparison */
-    if (state->num_keys == 1 && state->use_simd)
+    /*
+     * Pre-allocated SIMD scratch for the leading equi-join key.  For composite
+     * keys the leading key is filtered vectorially and the residual keys are
+     * verified scalar in nl_compare_block().
+     */
+    if (state->num_keys >= 1 && state->use_simd && state->theta_strategy == 0)
     {
         size_t elem_size = 0;
         Oid    ktype = state->key_types[0];

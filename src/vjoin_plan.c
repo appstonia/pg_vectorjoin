@@ -92,8 +92,13 @@ vjoin_hash_plan(PlannerInfo *root, RelOptInfo *rel,
     cscan->scan.scanrelid = 0;         /* not a real relation scan */
     cscan->flags = best_path->flags;
     cscan->custom_plans = custom_plans;
-    cscan->custom_exprs = NIL;
-    cscan->custom_private = best_path->custom_private;
+    /* Extract join qual expressions from custom_private (last element) */
+    {
+        List *full = best_path->custom_private;
+        int   len = list_length(full);
+        cscan->custom_exprs = (List *) copyObject(llast(full));
+        cscan->custom_private = list_truncate(list_copy(full), len - 1);
+    }
     cscan->custom_relids = rel->relids;
     cscan->methods = &vjoin_hash_scan_methods;
 
@@ -121,7 +126,7 @@ vjoin_nestloop_plan(PlannerInfo *root, RelOptInfo *rel,
     {
         List *full = best_path->custom_private;
         int   len = list_length(full);
-        cscan->custom_exprs = (List *) llast(full);
+        cscan->custom_exprs = (List *) copyObject(llast(full));
         cscan->custom_private = list_truncate(list_copy(full), len - 1);
     }
     cscan->custom_relids = rel->relids;
@@ -167,8 +172,13 @@ vjoin_merge_plan(PlannerInfo *root, RelOptInfo *rel,
     cscan->scan.scanrelid = 0;
     cscan->flags = best_path->flags;
     cscan->custom_plans = custom_plans;
-    cscan->custom_exprs = NIL;
-    cscan->custom_private = best_path->custom_private;
+    /* Extract join qual expressions from custom_private (last element) */
+    {
+        List *full = best_path->custom_private;
+        int   len = list_length(full);
+        cscan->custom_exprs = (List *) copyObject(llast(full));
+        cscan->custom_private = list_truncate(list_copy(full), len - 1);
+    }
     cscan->custom_relids = rel->relids;
     cscan->methods = &vjoin_merge_scan_methods;
 

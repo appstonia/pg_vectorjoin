@@ -1393,6 +1393,9 @@ vjoin_merge_begin(CustomScanState *node, EState *estate, int eflags)
     state->outer_desc = outer_desc;
     state->inner_desc = inner_desc;
 
+    if (cscan->custom_exprs != NIL)
+        node->ss.ps.qual = ExecInitQual(cscan->custom_exprs, (PlanState *) node);
+
     /* Deserialize key info (jointype is first element) */
     vjoin_deserialize_keys(cscan->custom_private,
                            &state->jointype,
