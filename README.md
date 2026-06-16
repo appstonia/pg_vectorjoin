@@ -1,4 +1,4 @@
-# pg_vectorjoin
+# pg_vectorjoin – SIMD-Accelerated Vectorized Join Execution for PostgreSQL
 
 > **Warning:** pg_vectorjoin has not reached a stable release yet. Do not use it in production environments.
 
